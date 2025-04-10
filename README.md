@@ -1,6 +1,4 @@
-# coleta_dados
-
-🕵️‍♂️ coleta_dados.py
+# 🕵️‍♂️ coleta_dados.py
 
 Ferramenta automatizada para coleta e análise de arquivos públicos (.js, .json, .env, etc.) relacionados a um domínio, com o objetivo de identificar possíveis exposições de dados sensíveis.
 
