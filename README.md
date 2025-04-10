@@ -1,4 +1,4 @@
-# coleta_dados.py
+# coleta_dados
 
 🕵️‍♂️ coleta_dados.py
 
