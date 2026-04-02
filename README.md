@@ -1,47 +1,180 @@
 # 🕵️‍♂️ coleta_dados.py
 
-Ferramenta automatizada para coleta e análise de arquivos públicos (.js, .json, .env, etc.) relacionados a um domínio, com o objetivo de identificar possíveis exposições de dados sensíveis.
+Ferramenta automatizada para coleta, download e análise de arquivos públicos relacionados a um domínio, com foco na identificação de exposição de dados sensíveis e artefatos úteis para Pentest / Bug Bounty.
 
-🚀 Funcionalidades
+# 🚀 Funcionalidades 🔎 Coleta de URLs
+Integração com:
+- gau
+- waybackurls
+- Coleta ampla de endpoints históricos e atuais
 
-Coleta URLs públicas usando gau e waybackurls
+- 📂 Filtragem inteligente de arquivos
 
-Filtra arquivos com extensões suspeitas ou sensíveis:
+- Busca por extensões sensíveis como:
+.js, .json, .map, .env, .log, .bak, .old,
+.zip, .tar, .gz, .tgz, .rar, .7z,
+.conf, .config, .ini, .yaml, .yml,
+.sql, .xml, .txt, .pdf, .docx,
+.pem, .key, .pfx, .db, .sqlite
 
-.js, .json, .env, .log, .bak, .old, .zip, .conf, .sql, .xml, .txt
+Inclui também:
 
-Realiza o download automatizado com wget
+robots.txt (tratamento especial 🔥)
 
-Analisa os arquivos localmente em busca de:
+⬇️ Download robusto
 
-🔐 JWTs, chaves de API (AWS, Google, Stripe)
+Retry automático em falhas
 
-👤 Credenciais e dados pessoais (usuário, senha, CPF, CNPJ, e-mail)
+Timeout configurável
 
-🧭 URLs internas ou endpoints de debug
+Controle de tamanho de arquivo
 
-🐞 Logs de depuração (console.log, debugger, etc.)
+Nome único para evitar sobrescrita
 
-Salva os resultados encontrados em um arquivo estruturado
+📦 Extração de arquivos
 
-🛠️ Uso
+- Suporte para:
+.zip
+.tar
+.tar.gz / .tgz
+
+# 🧠 Análise de conteúdo
+
+- Detecta automaticamente:
+
+# 🔐 Credenciais e Segredos
+
+JWT
+AWS Keys
+Google API Keys
+Stripe Keys
+Bearer Tokens
+Basic Auth
+GitHub / Slack tokens
+Connection Strings
+Secrets em .env
+
+# 🧬 Hardcoded secrets
+
+apiKey
+clientSecret
+accessToken
+secretKey
+
+# 🌐 Infraestrutura interna
+
+URLs internas (RFC1918)
+endpoints locais (localhost)
+
+# 🧑‍💻 Código sensível
+
+roles (admin, superadmin, impersonate)
+uso de cookies e storage
+chamadas HTTP (fetch, axios, XMLHttpRequest)
+
+# 🐞 Debug / vazamento
+
+console.log
+debugger
+artefatos de desenvolvimento
+
+# 🤖 Análise de robots.txt (🔥 diferencial)
+
+- Quando encontrado:
+Extrai:
+Disallow
+Allow
+Monta URLs automaticamente
+Testa cada endpoint com curl
+Identifica respostas:
+200
+301/302
+401
+403
+
+# 👉 Excelente para descobrir:
+
+painéis administrativos
+endpoints ocultos
+áreas restritas expostas
+
+# 📊 Relatórios
+
+- Geração de:
+
+📄 relatorio.txt (legível)
+📦 relatorio.json (estruturado)
+
+- Com:
+severidade (low, medium, high, critical)
+arquivo origem
+linha
+contexto do match
+
+# 🚨 Alertas em tempo real
+
+Durante execução:
+
+- exibe imediatamente achados:
+HIGH
+CRITICAL
+
+# 🛠️ Uso
 
 python3 coleta_dados.py
 
-Você informará:
+- Você informará:
+Informe o dominio (ex: exemplo.com):
 
-O domínio a ser analisado
+# 📁 Estrutura gerada
 
-A ferramenta então:
+coleta_dominio/
+├── downloads/
+├── possivelmente_sensiveis/
+├── extraidos/
+├── urls_dominio.txt
+├── relatorio_dominio.txt
+└── relatorio_dominio.json
 
-Cria uma pasta para os arquivos baixados
+# ⚙️ Dependências
 
-Cria um arquivo com as URLs coletadas
+Obrigatórias
+Python 3
+gau
+waybackurls
+curl
+Opcionais
 
-Salva os arquivos suspeitos em uma subpasta separada
+- Para melhorar análise:
 
-Gera um relatório com todos os possíveis vazamentos encontrados
+pip install pypdf
 
-⚠️ Aviso Legal
-Esta ferramenta foi desenvolvida para uso profissional e autorizado em análises de segurança, assessments, e atividades relacionadas a Pentest e Bug Bounty.
-⚠️ Jamais deve ser utilizada para fins maliciosos ou sem a devida autorização do proprietário do domínio.
+Se o sistema bloquear instalação:
+
+pip install pypdf --break-system-packages
+
+- Ou (recomendado):
+
+python3 -m venv venv
+source venv/bin/activate
+pip install pypdf
+
+# 🎯 Casos de uso
+Pentest Web
+Bug Bounty
+Recon (Reconnaissance)
+Attack Surface Mapping
+Leak Discovery
+Auditoria de exposição acidental
+
+# ⚠️ Aviso Legal
+
+Esta ferramenta foi desenvolvida para uso profissional e autorizado em:
+
+testes de segurança
+avaliações de segurança (assessments)
+programas de Bug Bounty
+
+# ❌ Não utilize sem autorização do proprietário do alvo
+
+O uso indevido pode violar leis locais e internacionais.
