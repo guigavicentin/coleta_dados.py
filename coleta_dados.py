@@ -706,11 +706,11 @@ def analyze_content(content: str, file_path: Path) -> list[dict]:
 
 
 def save_reports(findings: list[dict]) -> None:
-findings_sorted = sorted(
-    [
-        f for f in findings
-        if not (f["severity"] == "low" and f["type"] in {"JS Keyword", "Debug Artifact"})
-    ],
+    findings_sorted = sorted(
+        [
+            f for f in findings
+            if not (f["severity"] == "low" and f["type"] in {"JS Keyword", "Debug Artifact"})
+        ],
         key=lambda x: SEVERITY_ORDER.get(x["severity"], 0),
         reverse=True
     )
@@ -738,7 +738,6 @@ findings_sorted = sorted(
             f.write(f"Match   : {item['match']}\n")
             f.write(f"Contexto: {item['context']}\n")
             f.write("-" * 80 + "\n")
-
 
 def main():
     urls = collect_urls(dominio)
