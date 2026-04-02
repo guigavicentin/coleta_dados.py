@@ -89,11 +89,39 @@ PATTERNS = {
         "severity": "critical",
     },
     "Password Assignment": {
-        "regex": r"""(?i)\b(password|passwd|pwd|senha|secret|token|api[_-]?key)\b\s*[:=]\s*['"][^'"]{6,}['"]""",
+        "regex": r"""(?ix)
+        \b(
+            password|passwd|pwd|senha|
+            db_password|database_password|
+            secret_key|client_secret|api_key|
+            aws_secret_access_key
+        )\b
+        \s*[:=]\s*
+        ['"]
+        (?=.*[A-Za-z])(?=.*\d)[^'"\n]{8,}
+        ['"]
+        """,
+        "severity": "high",
+    },
+    "Hardcoded Token": {
+        "regex": r"""(?ix)
+        \b(
+            access_token|auth_token|refresh_token|
+            bearer_token|jwt_token|token_value
+        )\b
+        \s*[:=]\s*
+        ['"][A-Za-z0-9._\-+=/]{12,}['"]
+        """,
         "severity": "high",
     },
     "Hardcoded Secret": {
-        "regex": r"""(?i)\b(api[_-]?key|client[_-]?secret|secret[_-]?key|access[_-]?token|auth[_-]?token)\b\s*[:=]\s*['"][A-Za-z0-9\-_=+/]{10,}['"]""",
+        "regex": r"""(?ix)
+        \b(
+            api[_-]?key|client[_-]?secret|secret[_-]?key
+        )\b
+        \s*[:=]\s*
+        ['"][A-Za-z0-9\-_=+/]{10,}['"]
+        """,
         "severity": "high",
     },
     "Env File Secret": {
@@ -129,22 +157,32 @@ PATTERNS = {
 KEYWORDS_JS_RELEVANTES = [
     "Authorization",
     "Bearer ",
+    "Basic ",
+    "accessToken",
+    "refreshToken",
+    "idToken",
+    "authToken",
     "apiKey",
     "clientSecret",
     "secretKey",
-    "accessToken",
-    "refreshToken",
+    "privateKey",
     "document.cookie",
     "localStorage.setItem",
     "sessionStorage.setItem",
-    "fetch(",
+    "localStorage.getItem",
+    "sessionStorage.getItem",
     "axios.",
-    "XMLHttpRequest",
-    "graphql",
+    "$.ajax",
+    "setRequestHeader",
     "impersonate",
     "role_impersonate",
     "isAdmin",
     "isSuperAdmin",
+    "permission",
+    "scope",
+    "/admin",
+    "/auth/",
+    "/graphql",
 ]
 
 SEVERITY_ORDER = {"low": 1, "medium": 2, "high": 3, "critical": 4}
@@ -522,6 +560,86 @@ def analyze_robots_paths(content: str, source_url: str) -> list[dict]:
     return findings
 
 
+LIBS_RUIDOSAS = (
+    "jquery",
+    "bootstrap",
+    "lottie",
+    "anychart",
+    "mdb",
+    "materialize",
+    "emojiarea",
+)
+
+def is_translation_file(file_path: Path) -> bool:
+    name = file_path.name.lower()
+    return any(x in name for x in ("pt_br", "en_us", "i18n", "locale", "lang"))
+
+def is_probably_third_party(file_path: Path, content: str) -> bool:
+    name = file_path.name.lower()
+
+    if any(lib in name for lib in LIBS_RUIDOSAS):
+        return True
+
+    header = content[:2000].lower()
+    sinais = (
+        "copyright",
+        "license",
+        "licensed under",
+        "sourcemappingurl",
+        "webpack",
+        "jquery",
+        "bootstrap",
+    )
+    return any(s in header for s in sinais)
+
+
+def is_interesting_js_keyword(keyword: str, context: str) -> bool:
+    context = context.lower()
+
+    sinais_fortes = (
+        "authorization",
+        "bearer",
+        "basic ",
+        "secret",
+        "token",
+        "cookie",
+        "admin",
+        "impersonate",
+        "role",
+        "permission",
+    )
+
+    # palavras genéricas precisam de contexto forte
+    if keyword.lower() in {
+        "permission", "scope", "/admin", "/auth/", "/graphql"
+    }:
+        return sum(1 for s in sinais_fortes if s in context) >= 2
+
+    return True
+
+
+def should_skip_finding(name: str, file_path: Path, content: str, context: str) -> bool:
+    third_party = is_probably_third_party(file_path, content)
+    translation = is_translation_file(file_path)
+
+    # 🔴 ignora keyword sempre (ruído)
+    if name == "JS Keyword":
+        return True
+
+    # 🔴 ignora lixo de libs
+    if third_party and name in {"Email", "Debug Artifact"}:
+        return True
+
+    # 🔴 ignora arquivos de tradução
+    if translation and name in {
+        "Password Assignment",
+        "Hardcoded Secret",
+        "Hardcoded Token"
+    }:
+        return True
+
+    return False
+
 def analyze_content(content: str, file_path: Path) -> list[dict]:
     findings = []
     seen = set()
@@ -530,7 +648,16 @@ def analyze_content(content: str, file_path: Path) -> list[dict]:
         pattern = re.compile(meta["regex"])
         for match in pattern.finditer(content):
             found = match.group(0)
-            key = (name, found)
+            context = get_context(content, match.start(), match.end())
+
+            if should_skip_finding(name, file_path, content, context):
+                continue
+
+            key = (
+                name,
+                found[:120].lower(),
+                file_path.name.lower()
+            )
             if key in seen:
                 continue
             seen.add(key)
@@ -541,34 +668,49 @@ def analyze_content(content: str, file_path: Path) -> list[dict]:
                 "file": str(file_path),
                 "line": line_number(content, match.start()),
                 "match": found[:300],
-                "context": get_context(content, match.start(), match.end())
+                "context": context
             })
 
+    # 🔵 JS KEYWORDS (modo inteligente)
     lower_name = file_path.name.lower()
     if lower_name.endswith((".js", ".map", ".json")):
-        keyword_seen = set()
-        for kw in KEYWORDS_JS_RELEVANTES:
-            for m in re.finditer(re.escape(kw), content, re.IGNORECASE):
-                k = ("JS Keyword", kw, line_number(content, m.start()))
-                if k in keyword_seen:
-                    continue
-                keyword_seen.add(k)
 
-                findings.append({
-                    "type": "JS Keyword",
-                    "severity": "low",
-                    "file": str(file_path),
-                    "line": line_number(content, m.start()),
-                    "match": kw,
-                    "context": get_context(content, m.start(), m.end())
-                })
+        third_party = is_probably_third_party(file_path, content)
+
+        # 🔴 ignora libs
+        if not third_party:
+            keyword_seen = set()
+
+            for kw in KEYWORDS_JS_RELEVANTES:
+                for m in re.finditer(re.escape(kw), content, re.IGNORECASE):
+                    context = get_context(content, m.start(), m.end())
+
+                    if not is_interesting_js_keyword(kw, context):
+                        continue
+
+                    k = ("JS Keyword", kw, line_number(content, m.start()))
+                    if k in keyword_seen:
+                        continue
+                    keyword_seen.add(k)
+
+                    findings.append({
+                        "type": "JS Keyword",
+                        "severity": "low",
+                        "file": str(file_path),
+                        "line": line_number(content, m.start()),
+                        "match": kw,
+                        "context": context
+                    })
 
     return findings
 
 
 def save_reports(findings: list[dict]) -> None:
-    findings_sorted = sorted(
-        findings,
+findings_sorted = sorted(
+    [
+        f for f in findings
+        if not (f["severity"] == "low" and f["type"] in {"JS Keyword", "Debug Artifact"})
+    ],
         key=lambda x: SEVERITY_ORDER.get(x["severity"], 0),
         reverse=True
     )
