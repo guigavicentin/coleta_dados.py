@@ -104,16 +104,10 @@ def process_domain(domain, args):
 
     template_dirs = [NUCLEI_TAKEOVER]
 
-    if not args.no_cms:
-        template_dirs.append(NUCLEI_CMS)
-    if not args.no_db:
-        template_dirs.append(NUCLEI_DATABASE)
     if not args.no_network:
         template_dirs.append(NUCLEI_NETWORK)
     if not args.no_http:
         template_dirs.append(NUCLEI_HTTP)
-    if not args.no_misc:
-        template_dirs.append(NUCLEI_MISC)
 
     banner("Coleta Subdomínios")
     run(f"subfinder -d {domain} --all -silent > {base}/subfinder.txt")
@@ -162,11 +156,8 @@ def main():
     parser.add_argument("-l", "--list", help="Lista de domínios")
     parser.add_argument("--only-takeover", action="store_true")
     parser.add_argument("--no-nmap", action="store_true")
-    parser.add_argument("--no-cms", action="store_true")
-    parser.add_argument("--no-db", action="store_true")
     parser.add_argument("--no-network", action="store_true")
     parser.add_argument("--no-http", action="store_true")
-    parser.add_argument("--no-misc", action="store_true")
     parser.add_argument("--severity", help="Filtro severity nuclei")
 
     args = parser.parse_args()
