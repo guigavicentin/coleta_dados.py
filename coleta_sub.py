@@ -9,7 +9,6 @@ from concurrent.futures import ThreadPoolExecutor
 # Template paths
 NUCLEI_TAKEOVER = "/root/nuclei-templates/http/takeovers/"
 NUCLEI_CMS = "/root/nuclei-templates/cms/"
-NUCLEI_DATABASE = "/root/nuclei-templates/database/"
 NUCLEI_NETWORK = "/root/nuclei-templates/network/"
 NUCLEI_HTTP = "/root/nuclei-templates/http/"
 NUCLEI_MISC = "/root/nuclei-templates/misc/"
