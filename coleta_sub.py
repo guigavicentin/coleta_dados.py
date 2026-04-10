@@ -30,6 +30,22 @@ def banner(step):
     print(f"[+] ETAPA: {step}")
     print("="*60)
 
+def run_subzy(input_file, output):
+    print(f"[SUBZY] Rodando em {input_file}")
+    try:
+        r = subprocess.check_output(
+            f"subzy run --targets {input_file} --hide_fails",
+            shell=True
+        ).decode(errors="ignore")
+
+        with open(output, "w") as f:
+            for line in r.splitlines():
+                if line.strip():
+                    f.write(line.strip() + "\n")
+
+    except subprocess.CalledProcessError:
+        pass
+
 def takeover_worker(url):
     try:
         r = subprocess.check_output(
@@ -100,6 +116,7 @@ def process_domain(domain, args):
     takeover_thread = base / "takeover_threaded.txt"
     takeover_nuclei = base / "takeover_nuclei.txt"
     takeover_final = base / "takeover_final.txt"
+    subzy_output = base / "subzy_takeovers.txt"
     nmap = base / "nmap.txt"
 
     template_dirs = [NUCLEI_TAKEOVER]
@@ -113,9 +130,12 @@ def process_domain(domain, args):
     run(f"subfinder -d {domain} --all -silent > {base}/subfinder.txt")
     run(f"amass enum -active -norecursive -noalts -d {domain} -o {base}/amass.txt")
     run(f"shodanx subdomain -d {domain} -o {base}/shodanx.txt")
-    run(f"python3 /caminho/do/subcat/subcat.py -d {domain} -o {base}/subcat.txt")
+    run(f"python3 /home/caminho/da/subcat/subcat.py -d {domain} -o {base}/subcat.txt")
 
     run(f"cat {base}/subfinder.txt {base}/amass.txt {base}/shodanx.txt {base}/subcat.txt | grep -v '*' | sort -u > {subs}")
+
+    banner("Subzy Takeover Scan")
+    run_subzy(subs, subzy_output)
 
     banner("Hosts ativos - HTTPX")
     run(f"httpx -silent -ip -title -sc -l {subs} -o {alive}")
@@ -123,7 +143,7 @@ def process_domain(domain, args):
     banner("Takeover Threaded")
     threaded_takeover(alive, takeover_thread)
 
-    all_takeovers = [takeover_thread]
+    all_takeovers = [takeover_thread, subzy_output]
 
     for template_dir in template_dirs:
         template_name = template_dir.strip("/").split("/")[-1]
