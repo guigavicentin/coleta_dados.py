@@ -1,194 +1,194 @@
 #!/usr/bin/env python3
+import argparse
 import subprocess
 import re
-import requests
+import sys
 from pathlib import Path
-from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 
-# ================= CONFIG =================
+# Template paths
+NUCLEI_TAKEOVER = "/root/nuclei-templates/http/takeovers/"
+NUCLEI_CMS = "/root/nuclei-templates/cms/"
+NUCLEI_DATABASE = "/root/nuclei-templates/database/"
+NUCLEI_NETWORK = "/root/nuclei-templates/network/"
+NUCLEI_HTTP = "/root/nuclei-templates/http/"
+NUCLEI_MISC = "/root/nuclei-templates/misc/"
 
-domain = input("Dominio: ").strip()
+THREADS = 50
+fingerprints = [
+    "NoSuchBucket",
+    "There isn't a GitHub Pages site here",
+    "No such app",
+    "Fastly error: unknown domain",
+    "Repository not found",
+    "project not found"
+]
 
-BASE_DIR = Path(f"coleta_{domain}")
-BASE_DIR.mkdir(exist_ok=True)
+def run(cmd):
+    print(f"[CMD] {cmd}")
+    subprocess.run(cmd, shell=True)
 
-URLS_FILE = BASE_DIR / "urls.txt"
+def banner(step):
+    print("\n" + "="*60)
+    print(f"[+] ETAPA: {step}")
+    print("="*60)
 
-GF_PATTERNS = ["xss", "sqli", "ssrf", "redirect", "ssti"]
-
-SENSITIVE_REGEX = r"\.(php|html|xml|zip|gz|env|log|bak|sql|txt|conf|ini|yml|yaml|db|pem|key|crt|sh|py|jsp|asp|aspx)$"
-
-JS_DIR = BASE_DIR / "js"
-JS_DIR.mkdir(exist_ok=True)
-
-JS_FILE = BASE_DIR / "js_urls.txt"
-RESULT_FILE = BASE_DIR / "js_sensiveis.txt"
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 recon"
-}
-
-SENSITIVE_PATTERNS = {
-    "api_key": r'api[_-]?key["\']?\s*[:=]\s*["\'][A-Za-z0-9_\-]{8,}',
-    "token": r'token["\']?\s*[:=]\s*["\'][A-Za-z0-9_\-\.]{8,}',
-    "jwt": r'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+',
-    "authorization": r'authorization["\']?\s*[:=]\s*["\'][A-Za-z0-9_\-\. ]{8,}',
-    "aws_key": r'AKIA[0-9A-Z]{16}',
-    "secret": r'secret["\']?\s*[:=]\s*["\'][^"\']{8,}',
-    "password": r'password["\']?\s*[:=]\s*["\'][^"\']{6,}'
-}
-
-# ================= UTIL =================
-
-def run_cmd(cmd):
+def takeover_worker(url):
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        return result.stdout.splitlines()
-    except:
-        return []
+        r = subprocess.check_output(
+            f"curl -s -k --max-time 8 -L {url}",
+            shell=True
+        ).decode(errors="ignore")
 
-# ================= URL COLLECTION =================
-
-def collect_urls():
-    print("[+] gau")
-    gau = run_cmd(["gau", domain])
-
-    print("[+] waybackurls")
-    wayback = subprocess.run(
-        ["waybackurls"],
-        input=domain,
-        text=True,
-        capture_output=True
-    ).stdout.splitlines()
-
-    print("[+] katana")
-    katana = run_cmd([
-        "katana",
-        "-u", domain,
-        "-d", "5",
-        "-ps", "waybackarchive,commoncrawl,alienvault",
-        "-kf",
-        "-jc",
-        "-ef", "woff,css,png,svg,jpg,woff2,jpeg,gif"
-    ])
-
-    urls = set(gau + wayback + katana)
-
-    with open(URLS_FILE, "w") as f:
-        for u in sorted(urls):
-            f.write(u + "\n")
-
-    print(f"[+] URLs coletadas: {len(urls)}")
-
-# ================= GF =================
-
-def run_gf():
-    gf_dir = BASE_DIR / "gf"
-    gf_dir.mkdir(exist_ok=True)
-
-    for pattern in GF_PATTERNS:
-        print(f"[+] GF {pattern}")
-
-        output = gf_dir / f"gf_{pattern}.txt"
-
-        with open(output, "w") as out:
-            subprocess.run(
-                f"cat {URLS_FILE} | gf {pattern}",
-                shell=True,
-                stdout=out
-            )
-
-# ================= SENSITIVE FILES =================
-
-def extract_sensitive():
-    print("[+] filtrando arquivos sensíveis")
-
-    output = BASE_DIR / "urls_sensiveis.txt"
-    regex = re.compile(SENSITIVE_REGEX, re.IGNORECASE)
-
-    with open(URLS_FILE) as f, open(output, "w") as out:
-        for line in f:
-            if regex.search(line):
-                out.write(line)
-
-# ================= JS COLLECTION =================
-
-def collect_js():
-    print("[+] coletando JS")
-
-    js_urls = set()
-
-    with open(URLS_FILE) as f:
-        for line in f:
-            if ".js" in line.lower():
-                js_urls.add(line.strip())
-
-    with open(JS_FILE, "w") as f:
-        for u in js_urls:
-            f.write(u + "\n")
-
-    print(f"[+] JS encontrados: {len(js_urls)}")
-
-# ================= JS ANALYSIS =================
-
-def is_valid_js(resp, content):
-    ct = resp.headers.get("Content-Type", "")
-    if "javascript" in ct:
-        return True
-    if content.strip().startswith(("var ", "let ", "const ", "function", "!function", "(function")):
-        return True
-    return False
-
-def analyze_js(content, url):
-    with open(RESULT_FILE, "a", encoding="utf-8") as out:
-        for name, regex in SENSITIVE_PATTERNS.items():
-            for match in re.finditer(regex, content, re.IGNORECASE):
-                value = match.group(0)
-
-                print(f"[!!!] {name} -> {url}")
-
-                out.write(
-                    f"[{name}] {url}\n{value}\n"
-                    + "-"*60 + "\n"
-                )
-
-def process_js(url):
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=10, verify=False)
-
-        if resp.status_code != 200:
-            return
-
-        content = resp.text
-
-        if not is_valid_js(resp, content):
-            return
-
-        analyze_js(content, url)
+        for fp in fingerprints:
+            if fp.lower() in r.lower():
+                return url
 
     except:
         pass
 
-def analyze_all_js():
-    print("[+] analisando JS")
+    return None
 
-    with open(JS_FILE) as f:
-        urls = [x.strip() for x in f]
+def threaded_takeover(alive_file, output_file):
+    urls = []
+    with open(alive_file) as f:
+        for line in f:
+            if line.strip():
+                urls.append(line.split()[0])
 
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        executor.map(process_js, urls)
+    results = []
+    with ThreadPoolExecutor(max_workers=THREADS) as executor:
+        for r in executor.map(takeover_worker, urls):
+            if r:
+                print(f"[TAKEOVER] {r}")
+                results.append(r)
 
-# ================= MAIN =================
+    with open(output_file, "w") as f:
+        for r in sorted(set(results)):
+            f.write(r + "\n")
+
+def extract_ips(input_file, output_file):
+    ips = set()
+    with open(input_file) as f:
+        for line in f:
+            match = re.findall(r"\[(\d+\.\d+\.\d+\.\d+)\]", line)
+            if match:
+                ips.add(match[-1])
+
+    with open(output_file, "w") as f:
+        for ip in sorted(ips):
+            f.write(ip + "\n")
+
+def merge_takeovers(files, output):
+    merged = set()
+
+    for file in files:
+        if Path(file).exists():
+            with open(file) as f:
+                for line in f:
+                    if line.strip():
+                        merged.add(line.strip())
+
+    with open(output, "w") as f:
+        for line in sorted(merged):
+            f.write(line + "\n")
+
+def process_domain(domain, args):
+    base = Path(domain)
+    base.mkdir(exist_ok=True)
+
+    subs = base / "subdomains.txt"
+    alive = base / "alive.txt"
+    ips = base / "ips.txt"
+    takeover_thread = base / "takeover_threaded.txt"
+    takeover_nuclei = base / "takeover_nuclei.txt"
+    takeover_final = base / "takeover_final.txt"
+    nmap = base / "nmap.txt"
+
+    template_dirs = [NUCLEI_TAKEOVER]
+
+    if not args.no_cms:
+        template_dirs.append(NUCLEI_CMS)
+    if not args.no_db:
+        template_dirs.append(NUCLEI_DATABASE)
+    if not args.no_network:
+        template_dirs.append(NUCLEI_NETWORK)
+    if not args.no_http:
+        template_dirs.append(NUCLEI_HTTP)
+    if not args.no_misc:
+        template_dirs.append(NUCLEI_MISC)
+
+    banner("Coleta Subdomínios")
+    run(f"subfinder -d {domain} --all -silent > {base}/subfinder.txt")
+    run(f"amass enum -active -norecursive -noalts -d {domain} -o {base}/amass.txt")
+    run(f"shodanx subdomain -d {domain} -o {base}/shodanx.txt")
+    run(f"python3 /home/guilherme/kali/subcat/subcat.py -d {domain} -o {base}/subcat.txt")
+
+    run(f"cat {base}/subfinder.txt {base}/amass.txt {base}/shodanx.txt {base}/subcat.txt | grep -v '*' | sort -u > {subs}")
+
+    banner("Hosts ativos - HTTPX")
+    run(f"httpx -silent -ip -title -sc -l {subs} -o {alive}")
+
+    banner("Takeover Threaded")
+    threaded_takeover(alive, takeover_thread)
+
+    all_takeovers = [takeover_thread]
+
+    for template_dir in template_dirs:
+        template_name = template_dir.strip("/").split("/")[-1]
+        template_file = base / f"nuclei_{template_name}.txt"
+
+        severity = ""
+        if args.severity:
+            severity = f"-severity {args.severity}"
+
+        banner(f"Nuclei Scan: {template_name}")
+        run(f"nuclei -l {alive} -t {template_dir} {severity} -o {template_file}")
+
+        all_takeovers.append(template_file)
+
+    banner("Merge Takeover")
+    merge_takeovers(all_takeovers, takeover_final)
+
+    if args.no_nmap:
+        return
+
+    banner("Extraindo IPs")
+    extract_ips(alive, ips)
+
+    banner("Nmap Scan")
+    run(f"nmap -p- -T4 -sV -Pn -sS -iL {ips} -oN {nmap}")
 
 def main():
-    collect_urls()
-    run_gf()
-    extract_sensitive()
-    collect_js()
-    analyze_all_js()
+    parser = argparse.ArgumentParser(description="Recon + Domain Takeover + Nmap automation")
+    parser.add_argument("domain", nargs="?", help="Domínio alvo")
+    parser.add_argument("-l", "--list", help="Lista de domínios")
+    parser.add_argument("--only-takeover", action="store_true")
+    parser.add_argument("--no-nmap", action="store_true")
+    parser.add_argument("--no-cms", action="store_true")
+    parser.add_argument("--no-db", action="store_true")
+    parser.add_argument("--no-network", action="store_true")
+    parser.add_argument("--no-http", action="store_true")
+    parser.add_argument("--no-misc", action="store_true")
+    parser.add_argument("--severity", help="Filtro severity nuclei")
 
-    print("\n[✓] finalizado")
+    args = parser.parse_args()
+    domains = []
+
+    if args.domain:
+        domains.append(args.domain)
+
+    if args.list:
+        with open(args.list) as f:
+            domains.extend([d.strip() for d in f if d.strip()])
+
+    if not domains:
+        parser.print_help()
+        sys.exit()
+
+    for d in domains:
+        print(f"\n######## PROCESSANDO {d} ########")
+        process_domain(d, args)
 
 if __name__ == "__main__":
     main()
