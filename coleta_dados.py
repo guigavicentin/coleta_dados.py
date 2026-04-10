@@ -30,13 +30,14 @@ HEADERS = {
 }
 
 SENSITIVE_PATTERNS = {
-    "api_key": r'api[_-]?key["\']?\s*[:=]\s*["\'][A-Za-z0-9_\-]{8,}',
-    "token": r'token["\']?\s*[:=]\s*["\'][A-Za-z0-9_\-\.]{8,}',
+    "api_key": r'api[_-]?key["\']?\s*[:=]\s*["\'][A-Za-z0-9_\-]{16,}',
+    "token": r'token["\']?\s*[:=]\s*["\'][A-Za-z0-9_\-\.]{16,}',
     "jwt": r'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+',
-    "authorization": r'authorization["\']?\s*[:=]\s*["\'][A-Za-z0-9_\-\. ]{8,}',
     "aws_key": r'AKIA[0-9A-Z]{16}',
-    "secret": r'secret["\']?\s*[:=]\s*["\'][^"\']{8,}',
-    "password": r'password["\']?\s*[:=]\s*["\'][^"\']{6,}'
+    "secret": r'secret["\']?\s*[:=]\s*["\'][A-Za-z0-9_\-\/+=]{16,}',
+    "authorization": r'Bearer\s+[A-Za-z0-9_\-\.]{16,}',
+    "password": r'password["\']?\s*[:=]\s*["\'][^"\']{6,}', # vai trazer muito lixo, mas é bom manter
+    "senha": r'senha["\']?\s*[:=]\s*["\'][^"\']{6,}' # vai trazer muito lixo, mas é bom manter
 }
 
 # ================= UTIL =================
@@ -102,9 +103,9 @@ def run_gf():
 # ================= SENSITIVE FILES =================
 
 def extract_sensitive():
-    print("[+] filtrando arquivos sensíveis")
+    print("[+] filtrando arquivos para analisar")
 
-    output = BASE_DIR / "urls_sensiveis.txt"
+    output = BASE_DIR / "urls_analisar.txt"
     regex = re.compile(SENSITIVE_REGEX, re.IGNORECASE)
 
     with open(URLS_FILE) as f, open(output, "w") as out:
