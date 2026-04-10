@@ -1,9 +1,10 @@
-```python
 #!/usr/bin/env python3
 import subprocess
 import re
 import requests
 from pathlib import Path
+from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor
 
 # ================= CONFIG =================
 
@@ -12,20 +13,28 @@ domain = input("Dominio: ").strip()
 BASE_DIR = Path(f"coleta_{domain}")
 BASE_DIR.mkdir(exist_ok=True)
 
+URLS_FILE = BASE_DIR / "urls.txt"
+
+GF_PATTERNS = ["xss", "sqli", "ssrf", "redirect", "ssti"]
+
+SENSITIVE_REGEX = r"\.(php|html|xml|zip|gz|env|log|bak|sql|txt|conf|ini|yml|yaml|db|pem|key|crt|sh|py|jsp|asp|aspx)$"
+
 JS_DIR = BASE_DIR / "js"
 JS_DIR.mkdir(exist_ok=True)
 
-URLS_FILE = BASE_DIR / "urls.txt"
+JS_FILE = BASE_DIR / "js_urls.txt"
 RESULT_FILE = BASE_DIR / "js_sensiveis.txt"
 
-# regex sensível
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 recon"
+}
+
 SENSITIVE_PATTERNS = {
     "api_key": r'api[_-]?key["\']?\s*[:=]\s*["\'][A-Za-z0-9_\-]{8,}',
     "token": r'token["\']?\s*[:=]\s*["\'][A-Za-z0-9_\-\.]{8,}',
     "jwt": r'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+',
-    "authorization": r'Authorization["\']?\s*[:=]\s*["\']Bearer\s+[A-Za-z0-9\-\._~\+\/]+=*',
-    "aws": r'AKIA[0-9A-Z]{16}',
-    "google_api": r'AIza[0-9A-Za-z\-_]{35}',
+    "authorization": r'authorization["\']?\s*[:=]\s*["\'][A-Za-z0-9_\-\. ]{8,}',
+    "aws_key": r'AKIA[0-9A-Z]{16}',
     "secret": r'secret["\']?\s*[:=]\s*["\'][^"\']{8,}',
     "password": r'password["\']?\s*[:=]\s*["\'][^"\']{6,}'
 }
@@ -42,10 +51,10 @@ def run_cmd(cmd):
 # ================= URL COLLECTION =================
 
 def collect_urls():
-    print("[+] coletando urls")
-
+    print("[+] gau")
     gau = run_cmd(["gau", domain])
 
+    print("[+] waybackurls")
     wayback = subprocess.run(
         ["waybackurls"],
         input=domain,
@@ -53,11 +62,15 @@ def collect_urls():
         capture_output=True
     ).stdout.splitlines()
 
+    print("[+] katana")
     katana = run_cmd([
         "katana",
         "-u", domain,
         "-d", "5",
-        "-jc"
+        "-ps", "waybackarchive,commoncrawl,alienvault",
+        "-kf",
+        "-jc",
+        "-ef", "woff,css,png,svg,jpg,woff2,jpeg,gif"
     ])
 
     urls = set(gau + wayback + katana)
@@ -66,103 +79,116 @@ def collect_urls():
         for u in sorted(urls):
             f.write(u + "\n")
 
-    print(f"[+] total urls: {len(urls)}")
+    print(f"[+] URLs coletadas: {len(urls)}")
 
-    return urls
+# ================= GF =================
 
-# ================= JS FILTER =================
+def run_gf():
+    gf_dir = BASE_DIR / "gf"
+    gf_dir.mkdir(exist_ok=True)
 
-def extract_js(urls):
-    print("[+] filtrando js")
+    for pattern in GF_PATTERNS:
+        print(f"[+] GF {pattern}")
+
+        output = gf_dir / f"gf_{pattern}.txt"
+
+        with open(output, "w") as out:
+            subprocess.run(
+                f"cat {URLS_FILE} | gf {pattern}",
+                shell=True,
+                stdout=out
+            )
+
+# ================= SENSITIVE FILES =================
+
+def extract_sensitive():
+    print("[+] filtrando arquivos sensíveis")
+
+    output = BASE_DIR / "urls_sensiveis.txt"
+    regex = re.compile(SENSITIVE_REGEX, re.IGNORECASE)
+
+    with open(URLS_FILE) as f, open(output, "w") as out:
+        for line in f:
+            if regex.search(line):
+                out.write(line)
+
+# ================= JS COLLECTION =================
+
+def collect_js():
+    print("[+] coletando JS")
 
     js_urls = set()
 
-    for url in urls:
-        if ".js" in url.lower():
-            js_urls.add(url.split("?")[0])
+    with open(URLS_FILE) as f:
+        for line in f:
+            if ".js" in line.lower():
+                js_urls.add(line.strip())
 
-    print(f"[+] js encontrados: {len(js_urls)}")
+    with open(JS_FILE, "w") as f:
+        for u in js_urls:
+            f.write(u + "\n")
 
-    return js_urls
+    print(f"[+] JS encontrados: {len(js_urls)}")
 
-# ================= ANALYZE =================
+# ================= JS ANALYSIS =================
+
+def is_valid_js(resp, content):
+    ct = resp.headers.get("Content-Type", "")
+    if "javascript" in ct:
+        return True
+    if content.strip().startswith(("var ", "let ", "const ", "function", "!function", "(function")):
+        return True
+    return False
 
 def analyze_js(content, url):
-
-    results = []
-
     with open(RESULT_FILE, "a", encoding="utf-8") as out:
-
         for name, regex in SENSITIVE_PATTERNS.items():
             for match in re.finditer(regex, content, re.IGNORECASE):
-
                 value = match.group(0)
 
-                print("\n[!!! SENSITIVE FOUND]")
-                print("type :", name)
-                print("url  :", url)
-                print("match:", value[:200])
+                print(f"[!!!] {name} -> {url}")
 
                 out.write(
                     f"[{name}] {url}\n{value}\n"
                     + "-"*60 + "\n"
                 )
 
-                results.append((name, url, value))
+def process_js(url):
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=10, verify=False)
 
-    return results
+        if resp.status_code != 200:
+            return
 
-# ================= VERIFY JS =================
+        content = resp.text
 
-def verify_and_download(js_urls):
-    print("[+] verificando js acessiveis")
+        if not is_valid_js(resp, content):
+            return
 
-    findings = []
+        analyze_js(content, url)
 
-    for url in js_urls:
-        try:
-            r = requests.get(url, timeout=10)
+    except:
+        pass
 
-            if r.status_code != 200:
-                continue
+def analyze_all_js():
+    print("[+] analisando JS")
 
-            content_type = r.headers.get("Content-Type", "")
+    with open(JS_FILE) as f:
+        urls = [x.strip() for x in f]
 
-            if "javascript" not in content_type.lower() and not url.endswith(".js"):
-                continue
-
-            filename = JS_DIR / url.split("/")[-1]
-
-            with open(filename, "w", encoding="utf-8", errors="ignore") as f:
-                f.write(r.text)
-
-            print(f"[JS] {url}")
-
-            found = analyze_js(r.text, url)
-            findings.extend(found)
-
-        except:
-            continue
-
-    return findings
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        executor.map(process_js, urls)
 
 # ================= MAIN =================
 
 def main():
+    collect_urls()
+    run_gf()
+    extract_sensitive()
+    collect_js()
+    analyze_all_js()
 
-    urls = collect_urls()
-
-    js_urls = extract_js(urls)
-
-    findings = verify_and_download(js_urls)
-
-    print("\n===================================")
-    print("TOTAL JS:", len(js_urls))
-    print("SENSITIVE:", len(findings))
-    print("SALVO EM:", RESULT_FILE)
-    print("===================================")
-
+    print("\n[✓] finalizado")
 
 if __name__ == "__main__":
     main()
-```
