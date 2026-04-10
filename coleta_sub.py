@@ -10,7 +10,6 @@ from concurrent.futures import ThreadPoolExecutor
 NUCLEI_TAKEOVER = "/root/nuclei-templates/http/takeovers/"
 NUCLEI_NETWORK = "/root/nuclei-templates/network/"
 NUCLEI_HTTP = "/root/nuclei-templates/http/"
-NUCLEI_MISC = "/root/nuclei-templates/misc/"
 
 THREADS = 50
 fingerprints = [
