@@ -23,7 +23,7 @@ fingerprints = [
 
 def run(cmd):
     print(f"[CMD] {cmd}")
-    subprocess.run(cmd, shell=True)
+    subprocess.run(cmd, shell=True, executable="/bin/bash")
 
 def banner(step):
     print("\n" + "="*60)
@@ -56,7 +56,6 @@ def takeover_worker(url):
         for fp in fingerprints:
             if fp.lower() in r.lower():
                 return url
-
     except:
         pass
 
@@ -126,28 +125,40 @@ def process_domain(domain, args):
     if not args.no_http:
         template_dirs.append(NUCLEI_HTTP)
 
-    banner("Coleta Subdomínios (parallel)")
+    # -----------------------------------
+    banner("Coleta Subdomínios")
 
-    run(f"(subfinder -d {domain} --all -silent > {base}/subfinder.txt) &")
-    run(f"(amass enum -active -norecursive -noalts -d {domain} -o {base}/amass.txt) &")
-    run(f"(shodanx subdomain -d {domain} -o {base}/shodanx.txt) &")
-    run(f"(chaos -d {domain} -silent > {base}/chaos.txt) &")
-    run(f"(assetfinder --subs-only {domain} > {base}/assetfinder.txt) &")
-    run("wait")
+    run(f"subfinder -d {domain} --all -silent > {base}/subfinder.txt")
+    run(f"amass enum -active -norecursive -noalts -d {domain} -o {base}/amass.txt")
+    run(f"shodanx subdomain -d {domain} -o {base}/shodanx.txt")
+    run(f"chaos -d {domain} -silent > {base}/chaos.txt")
+    run(f"assetfinder --subs-only {domain} > {base}/assetfinder.txt")
 
-    run(f"cat {base}/subfinder.txt {base}/amass.txt {base}/shodanx.txt {base}/chaos.txt {base}/assetfinder.txt | grep -v '*' | sort -u > {subs}")
+    run(f"cat {base}/*.txt | grep -v '*' | sort -u > {subs}")
 
+    if not subs.exists() or subs.stat().st_size == 0:
+        print("[ERRO] Nenhum subdomínio encontrado")
+        return
+
+    # -----------------------------------
     banner("Subzy Takeover Scan")
     run_subzy(subs, subzy_output)
 
+    # -----------------------------------
     banner("Hosts ativos - HTTPX")
     run(f"httpx -silent -ip -title -sc -l {subs} -o {alive}")
 
+    if not alive.exists() or alive.stat().st_size == 0:
+        print("[ERRO] Nenhum host ativo encontrado")
+        return
+
+    # -----------------------------------
     banner("Takeover Threaded")
     threaded_takeover(alive, takeover_thread)
 
     all_takeovers = [takeover_thread, subzy_output]
 
+    # -----------------------------------
     for template_dir in template_dirs:
         template_name = template_dir.strip("/").split("/")[-1]
         template_file = base / f"nuclei_{template_name}.txt"
@@ -161,15 +172,22 @@ def process_domain(domain, args):
 
         all_takeovers.append(template_file)
 
+    # -----------------------------------
     banner("Merge Takeover")
     merge_takeovers(all_takeovers, takeover_final)
 
     if args.no_nmap:
         return
 
+    # -----------------------------------
     banner("Extraindo IPs")
     extract_ips(alive, ips)
 
+    if not ips.exists() or ips.stat().st_size == 0:
+        print("[ERRO] Nenhum IP encontrado")
+        return
+
+    # -----------------------------------
     banner("Nmap Scan")
     run(f"nmap -p- -T4 -sV -Pn -sS -iL {ips} -oN {nmap}")
 
