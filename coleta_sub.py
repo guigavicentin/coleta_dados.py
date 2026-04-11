@@ -126,13 +126,16 @@ def process_domain(domain, args):
     if not args.no_http:
         template_dirs.append(NUCLEI_HTTP)
 
-    banner("Coleta Subdomínios")
-    run(f"subfinder -d {domain} --all -silent > {base}/subfinder.txt")
-    run(f"amass enum -active -norecursive -noalts -d {domain} -o {base}/amass.txt")
-    run(f"shodanx subdomain -d {domain} -o {base}/shodanx.txt")
-    run(f"python3 /home/caminho/da/subcat/subcat.py -d {domain} -o {base}/subcat.txt")
+    banner("Coleta Subdomínios (parallel)")
 
-    run(f"cat {base}/subfinder.txt {base}/amass.txt {base}/shodanx.txt {base}/subcat.txt | grep -v '*' | sort -u > {subs}")
+    run(f"(subfinder -d {domain} --all -silent > {base}/subfinder.txt) &")
+    run(f"(amass enum -active -norecursive -noalts -d {domain} -o {base}/amass.txt) &")
+    run(f"(shodanx subdomain -d {domain} -o {base}/shodanx.txt) &")
+    run(f"(chaos -d {domain} -silent > {base}/chaos.txt) &")
+    run(f"(assetfinder --subs-only {domain} > {base}/assetfinder.txt) &")
+    run("wait")
+
+    run(f"cat {base}/subfinder.txt {base}/amass.txt {base}/shodanx.txt {base}/chaos.txt {base}/assetfinder.txt | grep -v '*' | sort -u > {subs}")
 
     banner("Subzy Takeover Scan")
     run_subzy(subs, subzy_output)
