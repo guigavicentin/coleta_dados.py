@@ -1,98 +1,129 @@
 # 🔎 Recon Automation Toolkit
 
-Conjunto de scripts para **coleta de dados**, **reconhecimento** e **análise automatizada** voltados para **Bug Bounty**, **Pentest** e **estudos de segurança ofensiva**.
+Conjunto de scripts para coleta de dados, reconhecimento e análise automatizada voltados para Bug Bounty, Pentest e estudos de segurança ofensiva.
 
----
+📦 Ferramentas incluídas
+🧠 coleta_dadado.py
 
-# 📦 Ferramentas incluídas
+Ferramenta focada em coleta de URLs, análise de parâmetros e busca de arquivos sensíveis.
 
-## 🧠 coleta_dadado.py
+🔍 O que ela faz
 
-Ferramenta focada em **coleta de URLs**, **análise de parâmetros** e **busca de arquivos sensíveis**.
+Coleta URLs utilizando:
 
-### 🔍 O que ela faz
+katana
+gau
+waybackurls
 
-* Coleta URLs utilizando:
+Analisa URLs coletadas com:
 
-  * `katana`
-  * `gau`
-  * `waybackurls`
+gf
 
-* Analisa URLs coletadas com:
+Filtra possíveis pontos de:
 
-  * `gf`
+XSS
+SQLi
+SSRF
+SSTI
+Redirect
+Injection em geral
+Coleta arquivos .js
 
-* Filtra possíveis pontos de:
+Analisa JavaScript em busca de:
 
-  * XSS
-  * SQLi
-  * SSRF
-  * SSTI
-  * Redirect
-  * Injection em geral
+Tokens
+API Keys
+Secrets
+Endpoints ocultos
 
-* Coleta arquivos `.js`
+Busca arquivos sensíveis no histórico:
 
-* Analisa JavaScript em busca de:
+.env
+.sql
+.bak
+.zip
+.conf
+.log
+.json
+etc.
 
-  * Tokens
-  * API Keys
-  * Secrets
-  * Endpoints ocultos
+# ⚠️ Observação Importante
 
-* Busca arquivos sensíveis no histórico:
-
-  * `.env`
-  * `.sql`
-  * `.bak`
-  * `.zip`
-  * `.conf`
-  * `.log`
-  * `.json`
-  * etc.
-
-### ⚠️ Observação Importante
-
-Alguns caminhos podem estar **inativos**.
+Alguns caminhos podem estar inativos.
 Nestes casos, é altamente recomendado validar manualmente no:
 
 https://web.archive.org/
 
 Muitas vezes arquivos removidos ainda estão disponíveis no histórico.
 
----
+# 🌐 coleta_sub.py
 
-## 🌐 coleta_sub.py
+Ferramenta focada em reconhecimento de subdomínios, análise de superfície externa e detecção de takeover.
 
-Ferramenta focada em **reconhecimento de subdomínios** e **análise de superfície externa**.
+🔥 O que ela faz (atualizado)
 
-### 🔍 O que ela faz
+Coleta subdomínios utilizando múltiplas ferramentas:
 
-* Coleta subdomínios utilizando múltiplas ferramentas
-* Combina resultados para maior cobertura
-* Valida hosts ativos com `httpx`
-* Executa varreduras com `nuclei`
-* Verifica possíveis **Subdomain Takeover**
-* Extrai IPs dos hosts ativos
-* Executa `nmap` nos IPs descobertos
+subfinder
+amass
+assetfinder
+chaos
+shodanx
+Deduplicação automática dos resultados
 
-### 🧪 Fluxo
+Resolução DNS massiva com:
 
-1. Enumeração de subdomínios
-2. Deduplicação
-3. Validação HTTP
-4. Scan com nuclei
-5. Detecção takeover
-6. Extração de IPs
-7. Scan Nmap
+massdns
 
----
+Validação de hosts ativos com:
 
-# ⚙️ Dependências
+httpx
+Detecção de Subdomain Takeover com:
+subzy
+subjack
+análise manual baseada em fingerprint
+
+Varredura com:
+
+nuclei (templates oficiais)
+templates customizados (GIT)
+Extração de IPs dos hosts ativos
+
+Scan completo com:
+
+nmap - Não recomendado rodar sempre - priorize rodar com --no-nmap - rode o nmap em casos mais acertivos.
+
+🧪 Fluxo atualizado
+
+Enumeração de subdomínios
+Deduplicação
+Resolução DNS (massdns) 🌐
+Scan takeover inicial (subjack + subzy) 💀
+Validação HTTP (httpx)
+Detecção takeover (thread + fingerprint)
+Scan com nuclei (oficial + custom)
+Merge de resultados
+Extração de IPs
+Scan Nmap
+
+📂 Outputs gerados
+
+Arquivo	Descrição
+
+subdomains.txt	lista consolidada
+massdns.txt	resolução DNS
+alive.txt	hosts ativos
+subjack_vuln.txt resultado subjack
+subzy_takeovers.txt	resultados subzy
+takeover_threaded.txt	análise por fingerprint
+takeover_final.txt	merge final
+ips.txt	IPs extraídos
+nmap.txt	scan de portas
+
+⚙️ Dependências
 
 Certifique-se de ter instalado:
 
-```
 katana
 gau
 waybackurls
@@ -103,62 +134,50 @@ nmap
 subfinder
 amass
 shodanx
-```
+assetfinder
+massdns
+subjack
+subzy
 
----
+🚀 Uso
 
-# 🚀 Uso
+coleta_dadado.py
 
-### coleta_dadado.py
-
-```
 python3 coleta_dadado.py
-```
 
 Informe o domínio quando solicitado.
 
----
+coleta_sub.py
 
-### coleta_sub.py
-
-```
 python3 coleta_sub.py dominio.com
-```
 
 Ou lista:
 
-```
 python3 coleta_sub.py -l dominios.txt
-```
 
----
----
+🎯 Uso recomendado
 
-# 🎯 Uso recomendado
+Bug Bounty
 
-* Bug Bounty
-* Pentest autorizado
-* Recon inicial
-* Estudos de segurança
-* Hunting automatizado
+Pentest autorizado
 
----
+Recon inicial
+
+Estudos de segurança
+
+Hunting automatizado
 
 # ⚠️ Aviso Legal
 
 Ferramenta destinada exclusivamente para:
 
-* Bug bounty
-* Estudos
-* Pentests com autorização
+Bug bounty
+estudos
+pentests com autorização
 
-❗ Não utilize contra alvos sem permissão.
-❗ O uso indevido é de responsabilidade do usuário.
+❗ Não utilize contra alvos sem permissão
+❗ O uso indevido é de responsabilidade do usuário
 
 Use com moderação. 🛡️
-
----
-
-# 👨‍💻 Autor
 
 Guilherme Vicentin
