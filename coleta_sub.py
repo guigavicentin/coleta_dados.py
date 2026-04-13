@@ -33,38 +33,42 @@ def banner(step):
     print("="*60)
 
 # =========================
-# NOVO: SUBJACK
-# =========================
-def run_subjack(input_file, output_all, output_vuln):
-    print(f"[SUBJACK] Rodando em {input_file}")
-
-    try:
-        subprocess.run(
-            f"subjack -w {input_file} -t 100 -timeout 30 -ssl -v -o {output_all}",
-            shell=True
-        )
-
-        with open(output_all) as f, open(output_vuln, "w") as out:
-            for line in f:
-                if "Vulnerable" in line or "vulnerable" in line:
-                    out.write(line)
-
-    except Exception as e:
-        print(f"[ERRO SUBJACK] {e}")
-
-# =========================
-# NOVO: MASSDNS
+# MASSDNS
 # =========================
 def run_massdns(input_file, output_file):
     print(f"[MASSDNS] Rodando em {input_file}")
 
-    try:
-        subprocess.run(
-            f"massdns -r /home/guilherme/kali/minha_ferramenta/resolvers.txt -t A -o S {input_file} > {output_file}",
-            shell=True
-        )
-    except Exception as e:
-        print(f"[ERRO MASSDNS] {e}")
+    if not Path(input_file).exists() or Path(input_file).stat().st_size == 0:
+        print("[MASSDNS] Arquivo vazio ou inexistente, pulando...")
+        return
+
+    subprocess.run(
+        f"massdns -r /home/guilherme/kali/minha_ferramenta/resolvers.txt -t A -o S {input_file} -w {output_file}",
+        shell=True
+    )
+
+# =========================
+# SUBJACK
+# =========================
+def run_subjack(input_file, output_all, output_vuln):
+    print(f"[SUBJACK] Rodando em {input_file}")
+
+    if not Path(input_file).exists() or Path(input_file).stat().st_size == 0:
+        print("[SUBJACK] Arquivo vazio ou inexistente, pulando...")
+        return
+
+    subprocess.run(
+        f"subjack -w {input_file} -t 100 -timeout 30 -ssl -v -o {output_all}",
+        shell=True
+    )
+
+    if not Path(output_all).exists():
+        return
+
+    with open(output_all) as f, open(output_vuln, "w") as out:
+        for line in f:
+            if "Vulnerable" in line or "vulnerable" in line:
+                out.write(line)
 
 # =========================
 
@@ -96,7 +100,6 @@ def takeover_worker(url):
                 return url
     except:
         pass
-
     return None
 
 def threaded_takeover(alive_file, output_file):
@@ -149,14 +152,15 @@ def process_domain(domain, args):
 
     subs = base / "subdomains.txt"
     alive = base / "alive.txt"
+    clean_alive = base / "alive_clean.txt"
+    domains_only = base / "alive_domains.txt"
+
     ips = base / "ips.txt"
     takeover_thread = base / "takeover_threaded.txt"
-    takeover_nuclei = base / "takeover_nuclei.txt"
     takeover_final = base / "takeover_final.txt"
     subzy_output = base / "subzy_takeovers.txt"
     nmap = base / "nmap.txt"
 
-    # NOVOS
     subjack_all = base / "subjack_all.txt"
     subjack_vuln = base / "subjack_vuln.txt"
     massdns_output = base / "massdns.txt"
@@ -177,22 +181,29 @@ def process_domain(domain, args):
 
     run(f"cat {base}/subfinder.txt {base}/amass.txt {base}/shodanx.txt {base}/chaos.txt {base}/assetfinder.txt | grep -v '*' | sort -u > {subs}")
 
-    # =========================
-    banner("MassDNS Scan")
-    run_massdns(subs, massdns_output)
-
-    banner("Subjack Scan")
-    run_subjack(subs, subjack_all, subjack_vuln)
-    # =========================
-
-    banner("Subzy Takeover Scan")
-    run_subzy(subs, subzy_output)
+    if subs.exists():
+        print(f"[DEBUG] Total de subdomínios: {sum(1 for _ in open(subs))}")
 
     banner("Hosts ativos - HTTPX")
     run(f"httpx -silent -ip -title -sc -l {subs} -o {alive}")
 
+    # =========================
+    banner("Preparando listas")
+    run(f"cut -d ' ' -f1 {alive} > {clean_alive}")
+    run(f"cut -d ' ' -f1 {alive} | sed 's|https\\?://||' | cut -d '/' -f1 | sort -u > {domains_only}")
+    # =========================
+
+    banner("MassDNS Scan")
+    run_massdns(domains_only, massdns_output)
+
+    banner("Subjack Scan")
+    run_subjack(domains_only, subjack_all, subjack_vuln)
+
+    banner("Subzy Takeover Scan")
+    run_subzy(domains_only, subzy_output)
+
     banner("Takeover Threaded")
-    threaded_takeover(alive, takeover_thread)
+    threaded_takeover(clean_alive, takeover_thread)
 
     all_takeovers = [takeover_thread, subzy_output, subjack_vuln]
 
@@ -205,7 +216,7 @@ def process_domain(domain, args):
             severity = f"-severity {args.severity}"
 
         banner(f"Nuclei Scan: {template_name}")
-        run(f"nuclei -l {alive} -t {template_dir} {severity} -o {template_file}")
+        run(f"nuclei -l {clean_alive} -t {template_dir} {severity} -o {template_file}")
 
         all_takeovers.append(template_file)
 
