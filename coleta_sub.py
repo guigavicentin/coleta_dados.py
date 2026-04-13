@@ -10,8 +10,10 @@ from concurrent.futures import ThreadPoolExecutor
 NUCLEI_TAKEOVER = "/root/nuclei-templates/http/takeovers/"
 NUCLEI_NETWORK = "/root/nuclei-templates/network/"
 NUCLEI_HTTP = "/root/nuclei-templates/http/"
+NUCLEI_GITS = "/home/guilherme/kali/nuclei-templates-gits/"
 
 THREADS = 50
+
 fingerprints = [
     "NoSuchBucket",
     "There isn't a GitHub Pages site here",
@@ -29,6 +31,42 @@ def banner(step):
     print("\n" + "="*60)
     print(f"[+] ETAPA: {step}")
     print("="*60)
+
+# =========================
+# NOVO: SUBJACK
+# =========================
+def run_subjack(input_file, output_all, output_vuln):
+    print(f"[SUBJACK] Rodando em {input_file}")
+
+    try:
+        subprocess.run(
+            f"subjack -w {input_file} -t 100 -timeout 30 -ssl -v -o {output_all}",
+            shell=True
+        )
+
+        with open(output_all) as f, open(output_vuln, "w") as out:
+            for line in f:
+                if "Vulnerable" in line or "vulnerable" in line:
+                    out.write(line)
+
+    except Exception as e:
+        print(f"[ERRO SUBJACK] {e}")
+
+# =========================
+# NOVO: MASSDNS
+# =========================
+def run_massdns(input_file, output_file):
+    print(f"[MASSDNS] Rodando em {input_file}")
+
+    try:
+        subprocess.run(
+            f"massdns -r /home/guilherme/kali/minha_ferramenta/resolvers.txt -t A -o S {input_file} > {output_file}",
+            shell=True
+        )
+    except Exception as e:
+        print(f"[ERRO MASSDNS] {e}")
+
+# =========================
 
 def run_subzy(input_file, output):
     print(f"[SUBZY] Rodando em {input_file}")
@@ -118,7 +156,12 @@ def process_domain(domain, args):
     subzy_output = base / "subzy_takeovers.txt"
     nmap = base / "nmap.txt"
 
-    template_dirs = [NUCLEI_TAKEOVER]
+    # NOVOS
+    subjack_all = base / "subjack_all.txt"
+    subjack_vuln = base / "subjack_vuln.txt"
+    massdns_output = base / "massdns.txt"
+
+    template_dirs = [NUCLEI_TAKEOVER, NUCLEI_GITS]
 
     if not args.no_network:
         template_dirs.append(NUCLEI_NETWORK)
@@ -134,6 +177,14 @@ def process_domain(domain, args):
 
     run(f"cat {base}/subfinder.txt {base}/amass.txt {base}/shodanx.txt {base}/chaos.txt {base}/assetfinder.txt | grep -v '*' | sort -u > {subs}")
 
+    # =========================
+    banner("MassDNS Scan")
+    run_massdns(subs, massdns_output)
+
+    banner("Subjack Scan")
+    run_subjack(subs, subjack_all, subjack_vuln)
+    # =========================
+
     banner("Subzy Takeover Scan")
     run_subzy(subs, subzy_output)
 
@@ -143,7 +194,7 @@ def process_domain(domain, args):
     banner("Takeover Threaded")
     threaded_takeover(alive, takeover_thread)
 
-    all_takeovers = [takeover_thread, subzy_output]
+    all_takeovers = [takeover_thread, subzy_output, subjack_vuln]
 
     for template_dir in template_dirs:
         template_name = template_dir.strip("/").split("/")[-1]
