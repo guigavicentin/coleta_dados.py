@@ -170,7 +170,7 @@ def process_domain(domain, args):
 
     banner("Coleta Subdomínios")
     run(f"subfinder -d {domain} --all -silent > {base}/subfinder.txt")
-    run(f"amass enum -active -norecursive -noalts -d {domain} -o {base}/amass.txt")
+    run(f"amass enum -passive -norecursive -d {domain} -o {base}/amass.txt")
     run(f"shodanx subdomain -d {domain} -o {base}/shodanx.txt")
     run(f"chaos -d {domain} -silent > {base}/chaos.txt")
     run(f"assetfinder --subs-only {domain} > {base}/assetfinder.txt")
