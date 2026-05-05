@@ -19,6 +19,9 @@ endpoints = {
     "Elevation": f"https://maps.googleapis.com/maps/api/elevation/json?locations=39.7391536,-104.9847034&key={API_KEY}",
     "Timezone": f"https://maps.googleapis.com/maps/api/timezone/json?location=39.6034810,-119.6822510&timestamp=1331161200&key={API_KEY}",
     "Roads": f"https://roads.googleapis.com/v1/nearestRoads?points=60.170880,24.942795&key={API_KEY}",
+
+    # 🔥 Novo endpoint (IA generativa)
+    "Generative Language (Models)": f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}",
 }
 
 def check(name, url):
@@ -28,6 +31,10 @@ def check(name, url):
 
         if "REQUEST_DENIED" in r.text:
             result = "DENIED"
+        elif "API key not valid" in r.text:
+            result = "INVALID KEY"
+        elif "PERMISSION_DENIED" in r.text:
+            result = "NO PERMISSION"
         elif "error" in r.text.lower():
             result = "ERROR"
         elif status == 200:
