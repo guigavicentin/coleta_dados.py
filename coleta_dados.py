@@ -459,6 +459,97 @@ def tool_available(name: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Fontes passivas via API HTTP direta (fallback sem dependência de ferramentas)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fetch_wayback_api(domain: str, logger: logging.Logger) -> set[str]:
+    """
+    Consulta a CDX API da Wayback Machine diretamente.
+    Pagina automaticamente — domínios grandes podem ter 100k+ URLs.
+    Não depende de gau nem waybackurls instalados.
+    """
+    urls: set[str] = set()
+    base_url = "https://web.archive.org/cdx/search/cdx"
+    params = {
+        "url":        f"*.{domain}/*",
+        "output":     "text",
+        "fl":         "original",
+        "collapse":   "urlkey",
+        "limit":      "100000",
+        "filter":     "statuscode:200",
+    }
+
+    try:
+        resp = requests.get(
+            base_url,
+            params=params,
+            timeout=120,
+            headers={"User-Agent": "Mozilla/5.0 recon"},
+        )
+        if resp.status_code == 200:
+            for line in resp.text.splitlines():
+                line = line.strip()
+                if line and line.startswith("http"):
+                    urls.add(line)
+        else:
+            logger.debug("[wayback-api] HTTP %d", resp.status_code)
+    except requests.exceptions.Timeout:
+        logger.warning("[wayback-api] timeout na requisição.")
+    except Exception as exc:
+        logger.debug("[wayback-api] erro: %s", exc)
+
+    return urls
+
+
+def _fetch_commoncrawl_api(domain: str, logger: logging.Logger) -> set[str]:
+    """
+    Consulta o índice mais recente do CommonCrawl via API.
+    Não depende de gau instalado.
+    """
+    urls: set[str] = set()
+
+    # Descobre o índice mais recente
+    try:
+        idx_resp = requests.get(
+            "https://index.commoncrawl.org/collinfo.json",
+            timeout=30,
+            headers={"User-Agent": "Mozilla/5.0 recon"},
+        )
+        if idx_resp.status_code != 200:
+            return urls
+        indexes = idx_resp.json()
+        # Pega os 3 mais recentes para maior cobertura
+        recent = [i["cdx-api"] for i in indexes[:3]]
+    except Exception as exc:
+        logger.debug("[commoncrawl-api] erro ao buscar índices: %s", exc)
+        return urls
+
+    for api_url in recent:
+        try:
+            resp = requests.get(
+                api_url,
+                params={
+                    "url":      f"*.{domain}",
+                    "output":   "text",
+                    "fl":       "url",
+                    "collapse": "urlkey",
+                    "limit":    "50000",
+                },
+                timeout=60,
+                headers={"User-Agent": "Mozilla/5.0 recon"},
+            )
+            if resp.status_code == 200:
+                for line in resp.text.splitlines():
+                    line = line.strip()
+                    if line and line.startswith("http"):
+                        urls.add(line)
+        except Exception as exc:
+            logger.debug("[commoncrawl-api] erro em %s: %s", api_url, exc)
+
+    return urls
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Etapa 1: Coleta de URLs
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -478,8 +569,6 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
     all_urls: set[str] = set()
 
     # ── gau ───────────────────────────────────────────────────────────────────
-    # Timeout alto: wayback + commoncrawl podem demorar bastante em alvos grandes
-    # como ifood.com.br, globo.com, mercadolivre.com (5-15 min é normal)
     if tool_available("gau"):
         logger.info("[gau] coletando… (pode demorar vários minutos)")
         try:
@@ -490,28 +579,30 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
                     "--subs",
                     "--providers", "wayback,commoncrawl,otx,urlscan",
                     "--retries", "3",
-                    "--timeout", "60",   # timeout por requisição HTTP interna do gau
+                    "--timeout", "60",
                     domain,
                 ],
                 capture_output=True,
                 text=True,
-                timeout=1800,            # 30 min máximo total
+                timeout=1800,
             )
             lines = [l for l in result.stdout.splitlines() if l.strip()]
-            if result.stderr and not lines:
-                logger.debug("[gau stderr] %s", result.stderr.strip()[:500])
+            # Mostra stderr sempre que retornar vazio — ajuda a diagnosticar
+            if result.stderr:
+                logger.debug("[gau stderr] %s", result.stderr.strip()[:800])
+                if not lines:
+                    logger.warning("[gau] retornou vazio. stderr: %s",
+                                   result.stderr.strip()[:300])
             all_urls.update(lines)
             logger.info("[gau] %d URLs", len(lines))
         except subprocess.TimeoutExpired:
-            logger.warning("[gau] timeout de 30min atingido — continuando com o que foi coletado.")
+            logger.warning("[gau] timeout de 30min atingido.")
         except Exception as exc:
             logger.error("[gau] erro: %s", exc)
     else:
         logger.warning("gau não encontrado — pulando.")
 
     # ── waybackurls ───────────────────────────────────────────────────────────
-    # Lê EXCLUSIVAMENTE via stdin. A Wayback Machine pode ser muito lenta para
-    # domínios grandes — 300s é insuficiente para ifood, globo, etc.
     if tool_available("waybackurls"):
         logger.info("[waybackurls] coletando… (pode demorar vários minutos)")
         try:
@@ -520,19 +611,42 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
                 input=domain + "\n",
                 capture_output=True,
                 text=True,
-                timeout=1800,            # 30 min máximo total
+                timeout=1800,
             )
             lines = [l for l in result.stdout.splitlines() if l.strip()]
-            if result.stderr and not lines:
-                logger.debug("[waybackurls stderr] %s", result.stderr.strip()[:500])
+            if result.stderr:
+                logger.debug("[waybackurls stderr] %s", result.stderr.strip()[:800])
+                if not lines:
+                    logger.warning("[waybackurls] retornou vazio. stderr: %s",
+                                   result.stderr.strip()[:300])
             all_urls.update(lines)
             logger.info("[waybackurls] %d URLs", len(lines))
         except subprocess.TimeoutExpired:
-            logger.warning("[waybackurls] timeout de 30min atingido — continuando com o que foi coletado.")
+            logger.warning("[waybackurls] timeout de 30min atingido.")
         except Exception as exc:
             logger.error("[waybackurls] erro: %s", exc)
     else:
         logger.warning("waybackurls não encontrado — pulando.")
+
+    # ── Wayback Machine API direta (fallback independente de ferramentas) ─────
+    # Consulta a CDX API da Wayback Machine diretamente via HTTP.
+    # Funciona mesmo se gau/waybackurls falharem ou retornarem vazio.
+    logger.info("[wayback-api] consultando CDX API…")
+    wayback_urls = _fetch_wayback_api(domain, logger)
+    if wayback_urls:
+        all_urls.update(wayback_urls)
+        logger.info("[wayback-api] %d URLs", len(wayback_urls))
+    else:
+        logger.info("[wayback-api] nenhuma URL retornada.")
+
+    # ── CommonCrawl API direta ────────────────────────────────────────────────
+    logger.info("[commoncrawl-api] consultando…")
+    cc_urls = _fetch_commoncrawl_api(domain, logger)
+    if cc_urls:
+        all_urls.update(cc_urls)
+        logger.info("[commoncrawl-api] %d URLs", len(cc_urls))
+    else:
+        logger.info("[commoncrawl-api] nenhuma URL retornada.")
 
     # ── katana ────────────────────────────────────────────────────────────────
     if tool_available("katana"):
