@@ -568,61 +568,68 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
     domain = cfg["domain"]
     all_urls: set[str] = set()
 
+
     # ── gau ───────────────────────────────────────────────────────────────────
+    # Usa Popen com leitura linha a linha para não travar com capture_output.
+    # Timer de 10 min mata o processo se travar.
     if tool_available("gau"):
-        logger.info("[gau] coletando… (pode demorar vários minutos)")
+        logger.info("[gau] coletando… (domínio: %s)", domain)
         try:
-            result = subprocess.run(
-                [
-                    "gau",
-                    "--threads", "5",
-                    "--subs",
-                    "--providers", "wayback,commoncrawl,otx,urlscan",
-                    "--retries", "3",
-                    "--timeout", "60",
-                    domain,
-                ],
-                capture_output=True,
+            import threading as _th
+            proc = subprocess.Popen(
+                ["gau", "--threads", "5", "--subs",
+                 "--providers", "wayback,commoncrawl,otx,urlscan",
+                 "--retries", "2", "--timeout", "30", domain],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=1800,
             )
-            lines = [l for l in result.stdout.splitlines() if l.strip()]
-            # Mostra stderr sempre que retornar vazio — ajuda a diagnosticar
-            if result.stderr:
-                logger.debug("[gau stderr] %s", result.stderr.strip()[:800])
-                if not lines:
-                    logger.warning("[gau] retornou vazio. stderr: %s",
-                                   result.stderr.strip()[:300])
-            all_urls.update(lines)
-            logger.info("[gau] %d URLs", len(lines))
-        except subprocess.TimeoutExpired:
-            logger.warning("[gau] timeout de 30min atingido.")
+            gau_lines: list[str] = []
+            killer = _th.Timer(600, lambda: proc.kill())
+            killer.start()
+            try:
+                for line in proc.stdout:
+                    line = line.strip()
+                    if line:
+                        gau_lines.append(line)
+            finally:
+                killer.cancel()
+                proc.wait(timeout=5)
+            all_urls.update(gau_lines)
+            logger.info("[gau] %d URLs", len(gau_lines))
         except Exception as exc:
             logger.error("[gau] erro: %s", exc)
     else:
         logger.warning("gau não encontrado — pulando.")
 
     # ── waybackurls ───────────────────────────────────────────────────────────
+    # Lê via stdin com Popen + timer de kill.
     if tool_available("waybackurls"):
-        logger.info("[waybackurls] coletando… (pode demorar vários minutos)")
+        logger.info("[waybackurls] coletando… (domínio: %s)", domain)
         try:
-            result = subprocess.run(
+            import threading as _th
+            proc = subprocess.Popen(
                 ["waybackurls"],
-                input=domain + "\n",
-                capture_output=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=1800,
             )
-            lines = [l for l in result.stdout.splitlines() if l.strip()]
-            if result.stderr:
-                logger.debug("[waybackurls stderr] %s", result.stderr.strip()[:800])
-                if not lines:
-                    logger.warning("[waybackurls] retornou vazio. stderr: %s",
-                                   result.stderr.strip()[:300])
-            all_urls.update(lines)
-            logger.info("[waybackurls] %d URLs", len(lines))
-        except subprocess.TimeoutExpired:
-            logger.warning("[waybackurls] timeout de 30min atingido.")
+            wb_lines: list[str] = []
+            killer = _th.Timer(600, lambda: proc.kill())
+            killer.start()
+            try:
+                proc.stdin.write(domain + "\n")
+                proc.stdin.close()
+                for line in proc.stdout:
+                    line = line.strip()
+                    if line:
+                        wb_lines.append(line)
+            finally:
+                killer.cancel()
+                proc.wait(timeout=5)
+            all_urls.update(wb_lines)
+            logger.info("[waybackurls] %d URLs", len(wb_lines))
         except Exception as exc:
             logger.error("[waybackurls] erro: %s", exc)
     else:
