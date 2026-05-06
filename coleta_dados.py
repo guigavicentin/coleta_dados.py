@@ -430,7 +430,7 @@ def _make_retrying_get(cfg: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_cmd(cmd: list[str], logger: logging.Logger,
-            stdin: str | None = None, timeout: int = 300) -> list[str]:
+            stdin: str | None = None, timeout: int = 1000) -> list[str]:
     try:
         result = subprocess.run(
             cmd,
@@ -489,7 +489,7 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
             "--providers", "wayback,commoncrawl,otx,urlscan",
             "--retries", "3",
             domain,
-        ], logger, timeout=600)
+        ], logger, timeout=1000)
         all_urls.update(lines)
         logger.info("[gau] %d URLs", len(lines))
     else:
@@ -504,7 +504,7 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
             ["waybackurls"],
             logger,
             stdin=domain + "\n",
-            timeout=300,
+            timeout=1000,
         )
         all_urls.update(lines)
         logger.info("[waybackurls] %d URLs", len(lines))
@@ -524,7 +524,7 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
             "-jc",
             "-ef", "woff,css,png,svg,jpg,woff2,jpeg,gif,ico,ttf",
             "-silent",
-        ], logger, timeout=600)
+        ], logger, timeout=1000)
         all_urls.update(lines)
         logger.info("[katana] %d URLs", len(lines))
     else:
@@ -541,7 +541,7 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
             ["hakrawler", "-d", "3", "-u", "-subs", "-t", "8", "-insecure"],
             logger,
             stdin=f"https://{domain}\n",
-            timeout=300,
+            timeout=1000,
         )
         all_urls.update(lines)
         logger.info("[hakrawler] %d URLs", len(lines))
@@ -564,7 +564,7 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
             "-w",          # include-subs de third-party
             "--subs",      # inclui subdomínios no crawl
             "-q",          # quiet: só mostra URLs, sem banner
-        ], logger, timeout=600)
+        ], logger, timeout=1000)
         for line in raw:
             m = re.search(r'https?://[^\s"\'<>\]]+', line)
             if m:
@@ -576,7 +576,7 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
     # ── subfinder → hakrawler + gospider em subdomínios ──────────────────────
     if tool_available("subfinder"):
         logger.info("[subfinder] enumerando subdomínios…")
-        subs = run_cmd(["subfinder", "-d", domain, "-silent"], logger, timeout=300)
+        subs = run_cmd(["subfinder", "-d", domain, "-silent"], logger, timeout=1000)
         logger.info("[subfinder] %d subdomínios encontrados", len(subs))
 
         if subs:
