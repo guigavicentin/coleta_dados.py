@@ -1134,18 +1134,33 @@ def _secret_context(content: str, start: int, end: int, radius: int = 90) -> str
     return content[left:right].replace("\r", " ").replace("\n", " ").strip()
 
 
+# Cache global de URLs de JS já analisadas — compartilhado entre domínio
+# raiz e todos os subdomínios. Evita baixar/analisar o mesmo bundle
+# dezenas de vezes quando múltiplos subdomínios apontam para o mesmo CDN.
+_analyzed_js_urls: set[str] = set()
+_analyzed_js_lock: threading.Lock = threading.Lock()
+
+# Cache de achados já registrados — evita duplicar o mesmo segredo
+# quando o mesmo arquivo JS é referenciado por múltiplos subdomínios.
+# Chave: (tipo, valor) — não inclui URL para capturar mesmo segredo em arquivos distintos.
+_seen_secrets: set[tuple[str, str]] = set()
+_seen_secrets_lock: threading.Lock = threading.Lock()
+
 # Lock global para escrita nos arquivos de segredos (threads paralelas)
 _secret_write_lock = threading.Lock()
 
 
-def _append_secret(finding: dict, cfg: dict) -> None:
+def _append_secret(finding: dict, cfg: dict) -> bool:
     """
-    Persiste um achado em:
-      - secrets.txt   (legível)
-      - secrets.csv
-      - secrets.jsonl
-    Cria cabeçalho do CSV apenas na primeira linha.
+    Persiste um achado em secrets.txt, secrets.csv e secrets.jsonl.
+    Retorna False se o achado já foi registrado antes (dedup por tipo+valor).
     """
+    key = (finding["type"], finding["value"])
+    with _seen_secrets_lock:
+        if key in _seen_secrets:
+            return False
+        _seen_secrets.add(key)
+
     with _secret_write_lock:
         # TXT
         append_line_to_file(
@@ -1178,6 +1193,7 @@ def _append_secret(finding: dict, cfg: dict) -> None:
                 "context": finding["context"][:300],
             }, ensure_ascii=False)
         )
+    return True
 
 
 def analyze_js_content(
@@ -1215,15 +1231,18 @@ def analyze_js_content(
                     continue
 
             context = _secret_context(content, match.start(), match.end())
-            logger.warning("[!!!] %s → %s | %s", name, value[:80], url)
 
             finding = {"type": name, "value": value, "url": url, "context": context}
-            _append_secret(finding, cfg)
-            found += 1
+            if _append_secret(finding, cfg):
+                # Só loga e conta se for um achado novo (não duplicado)
+                logger.warning("[!!!] %s → %s | %s", name, value[:80], url)
+                found += 1
 
-            if name == "google_api_key":
-                with google_keys_lock:
-                    google_keys_found.add(value)
+                if name == "google_api_key":
+                    with google_keys_lock:
+                        google_keys_found.add(value)
+            else:
+                logger.debug("[DEDUP] %s já registrado — pulando.", name)
 
     # Detecção de ofuscação por char-codes
     for obf in scan_charcode_obfuscation(content, url, logger):
@@ -1251,6 +1270,14 @@ def process_js(
     google_keys_lock: threading.Lock,
     get_fn,
 ) -> int:
+    # Normaliza a URL removendo query strings para melhor deduplicação
+    # ex: /app.js?v=123 e /app.js?v=456 são o mesmo arquivo
+    url_key = url.split("?")[0]
+    with _analyzed_js_lock:
+        if url_key in _analyzed_js_urls:
+            logger.debug("[CACHE] JS já analisado — pulando: %s", url)
+            return 0
+        _analyzed_js_urls.add(url_key)
     try:
         resp = get_fn(url)
     except requests.exceptions.SSLError as exc:
@@ -1493,6 +1520,14 @@ def analyze_subdomains(
         # Analisa cada arquivo JS
         sub_findings = 0
         for js_url in js_urls:
+            # Verifica cache antes de fazer request
+            url_key = js_url.split("?")[0]
+            with _analyzed_js_lock:
+                if url_key in _analyzed_js_urls:
+                    logger.debug("[CACHE] JS já analisado — pulando: %s", js_url)
+                    continue
+                _analyzed_js_urls.add(url_key)
+
             try:
                 resp = get_fn(js_url)
             except Exception:
@@ -1505,7 +1540,6 @@ def analyze_subdomains(
             if not is_valid_js(resp, content):
                 continue
 
-            # analyze_js_content usa cfg["secrets_*"] do root → achados consolidados
             n = analyze_js_content(
                 content, js_url, cfg, logger,
                 all_google_keys, google_keys_lock,
