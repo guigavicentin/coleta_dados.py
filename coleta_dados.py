@@ -430,7 +430,7 @@ def _make_retrying_get(cfg: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_cmd(cmd: list[str], logger: logging.Logger,
-            stdin: str | None = None, timeout: int = 1000) -> list[str]:
+            stdin: str | None = None, timeout: int = 300) -> list[str]:
     try:
         result = subprocess.run(
             cmd,
@@ -478,36 +478,59 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
     all_urls: set[str] = set()
 
     # ── gau ───────────────────────────────────────────────────────────────────
-    # Providers válidos: wayback, commoncrawl, otx, urlscan  (alienvault NÃO existe)
-    # --retries aceita uint; --threads aceita uint
+    # Timeout alto: wayback + commoncrawl podem demorar bastante em alvos grandes
+    # como ifood.com.br, globo.com, mercadolivre.com (5-15 min é normal)
     if tool_available("gau"):
-        logger.info("[gau] coletando…")
-        lines = run_cmd([
-            "gau",
-            "--threads", "5",
-            "--subs",
-            "--providers", "wayback,commoncrawl,otx,urlscan",
-            "--retries", "3",
-            domain,
-        ], logger, timeout=1000)
-        all_urls.update(lines)
-        logger.info("[gau] %d URLs", len(lines))
+        logger.info("[gau] coletando… (pode demorar vários minutos)")
+        try:
+            result = subprocess.run(
+                [
+                    "gau",
+                    "--threads", "5",
+                    "--subs",
+                    "--providers", "wayback,commoncrawl,otx,urlscan",
+                    "--retries", "3",
+                    "--timeout", "60",   # timeout por requisição HTTP interna do gau
+                    domain,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=1800,            # 30 min máximo total
+            )
+            lines = [l for l in result.stdout.splitlines() if l.strip()]
+            if result.stderr and not lines:
+                logger.debug("[gau stderr] %s", result.stderr.strip()[:500])
+            all_urls.update(lines)
+            logger.info("[gau] %d URLs", len(lines))
+        except subprocess.TimeoutExpired:
+            logger.warning("[gau] timeout de 30min atingido — continuando com o que foi coletado.")
+        except Exception as exc:
+            logger.error("[gau] erro: %s", exc)
     else:
         logger.warning("gau não encontrado — pulando.")
 
     # ── waybackurls ───────────────────────────────────────────────────────────
-    # Lê EXCLUSIVAMENTE via stdin — não existe argumento posicional.
-    # Flags úteis: sem --no-subs (queremos subdomínios)
+    # Lê EXCLUSIVAMENTE via stdin. A Wayback Machine pode ser muito lenta para
+    # domínios grandes — 300s é insuficiente para ifood, globo, etc.
     if tool_available("waybackurls"):
-        logger.info("[waybackurls] coletando…")
-        lines = run_cmd(
-            ["waybackurls"],
-            logger,
-            stdin=domain + "\n",
-            timeout=1000,
-        )
-        all_urls.update(lines)
-        logger.info("[waybackurls] %d URLs", len(lines))
+        logger.info("[waybackurls] coletando… (pode demorar vários minutos)")
+        try:
+            result = subprocess.run(
+                ["waybackurls"],
+                input=domain + "\n",
+                capture_output=True,
+                text=True,
+                timeout=1800,            # 30 min máximo total
+            )
+            lines = [l for l in result.stdout.splitlines() if l.strip()]
+            if result.stderr and not lines:
+                logger.debug("[waybackurls stderr] %s", result.stderr.strip()[:500])
+            all_urls.update(lines)
+            logger.info("[waybackurls] %d URLs", len(lines))
+        except subprocess.TimeoutExpired:
+            logger.warning("[waybackurls] timeout de 30min atingido — continuando com o que foi coletado.")
+        except Exception as exc:
+            logger.error("[waybackurls] erro: %s", exc)
     else:
         logger.warning("waybackurls não encontrado — pulando.")
 
@@ -524,7 +547,7 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
             "-jc",
             "-ef", "woff,css,png,svg,jpg,woff2,jpeg,gif,ico,ttf",
             "-silent",
-        ], logger, timeout=1000)
+        ], logger, timeout=600)
         all_urls.update(lines)
         logger.info("[katana] %d URLs", len(lines))
     else:
@@ -541,7 +564,7 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
             ["hakrawler", "-d", "3", "-u", "-subs", "-t", "8", "-insecure"],
             logger,
             stdin=f"https://{domain}\n",
-            timeout=1000,
+            timeout=300,
         )
         all_urls.update(lines)
         logger.info("[hakrawler] %d URLs", len(lines))
@@ -564,7 +587,7 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
             "-w",          # include-subs de third-party
             "--subs",      # inclui subdomínios no crawl
             "-q",          # quiet: só mostra URLs, sem banner
-        ], logger, timeout=1000)
+        ], logger, timeout=600)
         for line in raw:
             m = re.search(r'https?://[^\s"\'<>\]]+', line)
             if m:
@@ -576,7 +599,7 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
     # ── subfinder → hakrawler + gospider em subdomínios ──────────────────────
     if tool_available("subfinder"):
         logger.info("[subfinder] enumerando subdomínios…")
-        subs = run_cmd(["subfinder", "-d", domain, "-silent"], logger, timeout=1000)
+        subs = run_cmd(["subfinder", "-d", domain, "-silent"], logger, timeout=300)
         logger.info("[subfinder] %d subdomínios encontrados", len(subs))
 
         if subs:
