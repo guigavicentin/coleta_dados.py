@@ -874,23 +874,51 @@ def probe_xss(cfg: dict, logger: logging.Logger) -> int:
         return 0
 
     out_file = cfg["gf_dir"] / "dalfox_results.txt"
-    logger.info("Rodando dalfox…")
+    logger.info("Rodando dalfox… (pode demorar bastante dependendo do volume de URLs)")
+
     try:
-        subprocess.run(
-            ["dalfox", "file", str(xss_file),
-             "--silence", "--output", str(out_file),
-             "--worker", "10", "--timeout", "10"],
-            capture_output=True, text=True, timeout=600,
+        proc = subprocess.Popen(
+            [
+                "dalfox", "file", str(xss_file),
+                "--silence",
+                "--output", str(out_file),
+                "--worker", "10",
+                "--timeout", "10",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
-        hits = out_file.read_text(encoding="utf-8").count("[V]") if out_file.exists() else 0
+
+        hits = 0
+        killer = threading.Timer(3600, lambda: proc.kill())  # mata só após 1h
+        killer.start()
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                logger.debug("[dalfox] %s", line)
+                if "[V]" in line:
+                    hits += 1
+                    logger.warning("[!!!] dalfox XSS confirmado: %s", line)
+        finally:
+            killer.cancel()
+            proc.wait(timeout=15)
+
+        # Fallback: conta no arquivo de saída caso --silence tenha suprimido stdout
+        if hits == 0 and out_file.exists():
+            hits = out_file.read_text(encoding="utf-8").count("[V]")
+
         if hits:
             logger.warning("[!!!] dalfox: %d XSS confirmados → %s", hits, out_file)
         else:
-            # Apaga arquivo vazio
             if out_file.exists():
                 out_file.unlink()
             logger.info("dalfox: nenhum XSS confirmado.")
+
         return hits
+
     except Exception as exc:
         logger.error("Erro no dalfox: %s", exc)
         return 0
