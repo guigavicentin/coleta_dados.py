@@ -317,6 +317,12 @@ def get_config(domain: str) -> dict:
             "notion_token":         _regex(r'secret_[A-Za-z0-9]{43}'),
             "linear_api_key":       _regex(r'lin_api_[A-Za-z0-9]{40}'),
 
+            # Supabase
+            "supabase_url":          _regex(r'https://[a-z0-9]{20}\.supabase\.co', re.I),
+            "supabase_anon_key":     _regex(r'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[A-Za-z0-9_\-]{50,}\.[A-Za-z0-9_\-]{43}'),
+            "supabase_service_role": _regex(r'(?:SUPABASE_SERVICE_ROLE_KEY|service_role)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-\.]{100,})["\']', re.I),
+            "supabase_env":          _regex(r'SUPABASE_(?:URL|ANON_KEY|SERVICE_ROLE_KEY)\s*[=:]\s*\S+', re.I),
+
             # Chaves privadas
             "private_key":          _regex(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
 
@@ -364,6 +370,8 @@ def get_config(domain: str) -> dict:
             re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
             re.compile(r'(?:MAIL|SMTP)_PASS(?:WORD)?\s*=\s*\S+', re.I),
             re.compile(r'(?:STRIPE|PAYPAL|BRAINTREE)[_-](?:SECRET|KEY|TOKEN)\s*=\s*\S+', re.I),
+            re.compile(r'SUPABASE_(?:URL|ANON_KEY|SERVICE_ROLE_KEY)\s*=\s*\S+', re.I),
+            re.compile(r'createClient\s*\(\s*["\']https://[a-z0-9]+\.supabase\.co["\']', re.I),
         ],
     }
 
