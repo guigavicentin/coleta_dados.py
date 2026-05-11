@@ -53,11 +53,10 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # Constantes de qualidade
 # ─────────────────────────────────────────────────────────────────────────────
 
-_MIN_VALUE_LEN  = 8
-_MIN_ENTROPY    = 3.2   # bits por caractere (Shannon)
+_MIN_VALUE_LEN       = 8
+_MIN_ENTROPY         = 3.2
 _DECODED_ENTROPY_MIN = 3.5
 
-# Palavras que indicam valor de placeholder / UI / i18n
 _PLACEHOLDER_RE = re.compile(
     r'^('
     r'enter|your|change|example|placeholder|sample|dummy|fake|'
@@ -71,7 +70,6 @@ _PLACEHOLDER_RE = re.compile(
     re.I,
 )
 
-# Contexto de UI / i18n que indica que o valor não é um segredo real
 _UI_CONTEXT_RE = re.compile(
     r'(label|placeholder|hint|aria[-_]label|title|description|'
     r'tooltip|helper|message|text|i18n|translate|t\(|'
@@ -79,7 +77,6 @@ _UI_CONTEXT_RE = re.compile(
     re.I,
 )
 
-# CDNs comuns — URLs de JS vindas desses domínios são descartadas
 _CDN_DOMAINS_RE = re.compile(
     r'(?:cdnjs\.cloudflare\.com|cdn\.jsdelivr\.net|unpkg\.com|'
     r'ajax\.googleapis\.com|stackpath\.bootstrapcdn\.com|'
@@ -97,34 +94,20 @@ def _regex(pattern: str, flags: int = 0) -> re.Pattern:
     return re.compile(pattern, flags)
 
 
-def _ctx_regex(context: str, value_pattern: str,
-               flags: int = re.I, window: int = 80) -> re.Pattern:
-    """Regex que exige palavra de contexto próxima ao segredo (reduz FP)."""
-    return re.compile(
-        rf'(?is)(?:{context})' + r'.{0,' + str(window) + r'}(' + value_pattern + r')',
-        flags,
-    )
-
-
 def _shannon_entropy(s: str) -> float:
     if not s:
         return 0.0
-    freq = collections.Counter(s)
+    freq  = collections.Counter(s)
     total = len(s)
     return -sum((c / total) * math.log2(c / total) for c in freq.values())
 
 
 def _extract_value(raw_match: str) -> str:
-    """Extrai o valor do lado direito de key=value ou key:value."""
     m = re.search(r'[:=]\s*["\']?([^\s"\'`,;]{4,})', raw_match)
     return m.group(1).strip() if m else raw_match.strip()
 
 
 def is_likely_real_credential(raw_match: str, context_line: str = "") -> bool:
-    """
-    Filtragem de alta precisão para padrões genéricos (password, token, secret).
-    Retorna False se parecer placeholder, i18n ou baixa entropia.
-    """
     value = _extract_value(raw_match)
     if len(value) < _MIN_VALUE_LEN:
         return False
@@ -148,7 +131,7 @@ _DECODED_SECRET_CHECKS: list[tuple[str, re.Pattern | None]] = [
     ("google_key_decoded",   re.compile(r'AIza[0-9A-Za-z\-_]{35}')),
     ("aws_key_decoded",      re.compile(r'AKIA[0-9A-Z]{16}')),
     ("jwt_decoded",          re.compile(r'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+')),
-    ("high_entropy_decoded", None),   # fallback: apenas entropia
+    ("high_entropy_decoded", None),
 ]
 
 
@@ -163,7 +146,6 @@ def _decode_charcode_array(array_str: str) -> str | None:
 
 
 def scan_charcode_obfuscation(content: str, url: str, logger: logging.Logger) -> list[dict]:
-    """Varre arrays de char-codes e retorna lista de achados (sem escrever arquivos)."""
     results = []
     for m in _CHARCODE_ARRAY_RE.finditer(content):
         decoded = _decode_charcode_array(m.group(1))
@@ -226,38 +208,32 @@ def get_config(domain: str) -> dict:
     base.mkdir(exist_ok=True)
 
     return {
-        "domain":     domain,
-        "base_dir":   base,
+        "domain":   domain,
+        "base_dir": base,
 
-        # Arquivos de saída — criados SÓ se tiverem conteúdo
-        "urls_file":          base / "urls_raw.txt",
-        "urls_alive_file":    base / "urls_alive.txt",
-        "js_file":            base / "js_urls.txt",
-        "secrets_txt":        base / "secrets.txt",
-        "secrets_csv":        base / "secrets.csv",
-        "secrets_jsonl":      base / "secrets.jsonl",
-        "google_keys_file":   base / "google_keys.txt",
-        "google_report_file": base / "google_keys_report.txt",
-        "log_file":           base / "recon.log",
-        "gf_dir":             base / "gf",
-        "sensitive_urls_file":base / "sensitive_urls.txt",
-        "sensitive_dir":      base / "sensitive_downloads",
-        "sensitive_report":   base / "sensitive_report.txt",
-        "api_endpoints_file": base / "api_endpoints.txt",
-        "summary_file":       base / "SUMMARY.txt",
+        "urls_file":           base / "urls_raw.txt",
+        "urls_alive_file":     base / "urls_alive.txt",
+        "js_file":             base / "js_urls.txt",
+        "secrets_txt":         base / "secrets.txt",
+        "secrets_csv":         base / "secrets.csv",
+        "secrets_jsonl":       base / "secrets.jsonl",
+        "google_keys_file":    base / "google_keys.txt",
+        "google_report_file":  base / "google_keys_report.txt",
+        "log_file":            base / "recon.log",
+        "gf_dir":              base / "gf",
+        "sensitive_urls_file": base / "sensitive_urls.txt",
+        "sensitive_dir":       base / "sensitive_downloads",
+        "sensitive_report":    base / "sensitive_report.txt",
+        "api_endpoints_file":  base / "api_endpoints.txt",
+        "summary_file":        base / "SUMMARY.txt",
 
         "gf_patterns": ["xss", "sqli", "ssrf", "redirect", "ssti"],
 
-        # Extensões que interessam para download/análise
         "sensitive_regex": re.compile(
             r'\.(env|log|bak|sql|conf|ini|yml|yaml|pem|key|crt|sh|py)$',
             re.IGNORECASE,
         ),
 
-        # ── Padrões de segredos de ALTA PRECISÃO ─────────────────────────────
-        # Cada padrão foi escolhido por ter prefixo fixo ou estrutura única
-        # que minimiza falsos positivos. Padrões genéricos (api_key, token,
-        # password) só entram com contexto e validação de entropia.
         "secret_patterns": {
             # Google / Firebase / GCP
             "google_api_key":       _regex(r'AIza[0-9A-Za-z\-_]{35}'),
@@ -305,7 +281,7 @@ def get_config(domain: str) -> dict:
             "slack_token":          _regex(r'xox[baprs]-[0-9a-zA-Z\-]{10,48}'),
             "slack_webhook":        _regex(r'https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+'),
 
-            # DB / Connection strings (exigem user:pass@host)
+            # DB / Connection strings
             "mongodb_dsn":          _regex(r'mongodb(?:\+srv)?://[^:\s]+:[^@\s]+@[^\s"\'`]+', re.I),
             "postgres_dsn":         _regex(r'postgres(?:ql)?://[^:\s]+:[^@\s]+@[^\s"\'`]+', re.I),
             "mysql_dsn":            _regex(r'mysql://[^:\s]+:[^@\s]+@[^\s"\'`]+', re.I),
@@ -326,14 +302,13 @@ def get_config(domain: str) -> dict:
             # Chaves privadas
             "private_key":          _regex(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
 
-            # JWT (estrutura fixa — baixo FP)
+            # JWT
             "jwt":                  _regex(r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}'),
 
-            # Hashes hardcoded com CONTEXTO explícito
+            # Hashes
             "bcrypt_hash":          _regex(r'\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}'),
 
-            # ── Padrões GENÉRICOS — validação extra de entropia obrigatória ──
-            # Esses são os que geram mais FP; a validação acontece em analyze_js_content.
+            # Padrões genéricos — validação extra de entropia obrigatória
             "generic_api_key":      _regex(r'(?:api[_-]?key|apikey)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-]{20,})["\']', re.I),
             "generic_token":        _regex(r'(?:access[_-]?token|auth[_-]?token)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-\.]{20,})["\']', re.I),
             "generic_secret":       _regex(r'(?:client[_-]?secret|app[_-]?secret)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-/+=]{20,})["\']', re.I),
@@ -341,13 +316,11 @@ def get_config(domain: str) -> dict:
             "password_field":       _regex(r'(?:password|passwd|senha)["\']?\s*[:=]\s*["\']([^"\']{8,})["\']', re.I),
         },
 
-        # Padrões genéricos que exigem validação de entropia extra
         "_generic_patterns": {
             "generic_api_key", "generic_token", "generic_secret",
             "bearer_token", "password_field",
         },
 
-        # Endpoints de API internos em JS
         "api_endpoint_patterns": [
             re.compile(r'["\`](/api/v\d[a-zA-Z0-9/_\-]*)["\`]'),
             re.compile(r'["\`](/graphql)["\`\s/]', re.I),
@@ -361,7 +334,6 @@ def get_config(domain: str) -> dict:
         "js_workers":        20,
         "request_timeout":   10,
 
-        # Padrões para análise de arquivos .env/.conf baixados
         "sensitive_content_patterns": [
             re.compile(r'(?:DB_PASS(?:WORD)?|DATABASE_PASSWORD|MYSQL_ROOT_PASSWORD)\s*=\s*\S+', re.I),
             re.compile(r'(?:SECRET_KEY|APP_KEY|ENCRYPTION_KEY)\s*=\s*\S+', re.I),
@@ -377,11 +349,10 @@ def get_config(domain: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Escrita segura de arquivos — só cria se tiver conteúdo
+# Escrita segura de arquivos
 # ─────────────────────────────────────────────────────────────────────────────
 
 def write_if_not_empty(path: Path, lines: list[str], logger: logging.Logger) -> bool:
-    """Escreve arquivo somente se houver linhas. Retorna True se escreveu."""
     content = [l for l in lines if l.strip()]
     if not content:
         return False
@@ -392,7 +363,6 @@ def write_if_not_empty(path: Path, lines: list[str], logger: logging.Logger) -> 
 
 
 def append_line_to_file(path: Path, line: str) -> None:
-    """Append de uma linha; cria o arquivo (e diretório) se necessário."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(line + "\n")
@@ -462,38 +432,27 @@ def run_cmd(cmd: list[str], logger: logging.Logger,
 
 
 def tool_available(name: str) -> bool:
-    """Verifica se uma ferramenta está no PATH usando shutil.which (cross-platform)."""
     return shutil.which(name) is not None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Fontes passivas via API HTTP direta (fallback sem dependência de ferramentas)
+# Fontes passivas via API HTTP direta
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fetch_wayback_api(domain: str, logger: logging.Logger) -> set[str]:
-    """
-    Consulta a CDX API da Wayback Machine diretamente.
-    Pagina automaticamente — domínios grandes podem ter 100k+ URLs.
-    Não depende de gau nem waybackurls instalados.
-    """
     urls: set[str] = set()
     base_url = "https://web.archive.org/cdx/search/cdx"
     params = {
-        "url":        f"*.{domain}/*",
-        "output":     "text",
-        "fl":         "original",
-        "collapse":   "urlkey",
-        "limit":      "100000",
-        "filter":     "statuscode:200",
+        "url":      f"*.{domain}/*",
+        "output":   "text",
+        "fl":       "original",
+        "collapse": "urlkey",
+        "limit":    "100000",
+        "filter":   "statuscode:200",
     }
-
     try:
-        resp = requests.get(
-            base_url,
-            params=params,
-            timeout=120,
-            headers={"User-Agent": "Mozilla/5.0 recon"},
-        )
+        resp = requests.get(base_url, params=params, timeout=120,
+                            headers={"User-Agent": "Mozilla/5.0 recon"})
         if resp.status_code == 200:
             for line in resp.text.splitlines():
                 line = line.strip()
@@ -505,29 +464,20 @@ def _fetch_wayback_api(domain: str, logger: logging.Logger) -> set[str]:
         logger.warning("[wayback-api] timeout na requisição.")
     except Exception as exc:
         logger.debug("[wayback-api] erro: %s", exc)
-
     return urls
 
 
 def _fetch_commoncrawl_api(domain: str, logger: logging.Logger) -> set[str]:
-    """
-    Consulta o índice mais recente do CommonCrawl via API.
-    Não depende de gau instalado.
-    """
     urls: set[str] = set()
-
-    # Descobre o índice mais recente
     try:
         idx_resp = requests.get(
             "https://index.commoncrawl.org/collinfo.json",
-            timeout=30,
-            headers={"User-Agent": "Mozilla/5.0 recon"},
+            timeout=30, headers={"User-Agent": "Mozilla/5.0 recon"},
         )
         if idx_resp.status_code != 200:
             return urls
         indexes = idx_resp.json()
-        # Pega os 3 mais recentes para maior cobertura
-        recent = [i["cdx-api"] for i in indexes[:3]]
+        recent  = [i["cdx-api"] for i in indexes[:3]]
     except Exception as exc:
         logger.debug("[commoncrawl-api] erro ao buscar índices: %s", exc)
         return urls
@@ -536,15 +486,9 @@ def _fetch_commoncrawl_api(domain: str, logger: logging.Logger) -> set[str]:
         try:
             resp = requests.get(
                 api_url,
-                params={
-                    "url":      f"*.{domain}",
-                    "output":   "text",
-                    "fl":       "url",
-                    "collapse": "urlkey",
-                    "limit":    "50000",
-                },
-                timeout=60,
-                headers={"User-Agent": "Mozilla/5.0 recon"},
+                params={"url": f"*.{domain}", "output": "text",
+                        "fl": "url", "collapse": "urlkey", "limit": "50000"},
+                timeout=60, headers={"User-Agent": "Mozilla/5.0 recon"},
             )
             if resp.status_code == 200:
                 for line in resp.text.splitlines():
@@ -553,7 +497,6 @@ def _fetch_commoncrawl_api(domain: str, logger: logging.Logger) -> set[str]:
                         urls.add(line)
         except Exception as exc:
             logger.debug("[commoncrawl-api] erro em %s: %s", api_url, exc)
-
     return urls
 
 
@@ -562,38 +505,21 @@ def _fetch_commoncrawl_api(domain: str, logger: logging.Logger) -> set[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def collect_urls(cfg: dict, logger: logging.Logger) -> int:
-    """
-    Coleta URLs de múltiplas fontes passivas/ativas.
-
-    Ferramentas e flags validadas contra os --help reais:
-      - gau         : --providers wayback,commoncrawl,otx,urlscan  (alienvault não existe no gau)
-      - waybackurls : lê APENAS via stdin (sem argumento posicional)
-      - katana      : crawler ativo com JS rendering + passive sources
-      - hakrawler   : lê stdin; flags: -d, -subs, -u, -t, -timeout (sem -js, sem -plain)
-      - gospider    : -s, -c, -d, -a (other-source), -w (include-subs), --subs, -q (quiet)
-      - subfinder   : alimenta hakrawler e gospider com subdomínios
-    """
-    domain = cfg["domain"]
+    domain   = cfg["domain"]
     all_urls: set[str] = set()
 
-
     # ── gau ───────────────────────────────────────────────────────────────────
-    # Usa Popen com leitura linha a linha para não travar com capture_output.
-    # Timer de 10 min mata o processo se travar.
     if tool_available("gau"):
         logger.info("[gau] coletando… (domínio: %s)", domain)
         try:
-            import threading as _th
             proc = subprocess.Popen(
                 ["gau", "--threads", "5", "--subs",
                  "--providers", "wayback,commoncrawl,otx,urlscan",
                  "--retries", "2", "--timeout", "30", domain],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
             gau_lines: list[str] = []
-            killer = _th.Timer(600, lambda: proc.kill())
+            killer = threading.Timer(600, lambda: proc.kill())
             killer.start()
             try:
                 for line in proc.stdout:
@@ -611,20 +537,16 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
         logger.warning("gau não encontrado — pulando.")
 
     # ── waybackurls ───────────────────────────────────────────────────────────
-    # Lê via stdin com Popen + timer de kill.
     if tool_available("waybackurls"):
         logger.info("[waybackurls] coletando… (domínio: %s)", domain)
         try:
-            import threading as _th
             proc = subprocess.Popen(
                 ["waybackurls"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
             )
             wb_lines: list[str] = []
-            killer = _th.Timer(600, lambda: proc.kill())
+            killer = threading.Timer(600, lambda: proc.kill())
             killer.start()
             try:
                 proc.stdin.write(domain + "\n")
@@ -643,9 +565,7 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
     else:
         logger.warning("waybackurls não encontrado — pulando.")
 
-    # ── Wayback Machine API direta (fallback independente de ferramentas) ─────
-    # Consulta a CDX API da Wayback Machine diretamente via HTTP.
-    # Funciona mesmo se gau/waybackurls falharem ou retornarem vazio.
+    # ── Wayback Machine API direta ────────────────────────────────────────────
     logger.info("[wayback-api] consultando CDX API…")
     wayback_urls = _fetch_wayback_api(domain, logger)
     if wayback_urls:
@@ -667,13 +587,9 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
     if tool_available("katana"):
         logger.info("[katana] coletando…")
         lines = run_cmd([
-            "katana",
-            "-u", f"https://{domain}",
-            "-d", "5",
-            "-ps",
-            "-pss", "waybackarchive,commoncrawl,alienvault",
-            "-kf",
-            "-jc",
+            "katana", "-u", f"https://{domain}", "-d", "5",
+            "-ps", "-pss", "waybackarchive,commoncrawl,alienvault",
+            "-kf", "-jc",
             "-ef", "woff,css,png,svg,jpg,woff2,jpeg,gif,ico,ttf",
             "-silent",
         ], logger, timeout=600)
@@ -683,10 +599,6 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
         logger.warning("katana não encontrado — pulando.")
 
     # ── hakrawler ─────────────────────────────────────────────────────────────
-    # Flags válidas: -d (depth), -subs, -u (unique), -t (threads),
-    #                -timeout, -s (show source), -insecure, -json
-    # NÃO existe: -js, -plain, -linkfinder, -url
-    # Output vai para stdout — cada URL em uma linha
     if tool_available("hakrawler"):
         logger.info("[hakrawler] coletando…")
         lines = run_cmd(
@@ -700,42 +612,37 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
     else:
         logger.info("hakrawler não encontrado — instale: go install github.com/hakluke/hakrawler@latest")
 
-  # ── gospider ─────────────────────────────────────────────────────────────
-if tool_available("gospider"):
-    logger.info("[gospider] coletando…")
-    try:
-        proc = subprocess.Popen(
-            [
-                "gospider",
-                "-s", f"https://{domain}",
-                "-c", "10", "-d", "3",
-                "--js", "--sitemap", "--robots",
-                "-a", "-w", "--subs", "-q",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        gospider_lines: list[str] = []
-        killer = threading.Timer(900, lambda: proc.kill())  # 15 min
-        killer.start()
+    # ── gospider ─────────────────────────────────────────────────────────────
+    if tool_available("gospider"):
+        logger.info("[gospider] coletando…")
         try:
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                m = re.search(r'https?://[^\s"\'<>\]]+', line)
-                if m:
-                    all_urls.add(m.group(0).rstrip('.,;)"\'>]'))
-                gospider_lines.append(line)
-        finally:
-            killer.cancel()
-            proc.wait(timeout=10)
-        logger.info("[gospider] %d linhas processadas", len(gospider_lines))
-    except Exception as exc:
-        logger.error("[gospider] erro: %s", exc)
-else:
-    logger.info("gospider não encontrado — instale: go install github.com/jaeles-project/gospider@latest")
+            proc = subprocess.Popen(
+                ["gospider", "-s", f"https://{domain}",
+                 "-c", "10", "-d", "3",
+                 "--js", "--sitemap", "--robots",
+                 "-a", "-w", "--subs", "-q"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            gospider_lines: list[str] = []
+            killer = threading.Timer(900, lambda: proc.kill())
+            killer.start()
+            try:
+                for line in proc.stdout:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    m = re.search(r'https?://[^\s"\'<>\]]+', line)
+                    if m:
+                        all_urls.add(m.group(0).rstrip('.,;)"\'>]'))
+                    gospider_lines.append(line)
+            finally:
+                killer.cancel()
+                proc.wait(timeout=10)
+            logger.info("[gospider] %d linhas processadas", len(gospider_lines))
+        except Exception as exc:
+            logger.error("[gospider] erro: %s", exc)
+    else:
+        logger.info("gospider não encontrado — instale: go install github.com/jaeles-project/gospider@latest")
 
     # ── subfinder → hakrawler + gospider em subdomínios ──────────────────────
     if tool_available("subfinder"):
@@ -744,7 +651,7 @@ else:
         logger.info("[subfinder] %d subdomínios encontrados", len(subs))
 
         if subs:
-            # hakrawler: passa todos os subdomínios via stdin de uma vez
+            # hakrawler nos subdomínios
             if tool_available("hakrawler"):
                 logger.info("[hakrawler] crawling em %d subdomínios…", len(subs))
                 sub_input = "\n".join(f"https://{s}" for s in subs) + "\n"
@@ -758,39 +665,38 @@ else:
                 all_urls.update(lines)
                 logger.info("[hakrawler/subs] %d URLs", len(lines))
 
-            # gospider em subdomínios (limita a 50 para não demorar demais)
-if tool_available("gospider"):
-    logger.info("[gospider] crawling em subdomínios…")
-    for sub in subs[:50]:
-        try:
-            proc = subprocess.Popen(
-                ["gospider", "-s", f"https://{sub}",
-                 "-c", "5", "-d", "2", "--js", "-q"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            killer = threading.Timer(180, lambda: proc.kill())  # 3 min por sub
-            killer.start()
-            try:
-                for line in proc.stdout:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    m = re.search(r'https?://[^\s"\'<>\]]+', line)
-                    if m:
-                        all_urls.add(m.group(0).rstrip('.,;)"\'>]'))
-            finally:
-                killer.cancel()
-                proc.wait(timeout=10)
-        except Exception as exc:
-            logger.error("[gospider/subs] %s: %s", sub, exc)
+            # gospider nos subdomínios (limita a 50)
+            if tool_available("gospider"):
+                logger.info("[gospider] crawling em subdomínios…")
+                for sub in subs[:50]:
+                    try:
+                        proc = subprocess.Popen(
+                            ["gospider", "-s", f"https://{sub}",
+                             "-c", "5", "-d", "2", "--js", "-q"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                        )
+                        killer = threading.Timer(180, lambda: proc.kill())
+                        killer.start()
+                        try:
+                            for line in proc.stdout:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                m = re.search(r'https?://[^\s"\'<>\]]+', line)
+                                if m:
+                                    all_urls.add(m.group(0).rstrip('.,;)"\'>]'))
+                        finally:
+                            killer.cancel()
+                            proc.wait(timeout=10)
+                    except Exception as exc:
+                        logger.error("[gospider/subs] %s: %s", sub, exc)
     else:
         logger.info("subfinder não encontrado — instale: go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest")
 
-    urls = sorted(all_urls)
+    urls  = sorted(all_urls)
     wrote = write_if_not_empty(cfg["urls_file"], urls, logger)
-    logger.info("URLs coletadas: %d%s", len(urls), f" → {cfg['urls_file']}" if wrote else " (nenhuma)")
+    logger.info("URLs coletadas: %d%s", len(urls),
+                f" → {cfg['urls_file']}" if wrote else " (nenhuma)")
     return len(urls)
 
 
@@ -826,7 +732,8 @@ def validate_alive_urls(cfg: dict, logger: logging.Logger) -> int:
         alive = []
 
     wrote = write_if_not_empty(cfg["urls_alive_file"], alive, logger)
-    logger.info("URLs ativas: %d%s", len(alive), f" → {cfg['urls_alive_file']}" if wrote else "")
+    logger.info("URLs ativas: %d%s", len(alive),
+                f" → {cfg['urls_alive_file']}" if wrote else "")
     cfg["_active_urls_file"] = cfg["urls_alive_file"] if wrote else cfg["urls_file"]
     return len(alive)
 
@@ -844,19 +751,16 @@ def run_gf(cfg: dict, logger: logging.Logger) -> None:
     if not source.exists():
         return
 
-    # Lê todas as URLs uma vez e passa via stdin ao gf (sem shell=True)
     source_text = source.read_text(encoding="utf-8")
-
     cfg["gf_dir"].mkdir(parents=True, exist_ok=True)
+
     for pattern in cfg["gf_patterns"]:
         output = cfg["gf_dir"] / f"gf_{pattern}.txt"
         try:
             result = subprocess.run(
                 ["gf", pattern],
                 input=source_text,
-                capture_output=True,
-                text=True,
-                timeout=120,
+                capture_output=True, text=True, timeout=120,
             )
             lines = [l for l in result.stdout.splitlines() if l.strip()]
             if lines:
@@ -886,20 +790,13 @@ def probe_xss(cfg: dict, logger: logging.Logger) -> int:
 
     try:
         proc = subprocess.Popen(
-            [
-                "dalfox", "file", str(xss_file),
-                "--silence",
-                "--output", str(out_file),
-                "--worker", "10",
-                "--timeout", "10",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            ["dalfox", "file", str(xss_file),
+             "--silence", "--output", str(out_file),
+             "--worker", "10", "--timeout", "10"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
-
-        hits = 0
-        killer = threading.Timer(3600, lambda: proc.kill())  # mata só após 1h
+        hits   = 0
+        killer = threading.Timer(3600, lambda: proc.kill())
         killer.start()
         try:
             for line in proc.stdout:
@@ -914,7 +811,6 @@ def probe_xss(cfg: dict, logger: logging.Logger) -> int:
             killer.cancel()
             proc.wait(timeout=15)
 
-        # Fallback: conta no arquivo de saída caso --silence tenha suprimido stdout
         if hits == 0 and out_file.exists():
             hits = out_file.read_text(encoding="utf-8").count("[V]")
 
@@ -933,7 +829,7 @@ def probe_xss(cfg: dict, logger: logging.Logger) -> int:
 
 
 def probe_ssrf_redirect(cfg: dict, logger: logging.Logger) -> int:
-    found = 0
+    found  = 0
     probes = {
         "ssrf":     (cfg["gf_dir"] / "gf_ssrf.txt",     "http://169.254.169.254/latest/meta-data/"),
         "redirect": (cfg["gf_dir"] / "gf_redirect.txt", "https://evil.com"),
@@ -968,7 +864,7 @@ def probe_ssrf_redirect(cfg: dict, logger: logging.Logger) -> int:
                     capture_output=True, text=True, timeout=10,
                 )
                 output = r.stdout.strip()
-                code = output.split()[0] if output else "0"
+                code   = output.split()[0] if output else "0"
                 if kind == "redirect" and code in ("301", "302", "307", "308") and "evil.com" in output:
                     hits.append(url)
                 elif kind == "ssrf" and code == "200":
@@ -1013,8 +909,8 @@ def download_and_analyze_sensitive(cfg: dict, logger: logging.Logger) -> int:
     if not urls:
         return 0
 
-    get      = _make_retrying_get(cfg)
-    findings = 0
+    get          = _make_retrying_get(cfg)
+    findings     = 0
     report_lines: list[str] = []
 
     logger.info("Baixando %d arquivos sensíveis…", len(urls))
@@ -1036,7 +932,6 @@ def download_and_analyze_sensitive(cfg: dict, logger: logging.Logger) -> int:
                 local_hits.append(m.group(0))
 
         if local_hits:
-            # Salva cópia local apenas se tiver achados
             cfg["sensitive_dir"].mkdir(parents=True, exist_ok=True)
             safe_name = re.sub(r'[^\w\-.]', '_', url)[:120]
             (cfg["sensitive_dir"] / safe_name).write_text(content, encoding="utf-8", errors="replace")
@@ -1057,13 +952,6 @@ def download_and_analyze_sensitive(cfg: dict, logger: logging.Logger) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def collect_js(cfg: dict, logger: logging.Logger) -> int:
-    """
-    Filtra URLs de JS com cuidado:
-      - Exige extensão .js ou padrão de bundle (/static/js/, /chunks/, etc.)
-      - Descarta CDNs conhecidos
-      - Descarta source maps (.js.map)
-      - Descarta miniaturas e fallbacks de imagem com .js na query string
-    """
     source = cfg.get("_active_urls_file", cfg["urls_file"])
     if not source.exists():
         logger.warning("Arquivo de URLs não encontrado — pulando coleta de JS.")
@@ -1071,8 +959,8 @@ def collect_js(cfg: dict, logger: logging.Logger) -> int:
 
     js_re = re.compile(
         r'(?:'
-        r'\.js(?:\?[^\s]*)?$'           # termina em .js ou .js?...
-        r'|/(?:static|assets|dist|build|chunks|bundles)/[^\s]*\.js'  # padrão de build
+        r'\.js(?:\?[^\s]*)?$'
+        r'|/(?:static|assets|dist|build|chunks|bundles)/[^\s]*\.js'
         r')',
         re.I,
     )
@@ -1178,20 +1066,12 @@ def validate_all_google_keys(google_keys: set, cfg: dict, logger: logging.Logger
 # ─────────────────────────────────────────────────────────────────────────────
 
 def is_valid_js(resp: requests.Response, content: str) -> bool:
-    """
-    Aceita o conteúdo como JS se:
-      - Content-Type indica JavaScript/ECMAScript, OU
-      - Não começa com HTML/XML/JSON puro
-    Bundles modernos (Webpack/Vite/esbuild) IIFEs e arrow functions são aceitos.
-    """
     ct = resp.headers.get("Content-Type", "")
     if "javascript" in ct or "ecmascript" in ct:
         return True
-
     stripped = content.strip()
     if stripped.startswith(("<html", "<HTML", "<!DOCTYPE", "<!doctype", "<?xml")):
         return False
-    # JSON puro na raiz sem código JS visível
     if re.match(r'^\s*[{\[]', stripped) and not re.search(
             r'(?:var |let |const |function|=>|\bif\b|\bfor\b)', stripped[:500]):
         return False
@@ -1204,27 +1084,14 @@ def _secret_context(content: str, start: int, end: int, radius: int = 90) -> str
     return content[left:right].replace("\r", " ").replace("\n", " ").strip()
 
 
-# Cache global de URLs de JS já analisadas — compartilhado entre domínio
-# raiz e todos os subdomínios. Evita baixar/analisar o mesmo bundle
-# dezenas de vezes quando múltiplos subdomínios apontam para o mesmo CDN.
-_analyzed_js_urls: set[str] = set()
-_analyzed_js_lock: threading.Lock = threading.Lock()
-
-# Cache de achados já registrados — evita duplicar o mesmo segredo
-# quando o mesmo arquivo JS é referenciado por múltiplos subdomínios.
-# Chave: (tipo, valor) — não inclui URL para capturar mesmo segredo em arquivos distintos.
-_seen_secrets: set[tuple[str, str]] = set()
-_seen_secrets_lock: threading.Lock = threading.Lock()
-
-# Lock global para escrita nos arquivos de segredos (threads paralelas)
-_secret_write_lock = threading.Lock()
+_analyzed_js_urls: set[str]          = set()
+_analyzed_js_lock: threading.Lock    = threading.Lock()
+_seen_secrets: set[tuple[str, str]]  = set()
+_seen_secrets_lock: threading.Lock   = threading.Lock()
+_secret_write_lock                   = threading.Lock()
 
 
 def _append_secret(finding: dict, cfg: dict) -> bool:
-    """
-    Persiste um achado em secrets.txt, secrets.csv e secrets.jsonl.
-    Retorna False se o achado já foi registrado antes (dedup por tipo+valor).
-    """
     key = (finding["type"], finding["value"])
     with _seen_secrets_lock:
         if key in _seen_secrets:
@@ -1232,15 +1099,13 @@ def _append_secret(finding: dict, cfg: dict) -> bool:
         _seen_secrets.add(key)
 
     with _secret_write_lock:
-        # TXT
         append_line_to_file(
             cfg["secrets_txt"],
             f"[{finding['type']}] {finding['url']}\n"
             f"VALUE  : {finding['value']}\n"
             f"CONTEXT: {finding['context'][:300]}\n"
-            + "-" * 60
+            + "-" * 60,
         )
-        # CSV
         csv_new = not cfg["secrets_csv"].exists()
         cfg["secrets_csv"].parent.mkdir(parents=True, exist_ok=True)
         with open(cfg["secrets_csv"], "a", encoding="utf-8", newline="") as f:
@@ -1253,7 +1118,6 @@ def _append_secret(finding: dict, cfg: dict) -> bool:
                 "value":   finding["value"],
                 "context": finding["context"][:300],
             })
-        # JSONL
         append_line_to_file(
             cfg["secrets_jsonl"],
             json.dumps({
@@ -1261,7 +1125,7 @@ def _append_secret(finding: dict, cfg: dict) -> bool:
                 "url":     finding["url"],
                 "value":   finding["value"],
                 "context": finding["context"][:300],
-            }, ensure_ascii=False)
+            }, ensure_ascii=False),
         )
     return True
 
@@ -1289,11 +1153,8 @@ def analyze_js_content(
     for name, pattern in cfg["secret_patterns"].items():
         for match in pattern.finditer(content):
             raw_value = match.group(0)
+            value     = match.group(1) if match.lastindex and match.lastindex >= 1 else raw_value
 
-            # Para padrões genéricos, extrai o grupo capturado se existir
-            value = match.group(1) if match.lastindex and match.lastindex >= 1 else raw_value
-
-            # Filtragem extra para padrões genéricos
             if name in generic_set:
                 context_line = _line_at(match.start())
                 if not is_likely_real_credential(value, context_line):
@@ -1301,25 +1162,21 @@ def analyze_js_content(
                     continue
 
             context = _secret_context(content, match.start(), match.end())
-
             finding = {"type": name, "value": value, "url": url, "context": context}
+
             if _append_secret(finding, cfg):
-                # Só loga e conta se for um achado novo (não duplicado)
                 logger.warning("[!!!] %s → %s | %s", name, value[:80], url)
                 found += 1
-
                 if name == "google_api_key":
                     with google_keys_lock:
                         google_keys_found.add(value)
             else:
                 logger.debug("[DEDUP] %s já registrado — pulando.", name)
 
-    # Detecção de ofuscação por char-codes
     for obf in scan_charcode_obfuscation(content, url, logger):
         _append_secret(obf, cfg)
         found += 1
 
-    # Endpoints de API
     endpoints: set[str] = set()
     for pattern in cfg["api_endpoint_patterns"]:
         for m in pattern.finditer(content):
@@ -1340,14 +1197,13 @@ def process_js(
     google_keys_lock: threading.Lock,
     get_fn,
 ) -> int:
-    # Normaliza a URL removendo query strings para melhor deduplicação
-    # ex: /app.js?v=123 e /app.js?v=456 são o mesmo arquivo
     url_key = url.split("?")[0]
     with _analyzed_js_lock:
         if url_key in _analyzed_js_urls:
             logger.debug("[CACHE] JS já analisado — pulando: %s", url)
             return 0
         _analyzed_js_urls.add(url_key)
+
     try:
         resp = get_fn(url)
     except requests.exceptions.SSLError as exc:
@@ -1380,10 +1236,10 @@ def analyze_all_js(cfg: dict, logger: logging.Logger) -> tuple[int, set]:
     if not urls:
         return 0, set()
 
-    total_found:      int  = 0
-    google_keys_found: set = set()
-    google_keys_lock       = threading.Lock()
-    get_fn                 = _make_retrying_get(cfg)
+    total_found:       int           = 0
+    google_keys_found: set           = set()
+    google_keys_lock:  threading.Lock = threading.Lock()
+    get_fn                           = _make_retrying_get(cfg)
 
     logger.info("Analisando %d arquivos JS com %d workers…", len(urls), cfg["js_workers"])
 
@@ -1391,7 +1247,7 @@ def analyze_all_js(cfg: dict, logger: logging.Logger) -> tuple[int, set]:
         futures = {
             executor.submit(
                 process_js, url, cfg, logger,
-                google_keys_found, google_keys_lock, get_fn
+                google_keys_found, google_keys_lock, get_fn,
             ): url for url in urls
         }
         for future in as_completed(futures):
@@ -1413,7 +1269,6 @@ def analyze_all_js(cfg: dict, logger: logging.Logger) -> tuple[int, set]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _probe_alive_urls(urls: list[str], timeout: int, logger: logging.Logger) -> list[str]:
-    """Valida quais URLs respondem usando httpx. Retorna lista de URLs vivas."""
     if not urls:
         return []
     if not tool_available("httpx"):
@@ -1425,8 +1280,7 @@ def _probe_alive_urls(urls: list[str], timeout: int, logger: logging.Logger) -> 
         result = subprocess.run(
             ["httpx", "-silent",
              "-mc", "200,201,204,301,302,307,308,403",
-             "-threads", "50",
-             "-timeout", str(timeout)],
+             "-threads", "50", "-timeout", str(timeout)],
             input=input_text,
             capture_output=True, text=True, timeout=300,
         )
@@ -1436,15 +1290,7 @@ def _probe_alive_urls(urls: list[str], timeout: int, logger: logging.Logger) -> 
         return urls
 
 
-def _collect_js_from_sub(
-    sub_url: str,
-    cfg: dict,
-    logger: logging.Logger,
-) -> set[str]:
-    """
-    Coleta URLs de JS de um subdomínio específico usando hakrawler e gospider.
-    Retorna conjunto de URLs de JS filtradas (sem CDN, sem .map).
-    """
+def _collect_js_from_sub(sub_url: str, cfg: dict, logger: logging.Logger) -> set[str]:
     all_urls: set[str] = set()
 
     js_re = re.compile(
@@ -1453,28 +1299,22 @@ def _collect_js_from_sub(
         re.I,
     )
 
-    # hakrawler via stdin
     if tool_available("hakrawler"):
         lines = run_cmd(
             ["hakrawler", "-d", "2", "-u", "-t", "8", "-insecure"],
-            logger,
-            stdin=sub_url + "\n",
-            timeout=60,
+            logger, stdin=sub_url + "\n", timeout=60,
         )
         all_urls.update(lines)
 
-    # gospider
     if tool_available("gospider"):
         raw = run_cmd([
-            "gospider", "-s", sub_url,
-            "-c", "5", "-d", "2", "--js", "-q",
+            "gospider", "-s", sub_url, "-c", "5", "-d", "2", "--js", "-q",
         ], logger, timeout=60)
         for line in raw:
             m = re.search(r'https?://[^\s"\'<>\]]+', line)
             if m:
                 all_urls.add(m.group(0).rstrip('.,;)"\'>]'))
 
-    # Filtra apenas JS, sem CDN, sem source maps
     js_urls: set[str] = set()
     for url in all_urls:
         if _CDN_DOMAINS_RE.search(url):
@@ -1495,18 +1335,11 @@ def analyze_subdomains(
     all_google_keys: set,
     google_keys_lock: threading.Lock,
 ) -> dict:
-    """
-    Enumera subdomínios do domínio raiz, valida quais estão vivos e
-    executa análise completa de JS em cada um separadamente.
-
-    Retorna dict com estatísticas agregadas por subdomínio.
-    """
     banner_sub = "=" * 60
     logger.info(banner_sub)
     logger.info("ANÁLISE DE SUBDOMÍNIOS — %s", root_domain)
     logger.info(banner_sub)
 
-    # ── 1. Enumeração ─────────────────────────────────────────────────────────
     subs: set[str] = set()
 
     if tool_available("subfinder"):
@@ -1518,7 +1351,6 @@ def analyze_subdomains(
         logger.warning("subfinder não encontrado — pulando enumeração de subdomínios.")
         return {}
 
-    # Filtra subdomínios válidos (descarta wildcards e o próprio root)
     subs_clean = sorted({
         s.strip().lower() for s in subs
         if s.strip()
@@ -1533,13 +1365,11 @@ def analyze_subdomains(
 
     logger.info("Subdomínios únicos: %d", len(subs_clean))
 
-    # ── 2. Validação de hosts vivos ───────────────────────────────────────────
-    sub_urls = [f"https://{s}" for s in subs_clean]
+    sub_urls   = [f"https://{s}" for s in subs_clean]
     alive_urls = _probe_alive_urls(sub_urls, cfg["request_timeout"], logger)
 
-    # Tenta http se https não respondeu
-    https_alive = set(alive_urls)
-    http_candidates = [
+    https_alive      = set(alive_urls)
+    http_candidates  = [
         f"http://{s}" for s in subs_clean
         if f"https://{s}" not in https_alive
     ]
@@ -1554,29 +1384,19 @@ def analyze_subdomains(
         logger.info("Nenhum subdomínio vivo encontrado.")
         return {}
 
-    # Salva lista de subdomínios vivos na pasta do domínio raiz
-    write_if_not_empty(
-        cfg["base_dir"] / "subdomains_alive.txt",
-        alive_urls, logger,
-    )
+    write_if_not_empty(cfg["base_dir"] / "subdomains_alive.txt", alive_urls, logger)
 
-    # ── 3. Análise de JS por subdomínio ───────────────────────────────────────
     sub_stats: dict[str, dict] = {}
     get_fn = _make_retrying_get(cfg)
-
-    # Arquivo consolidado de segredos de subdomínios (mesmo formato do root)
-    # Os achados também vão para cfg["secrets_*"] do root para aparecer no sumário
 
     for sub_url in alive_urls:
         sub_host = re.sub(r'^https?://', '', sub_url).rstrip('/')
         logger.info("─── Analisando subdomínio: %s", sub_host)
 
-        # Pasta de saída específica deste subdomínio
-        safe_sub  = re.sub(r'[^\w\-.]', '_', sub_host)
-        sub_dir   = cfg["base_dir"] / "subdomains" / safe_sub
+        safe_sub = re.sub(r'[^\w\-.]', '_', sub_host)
+        sub_dir  = cfg["base_dir"] / "subdomains" / safe_sub
         sub_dir.mkdir(parents=True, exist_ok=True)
 
-        # Coleta JS específico do subdomínio
         js_urls = _collect_js_from_sub(sub_url, cfg, logger)
         logger.info("  JS encontrado: %d arquivos", len(js_urls))
 
@@ -1584,13 +1404,10 @@ def analyze_subdomains(
             sub_stats[sub_host] = {"js": 0, "secrets": 0}
             continue
 
-        # Salva lista de JS do subdomínio
         write_if_not_empty(sub_dir / "js_urls.txt", sorted(js_urls), logger)
 
-        # Analisa cada arquivo JS
         sub_findings = 0
         for js_url in js_urls:
-            # Verifica cache antes de fazer request
             url_key = js_url.split("?")[0]
             with _analyzed_js_lock:
                 if url_key in _analyzed_js_urls:
@@ -1616,17 +1433,13 @@ def analyze_subdomains(
             )
             sub_findings += n
 
-        sub_stats[sub_host] = {
-            "js":      len(js_urls),
-            "secrets": sub_findings,
-        }
+        sub_stats[sub_host] = {"js": len(js_urls), "secrets": sub_findings}
 
         if sub_findings:
             logger.warning("  [!!!] %d segredo(s) em %s", sub_findings, sub_host)
         else:
             logger.info("  Nenhum segredo em %s", sub_host)
 
-    # ── 4. Sumário de subdomínios ─────────────────────────────────────────────
     total_subs_secrets = sum(v["secrets"] for v in sub_stats.values())
     total_subs_js      = sum(v["js"]      for v in sub_stats.values())
 
@@ -1637,7 +1450,6 @@ def analyze_subdomains(
     logger.info("  Segredos totais  : %d", total_subs_secrets)
     logger.info(banner_sub)
 
-    # Salva relatório de subdomínios
     report_lines = [
         "ANÁLISE POR SUBDOMÍNIO",
         f"Domínio raiz: {root_domain}",
@@ -1650,10 +1462,7 @@ def analyze_subdomains(
             f"{status} {sub:<50}  JS: {data['js']:>4}  Segredos: {data['secrets']:>4}"
         )
 
-    write_if_not_empty(
-        cfg["base_dir"] / "subdomains_report.txt",
-        report_lines, logger,
-    )
+    write_if_not_empty(cfg["base_dir"] / "subdomains_report.txt", report_lines, logger)
 
     return {
         "subs_found":   len(subs_clean),
@@ -1663,6 +1472,9 @@ def analyze_subdomains(
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Sumário
+# ─────────────────────────────────────────────────────────────────────────────
 
 def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
     def _count(path: Path) -> int:
@@ -1670,7 +1482,6 @@ def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
             return 0
         return sum(1 for l in path.read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip())
 
-    # Contagem por tipo a partir do JSONL (se existir)
     type_counts: dict[str, int] = collections.Counter()
     if cfg["secrets_jsonl"].exists():
         for line in cfg["secrets_jsonl"].read_text(encoding="utf-8", errors="ignore").splitlines():
@@ -1680,7 +1491,6 @@ def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
             except json.JSONDecodeError:
                 pass
 
-    # Chaves Google vulneráveis
     vuln_google = 0
     if cfg["google_report_file"].exists():
         for line in cfg["google_report_file"].read_text(encoding="utf-8", errors="ignore").splitlines():
@@ -1723,7 +1533,6 @@ def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
         f"  Endpoints de API         : {str(_count(cfg['api_endpoints_file'])).rjust(6)}",
     ]
 
-    # Estatísticas de subdomínios (só aparece se a análise foi executada)
     if stats.get("subs_found", 0) > 0:
         lines += [
             "",
@@ -1737,15 +1546,14 @@ def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
         if sub_report.exists():
             lines.append(f"  Relatório subs           : {sub_report}")
 
-    # Arquivos gerados (só lista os que existem)
     output_files = [
-        ("Segredos TXT",    cfg["secrets_txt"]),
-        ("Segredos CSV",    cfg["secrets_csv"]),
-        ("Segredos JSONL",  cfg["secrets_jsonl"]),
-        ("Google Keys",     cfg["google_report_file"]),
-        ("API Endpoints",   cfg["api_endpoints_file"]),
-        ("Sensíveis",       cfg["sensitive_report"]),
-        ("Log completo",    cfg["log_file"]),
+        ("Segredos TXT",   cfg["secrets_txt"]),
+        ("Segredos CSV",   cfg["secrets_csv"]),
+        ("Segredos JSONL", cfg["secrets_jsonl"]),
+        ("Google Keys",    cfg["google_report_file"]),
+        ("API Endpoints",  cfg["api_endpoints_file"]),
+        ("Sensíveis",      cfg["sensitive_report"]),
+        ("Log completo",   cfg["log_file"]),
     ]
     existing = [(label, path) for label, path in output_files if path.exists()]
     if existing:
@@ -1768,15 +1576,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Reconhecimento web focado em JS: coleta URLs, extrai segredos, valida chaves."
     )
-    parser.add_argument("domain",             nargs="?",           help="Domínio alvo. Ex: exemplo.com.br")
-    parser.add_argument("--no-dalfox",        action="store_true", help="Pula probe XSS com dalfox")
-    parser.add_argument("--no-ssrf-probe",    action="store_true", help="Pula probe SSRF/redirect")
-    parser.add_argument("--no-sensitive-dl",  action="store_true", help="Pula download de arquivos sensíveis")
-    parser.add_argument("--no-httpx",         action="store_true", help="Usa todas as URLs sem validar com httpx")
-    parser.add_argument("--no-google-val",    action="store_true", help="Pula validação de endpoints Google")
-    parser.add_argument("--no-subs",          action="store_true", help="Pula análise de subdomínios")
-    parser.add_argument("--workers",          type=int, default=20, help="Workers JS (padrão: 20)")
-    parser.add_argument("--timeout",          type=int, default=10, help="Timeout de requisições em segundos (padrão: 10)")
+    parser.add_argument("domain",            nargs="?",            help="Domínio alvo. Ex: exemplo.com.br")
+    parser.add_argument("--no-dalfox",       action="store_true",  help="Pula probe XSS com dalfox")
+    parser.add_argument("--no-ssrf-probe",   action="store_true",  help="Pula probe SSRF/redirect")
+    parser.add_argument("--no-sensitive-dl", action="store_true",  help="Pula download de arquivos sensíveis")
+    parser.add_argument("--no-httpx",        action="store_true",  help="Usa todas as URLs sem validar com httpx")
+    parser.add_argument("--no-google-val",   action="store_true",  help="Pula validação de endpoints Google")
+    parser.add_argument("--no-subs",         action="store_true",  help="Pula análise de subdomínios")
+    parser.add_argument("--workers",         type=int, default=20, help="Workers JS (padrão: 20)")
+    parser.add_argument("--timeout",         type=int, default=10, help="Timeout de requisições em segundos (padrão: 10)")
     return parser.parse_args()
 
 
@@ -1791,21 +1599,19 @@ def main() -> None:
         print("Domínio inválido.")
         sys.exit(1)
 
-    cfg                     = get_config(domain)
-    cfg["js_workers"]       = max(1, args.workers)
-    cfg["request_timeout"]  = max(1, args.timeout)
-    logger                  = setup_logging(cfg["log_file"])
-    stats: dict[str, int]   = {}
+    cfg                    = get_config(domain)
+    cfg["js_workers"]      = max(1, args.workers)
+    cfg["request_timeout"] = max(1, args.timeout)
+    logger                 = setup_logging(cfg["log_file"])
+    stats: dict[str, int]  = {}
 
     logger.info("=" * 60)
     logger.info("Iniciando recon para: %s", domain)
     logger.info("Diretório de saída : %s", cfg["base_dir"])
     logger.info("=" * 60)
 
-    # 1. Coleta de URLs
     stats["urls_total"] = collect_urls(cfg, logger)
 
-    # 2. Validação de URLs ativas
     if args.no_httpx:
         cfg["_active_urls_file"] = cfg["urls_file"]
         stats["urls_alive"]      = stats["urls_total"]
@@ -1813,30 +1619,24 @@ def main() -> None:
     else:
         stats["urls_alive"] = validate_alive_urls(cfg, logger)
 
-    # 3. GF + probes
     run_gf(cfg, logger)
     stats["xss_hits"]           = 0 if args.no_dalfox     else probe_xss(cfg, logger)
     stats["ssrf_redirect_hits"] = 0 if args.no_ssrf_probe else probe_ssrf_redirect(cfg, logger)
 
-    # 4. Arquivos sensíveis
     stats["sensitive_total"]    = extract_sensitive_urls(cfg, logger)
     stats["sensitive_findings"] = 0 if args.no_sensitive_dl \
                                     else download_and_analyze_sensitive(cfg, logger)
 
-    # 5. Coleta de JS do domínio raiz
     stats["js_total"] = collect_js(cfg, logger)
 
-    # 6. Análise de JS + Google Keys do domínio raiz
-    # Lock compartilhado — será reutilizado na análise de subdomínios
-    google_keys_found: set        = set()
-    google_keys_lock: threading.Lock = threading.Lock()
+    google_keys_found: set           = set()
+    google_keys_lock:  threading.Lock = threading.Lock()
 
     js_findings, gkeys = analyze_all_js(cfg, logger)
     stats["js_findings"] = js_findings
     with google_keys_lock:
         google_keys_found.update(gkeys)
 
-    # 7. Análise de subdomínios (JS + segredos em cada sub vivo)
     if args.no_subs:
         logger.info("--no-subs: análise de subdomínios pulada.")
         stats.update({"subs_found": 0, "subs_alive": 0, "subs_js": 0, "subs_secrets": 0})
@@ -1849,7 +1649,6 @@ def main() -> None:
 
     stats["google_keys"] = len(google_keys_found)
 
-    # 8. Validação de Google Keys (todas — raiz + subdomínios)
     if args.no_google_val:
         if google_keys_found:
             write_if_not_empty(cfg["google_keys_file"], sorted(google_keys_found), logger)
@@ -1857,7 +1656,6 @@ def main() -> None:
     else:
         validate_all_google_keys(google_keys_found, cfg, logger)
 
-    # 9. Sumário
     write_summary(cfg, logger, stats)
 
     logger.info("=" * 60)
