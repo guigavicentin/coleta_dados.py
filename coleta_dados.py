@@ -692,30 +692,42 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
     else:
         logger.info("hakrawler não encontrado — instale: go install github.com/hakluke/hakrawler@latest")
 
-    # ── gospider ─────────────────────────────────────────────────────────────
-    # Flags válidas: -s (site), -c (concurrent), -d (depth), -a (other-source),
-    #                -w (include-subs), --subs, --js, --sitemap, --robots, -q (quiet)
-    # NÃO existe: --other-source, --include-subs (são -a e -w respectivamente)
-    # Usamos -q para output limpo e depois extraímos URLs com regex
-    if tool_available("gospider"):
-        logger.info("[gospider] coletando…")
-        raw = run_cmd([
-            "gospider",
-            "-s", f"https://{domain}",
-            "-c", "10", "-d", "3",
-            "--js", "--sitemap", "--robots",
-            "-a",          # other-source: Archive.org, CommonCrawl, VirusTotal, AlienVault
-            "-w",          # include-subs de third-party
-            "--subs",      # inclui subdomínios no crawl
-            "-q",          # quiet: só mostra URLs, sem banner
-        ], logger, timeout=600)
-        for line in raw:
-            m = re.search(r'https?://[^\s"\'<>\]]+', line)
-            if m:
-                all_urls.add(m.group(0).rstrip('.,;)"\'>]'))
-        logger.info("[gospider] %d linhas processadas", len(raw))
-    else:
-        logger.info("gospider não encontrado — instale: go install github.com/jaeles-project/gospider@latest")
+  # ── gospider ─────────────────────────────────────────────────────────────
+if tool_available("gospider"):
+    logger.info("[gospider] coletando…")
+    try:
+        proc = subprocess.Popen(
+            [
+                "gospider",
+                "-s", f"https://{domain}",
+                "-c", "10", "-d", "3",
+                "--js", "--sitemap", "--robots",
+                "-a", "-w", "--subs", "-q",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        gospider_lines: list[str] = []
+        killer = threading.Timer(900, lambda: proc.kill())  # 15 min
+        killer.start()
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                m = re.search(r'https?://[^\s"\'<>\]]+', line)
+                if m:
+                    all_urls.add(m.group(0).rstrip('.,;)"\'>]'))
+                gospider_lines.append(line)
+        finally:
+            killer.cancel()
+            proc.wait(timeout=10)
+        logger.info("[gospider] %d linhas processadas", len(gospider_lines))
+    except Exception as exc:
+        logger.error("[gospider] erro: %s", exc)
+else:
+    logger.info("gospider não encontrado — instale: go install github.com/jaeles-project/gospider@latest")
 
     # ── subfinder → hakrawler + gospider em subdomínios ──────────────────────
     if tool_available("subfinder"):
@@ -739,17 +751,32 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
                 logger.info("[hakrawler/subs] %d URLs", len(lines))
 
             # gospider em subdomínios (limita a 50 para não demorar demais)
-            if tool_available("gospider"):
-                logger.info("[gospider] crawling em subdomínios…")
-                for sub in subs[:50]:
-                    raw = run_cmd([
-                        "gospider", "-s", f"https://{sub}",
-                        "-c", "5", "-d", "2", "--js", "-q",
-                    ], logger, timeout=60)
-                    for line in raw:
-                        m = re.search(r'https?://[^\s"\'<>\]]+', line)
-                        if m:
-                            all_urls.add(m.group(0).rstrip('.,;)"\'>]'))
+if tool_available("gospider"):
+    logger.info("[gospider] crawling em subdomínios…")
+    for sub in subs[:50]:
+        try:
+            proc = subprocess.Popen(
+                ["gospider", "-s", f"https://{sub}",
+                 "-c", "5", "-d", "2", "--js", "-q"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            killer = threading.Timer(180, lambda: proc.kill())  # 3 min por sub
+            killer.start()
+            try:
+                for line in proc.stdout:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    m = re.search(r'https?://[^\s"\'<>\]]+', line)
+                    if m:
+                        all_urls.add(m.group(0).rstrip('.,;)"\'>]'))
+            finally:
+                killer.cancel()
+                proc.wait(timeout=10)
+        except Exception as exc:
+            logger.error("[gospider/subs] %s: %s", sub, exc)
     else:
         logger.info("subfinder não encontrado — instale: go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest")
 
