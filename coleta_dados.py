@@ -508,60 +508,60 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
     domain   = cfg["domain"]
     all_urls: set[str] = set()
 
-    # ── gau ───────────────────────────────────────────────────────────────────
-   if tool_available("gau"):
-    logger.info("[gau] coletando… (domínio: %s)", domain)
-    try:
-        proc = subprocess.Popen(
-            ["gau", "--threads", "5", "--subs",
-             "--providers", "wayback,commoncrawl,otx,urlscan",
-             "--retries", "2", "--timeout", "30", domain],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        gau_lines: list[str] = []
+    # ── gau ──────────────────────────────────────────────────
+    if tool_available("gau"):
+        logger.info("[gau] coletando… (domínio: %s)", domain)
         try:
-            for line in proc.stdout:
-                line = line.strip()
-                if line:
-                    gau_lines.append(line)
-        finally:
-            proc.wait()
+            proc = subprocess.Popen(
+                ["gau", "--threads", "5", "--subs",
+                 "--providers", "wayback,commoncrawl,otx,urlscan",
+                 "--retries", "2", "--timeout", "50", domain],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            gau_lines: list[str] = []
+            try:
+                for line in proc.stdout:
+                    line = line.strip()
+                    if line:
+                        gau_lines.append(line)
+            finally:
+                proc.wait()
 
-        all_urls.update(gau_lines)
-        logger.info("[gau] %d URLs", len(gau_lines))
-    except Exception as exc:
-        logger.error("[gau] erro: %s", exc)
-else:
-    logger.warning("gau não encontrado — pulando.")
+            all_urls.update(gau_lines)
+            logger.info("[gau] %d URLs", len(gau_lines))
+        except Exception as exc:
+            logger.error("[gau] erro: %s", exc)
+    else:
+        logger.warning("gau não encontrado — pulando.")
 
-    # ── waybackurls ───────────────────────────────────────────────────────────
-if tool_available("waybackurls"):
-    logger.info("[waybackurls] coletando… (domínio: %s)", domain)
-    try:
-        proc = subprocess.Popen(
-            ["waybackurls"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True,
-        )
-        wb_lines: list[str] = []
+    # ── waybackurls ───────────────────────────────────────────
+    if tool_available("waybackurls"):
+        logger.info("[waybackurls] coletando… (domínio: %s)", domain)
         try:
-            proc.stdin.write(domain + "\n")
-            proc.stdin.close()
-            for line in proc.stdout:
-                line = line.strip()
-                if line:
-                    wb_lines.append(line)
-        finally:
-            proc.wait()
+            proc = subprocess.Popen(
+                ["waybackurls"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+            )
+            wb_lines: list[str] = []
+            try:
+                proc.stdin.write(domain + "\n")
+                proc.stdin.close()
+                for line in proc.stdout:
+                    line = line.strip()
+                    if line:
+                        wb_lines.append(line)
+            finally:
+                proc.wait()
 
-        all_urls.update(wb_lines)
-        logger.info("[waybackurls] %d URLs", len(wb_lines))
-    except Exception as exc:
-        logger.error("[waybackurls] erro: %s", exc)
-else:
-    logger.warning("waybackurls não encontrado — pulando.")
+            all_urls.update(wb_lines)
+            logger.info("[waybackurls] %d URLs", len(wb_lines))
+        except Exception as exc:
+            logger.error("[waybackurls] erro: %s", exc)
+    else:
+        logger.warning("waybackurls não encontrado — pulando.")
 
-    # ── Wayback Machine API direta ────────────────────────────────────────────
+    # ── Wayback Machine API direta ────────────────────────────
     logger.info("[wayback-api] consultando CDX API…")
     wayback_urls = _fetch_wayback_api(domain, logger)
     if wayback_urls:
@@ -570,7 +570,7 @@ else:
     else:
         logger.info("[wayback-api] nenhuma URL retornada.")
 
-    # ── CommonCrawl API direta ────────────────────────────────────────────────
+    # ── CommonCrawl API direta ────────────────────────────────
     logger.info("[commoncrawl-api] consultando…")
     cc_urls = _fetch_commoncrawl_api(domain, logger)
     if cc_urls:
@@ -579,7 +579,7 @@ else:
     else:
         logger.info("[commoncrawl-api] nenhuma URL retornada.")
 
-    # ── katana ────────────────────────────────────────────────────────────────
+    # ── katana ────────────────────────────────────────────────
     if tool_available("katana"):
         logger.info("[katana] coletando…")
         lines = run_cmd([
@@ -594,7 +594,7 @@ else:
     else:
         logger.warning("katana não encontrado — pulando.")
 
-    # ── hakrawler ─────────────────────────────────────────────────────────────
+    # ── hakrawler ─────────────────────────────────────────────
     if tool_available("hakrawler"):
         logger.info("[hakrawler] coletando…")
         lines = run_cmd(
@@ -608,45 +608,44 @@ else:
     else:
         logger.info("hakrawler não encontrado — instale: go install github.com/hakluke/hakrawler@latest")
 
-    # ── gospider ─────────────────────────────────────────────────────────────
-if tool_available("gospider"):
-    logger.info("[gospider] coletando…")
-    try:
-        proc = subprocess.Popen(
-            ["gospider", "-s", f"https://{domain}",
-             "-c", "10", "-d", "3",
-             "--js", "--sitemap", "--robots",
-             "-a", "-w", "--subs", "-q",
-             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        gospider_lines: list[str] = []
+    # ── gospider ─────────────────────────────────────────────
+    if tool_available("gospider"):
+        logger.info("[gospider] coletando…")
         try:
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                m = re.search(r'https?://[^\s"\'<>\]]+', line)
-                if m:
-                    all_urls.add(m.group(0).rstrip('.,;)"\'>]'))
-                gospider_lines.append(line)
-        finally:
-            proc.wait()
+            proc = subprocess.Popen(
+                ["gospider", "-s", f"https://{domain}",
+                 "-c", "10", "-d", "3",
+                 "--js", "--sitemap", "--robots",
+                 "-a", "-w", "--subs", "-q",
+                 "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            gospider_lines: list[str] = []
+            try:
+                for line in proc.stdout:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    m = re.search(r'https?://[^\s"\'<>\]]+', line)
+                    if m:
+                        all_urls.add(m.group(0).rstrip('.,;)"\'>]'))
+                    gospider_lines.append(line)
+            finally:
+                proc.wait()
 
-        logger.info("[gospider] %d linhas processadas", len(gospider_lines))
-    except Exception as exc:
-        logger.error("[gospider] erro: %s", exc)
-else:
-    logger.info("gospider não encontrado — instale: go install github.com/jaeles-project/gospider@latest")
+            logger.info("[gospider] %d linhas processadas", len(gospider_lines))
+        except Exception as exc:
+            logger.error("[gospider] erro: %s", exc)
+    else:
+        logger.info("gospider não encontrado — instale: go install github.com/jaeles-project/gospider@latest")
 
-    # ── subfinder → hakrawler + gospider em subdomínios ──────────────────────
+    # ── subfinder ─────────────────────────────────────────────
     if tool_available("subfinder"):
         logger.info("[subfinder] enumerando subdomínios…")
         subs = run_cmd(["subfinder", "-d", domain, "-silent"], logger, timeout=300)
         logger.info("[subfinder] %d subdomínios encontrados", len(subs))
 
         if subs:
-            # hakrawler nos subdomínios
             if tool_available("hakrawler"):
                 logger.info("[hakrawler] crawling em %d subdomínios…", len(subs))
                 sub_input = "\n".join(f"https://{s}" for s in subs) + "\n"
@@ -660,18 +659,16 @@ else:
                 all_urls.update(lines)
                 logger.info("[hakrawler/subs] %d URLs", len(lines))
 
-            # gospider nos subdomínios (limita a 50)
             if tool_available("gospider"):
                 logger.info("[gospider] crawling em subdomínios…")
                 for sub in subs[:50]:
                     try:
                         proc = subprocess.Popen(
                             ["gospider", "-s", f"https://{sub}",
-                             "-c", "5", "-d", "2", "--js", "-q"],
+                             "-c", "5", "-d", "2", "--js", "-q",
+                             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                         )
-                        killer = threading.Timer(180, lambda: proc.kill())
-                        killer.start()
                         try:
                             for line in proc.stdout:
                                 line = line.strip()
@@ -681,8 +678,7 @@ else:
                                 if m:
                                     all_urls.add(m.group(0).rstrip('.,;)"\'>]'))
                         finally:
-                            killer.cancel()
-                            proc.wait(timeout=10)
+                            proc.wait()
                     except Exception as exc:
                         logger.error("[gospider/subs] %s: %s", sub, exc)
     else:
