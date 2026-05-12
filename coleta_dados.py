@@ -613,36 +613,35 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
         logger.info("hakrawler não encontrado — instale: go install github.com/hakluke/hakrawler@latest")
 
     # ── gospider ─────────────────────────────────────────────────────────────
-    if tool_available("gospider"):
-        logger.info("[gospider] coletando…")
+if tool_available("gospider"):
+    logger.info("[gospider] coletando…")
+    try:
+        proc = subprocess.Popen(
+            ["gospider", "-s", f"https://{domain}",
+             "-c", "10", "-d", "3",
+             "--js", "--sitemap", "--robots",
+             "-a", "-w", "--subs", "-q",
+             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        gospider_lines: list[str] = []
         try:
-            proc = subprocess.Popen(
-                ["gospider", "-s", f"https://{domain}",
-                 "-c", "10", "-d", "3",
-                 "--js", "--sitemap", "--robots",
-                 "-a", "-w", "--subs", "-q"],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            )
-            gospider_lines: list[str] = []
-            killer = threading.Timer(900, lambda: proc.kill())
-            killer.start()
-            try:
-                for line in proc.stdout:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    m = re.search(r'https?://[^\s"\'<>\]]+', line)
-                    if m:
-                        all_urls.add(m.group(0).rstrip('.,;)"\'>]'))
-                    gospider_lines.append(line)
-            finally:
-                killer.cancel()
-                proc.wait(timeout=10)
-            logger.info("[gospider] %d linhas processadas", len(gospider_lines))
-        except Exception as exc:
-            logger.error("[gospider] erro: %s", exc)
-    else:
-        logger.info("gospider não encontrado — instale: go install github.com/jaeles-project/gospider@latest")
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                m = re.search(r'https?://[^\s"\'<>\]]+', line)
+                if m:
+                    all_urls.add(m.group(0).rstrip('.,;)"\'>]'))
+                gospider_lines.append(line)
+        finally:
+            proc.wait()
+
+        logger.info("[gospider] %d linhas processadas", len(gospider_lines))
+    except Exception as exc:
+        logger.error("[gospider] erro: %s", exc)
+else:
+    logger.info("gospider não encontrado — instale: go install github.com/jaeles-project/gospider@latest")
 
     # ── subfinder → hakrawler + gospider em subdomínios ──────────────────────
     if tool_available("subfinder"):
@@ -792,7 +791,8 @@ def probe_xss(cfg: dict, logger: logging.Logger) -> int:
         proc = subprocess.Popen(
             ["dalfox", "file", str(xss_file),
              "--silence", "--output", str(out_file),
-             "--worker", "10", "--timeout", "10"],
+             "--worker", "10", "--timeout", "10",
+             "--header", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         hits   = 0
