@@ -509,61 +509,57 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
     all_urls: set[str] = set()
 
     # ── gau ───────────────────────────────────────────────────────────────────
-    if tool_available("gau"):
-        logger.info("[gau] coletando… (domínio: %s)", domain)
+   if tool_available("gau"):
+    logger.info("[gau] coletando… (domínio: %s)", domain)
+    try:
+        proc = subprocess.Popen(
+            ["gau", "--threads", "5", "--subs",
+             "--providers", "wayback,commoncrawl,otx,urlscan",
+             "--retries", "2", "--timeout", "30", domain],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        gau_lines: list[str] = []
         try:
-            proc = subprocess.Popen(
-                ["gau", "--threads", "5", "--subs",
-                 "--providers", "wayback,commoncrawl,otx,urlscan",
-                 "--retries", "2", "--timeout", "30", domain],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            )
-            gau_lines: list[str] = []
-            killer = threading.Timer(600, lambda: proc.kill())
-            killer.start()
-            try:
-                for line in proc.stdout:
-                    line = line.strip()
-                    if line:
-                        gau_lines.append(line)
-            finally:
-                killer.cancel()
-                proc.wait(timeout=5)
-            all_urls.update(gau_lines)
-            logger.info("[gau] %d URLs", len(gau_lines))
-        except Exception as exc:
-            logger.error("[gau] erro: %s", exc)
-    else:
-        logger.warning("gau não encontrado — pulando.")
+            for line in proc.stdout:
+                line = line.strip()
+                if line:
+                    gau_lines.append(line)
+        finally:
+            proc.wait()
+
+        all_urls.update(gau_lines)
+        logger.info("[gau] %d URLs", len(gau_lines))
+    except Exception as exc:
+        logger.error("[gau] erro: %s", exc)
+else:
+    logger.warning("gau não encontrado — pulando.")
 
     # ── waybackurls ───────────────────────────────────────────────────────────
-    if tool_available("waybackurls"):
-        logger.info("[waybackurls] coletando… (domínio: %s)", domain)
+if tool_available("waybackurls"):
+    logger.info("[waybackurls] coletando… (domínio: %s)", domain)
+    try:
+        proc = subprocess.Popen(
+            ["waybackurls"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+        )
+        wb_lines: list[str] = []
         try:
-            proc = subprocess.Popen(
-                ["waybackurls"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True,
-            )
-            wb_lines: list[str] = []
-            killer = threading.Timer(600, lambda: proc.kill())
-            killer.start()
-            try:
-                proc.stdin.write(domain + "\n")
-                proc.stdin.close()
-                for line in proc.stdout:
-                    line = line.strip()
-                    if line:
-                        wb_lines.append(line)
-            finally:
-                killer.cancel()
-                proc.wait(timeout=5)
-            all_urls.update(wb_lines)
-            logger.info("[waybackurls] %d URLs", len(wb_lines))
-        except Exception as exc:
-            logger.error("[waybackurls] erro: %s", exc)
-    else:
-        logger.warning("waybackurls não encontrado — pulando.")
+            proc.stdin.write(domain + "\n")
+            proc.stdin.close()
+            for line in proc.stdout:
+                line = line.strip()
+                if line:
+                    wb_lines.append(line)
+        finally:
+            proc.wait()
+
+        all_urls.update(wb_lines)
+        logger.info("[waybackurls] %d URLs", len(wb_lines))
+    except Exception as exc:
+        logger.error("[waybackurls] erro: %s", exc)
+else:
+    logger.warning("waybackurls não encontrado — pulando.")
 
     # ── Wayback Machine API direta ────────────────────────────────────────────
     logger.info("[wayback-api] consultando CDX API…")
