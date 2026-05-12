@@ -1,31 +1,32 @@
 #!/usr/bin/env python3
 """
-recon.py — Script de reconhecimento web passivo/ativo focado em JS.
+recon.py — Script de reconhecimento web passivo/ativo.
 
-Fluxo:
-  1. Coleta de URLs  (gau + waybackurls + katana + hakrawler + subfinder + gospider)
+Etapas:
+  1. Coleta de URLs (gau + waybackurls + katana)
   2. Validação de URLs ativas com httpx
-  3. Filtragem com GF  (xss, sqli, ssrf, redirect, ssti)
-  4. Download e análise de arquivos sensíveis por extensão
-  5. Coleta de URLs de JS  (filtro inteligente, sem CDNs)
-  6. Análise de segredos em JS  (padrões de alta precisão + detecção de ofuscação)
-  7. Validação de Google API Keys
+  3. Filtragem com GF (xss, sqli, ssrf, redirect, ssti)
+  4. Extração de arquivos sensíveis por extensão + download e análise
+  5. Coleta de arquivos JS
+  6. Análise de segredos em JS — inclui detecção e validação de Google API Keys
+  7. Probe de parâmetros vulneráveis (XSS via dalfox, SSRF/redirect via qsreplace)
   8. Extração de endpoints de API expostos em JS
-  9. Probe de XSS (dalfox) e SSRF/redirect (qsreplace)
- 10. Relatório consolidado
+  9. Relatório consolidado final
 
-Filosofia de saída:
-  - Nenhum arquivo é criado se estiver vazio.
-  - Sem estrutura de diretórios pré-criada; pastas são geradas sob demanda.
-  - Apenas achados reais são persistidos.
+Melhorias aplicadas em relação à versão anterior:
+  - Validação de URLs ativas (httpx) antes do GF e análise JS
+  - is_valid_js() tolerante a bundles Webpack/Vite/esbuild modernos
+  - secret_patterns expandido: GitHub, OpenAI, SendGrid, Slack, Twilio, RSA keys,
+    Amazon MWS, Google OAuth client, e mais
+  - Race condition corrigida em google_keys_found com threading.Lock
+  - Rate limiting com tenacity (backoff exponencial + respeito a Retry-After)
+  - Detecção de endpoints de API internos em JS
+  - Download e análise de arquivos sensíveis (.env, .conf, etc.)
+  - Probe de XSS (dalfox) e SSRF/open-redirect (qsreplace+curl) nas URLs filtradas pelo GF
+  - Sumário consolidado ao final
 """
 
-from __future__ import annotations
-
 import argparse
-import csv
-import json
-import shutil
 import subprocess
 import re
 import math
@@ -35,11 +36,6 @@ import sys
 import threading
 import urllib3
 import time
-import base64 as _b64
-import hashlib
-import contextlib
-import html as html_lib
-import urllib.parse
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -54,13 +50,7 @@ from tenacity import (
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Constantes de qualidade
-# ─────────────────────────────────────────────────────────────────────────────
-
-_MIN_VALUE_LEN       = 8
-_MIN_ENTROPY         = 3.2
-_DECODED_ENTROPY_MIN = 3.5
+# ── Filtros de qualidade para password/senha ──────────────────────────────────
 
 _PLACEHOLDER_RE = re.compile(
     r'^('
@@ -77,39 +67,42 @@ _PLACEHOLDER_RE = re.compile(
 
 _UI_CONTEXT_RE = re.compile(
     r'(label|placeholder|hint|aria[-_]label|title|description|'
-    r'tooltip|helper|message|text|i18n|translate|t\(|'
-    r'console\.log|console\.warn|console\.error|comment|//)',
+    r'tooltip|helper|message|text|i18n|translate|t\()',
     re.I,
 )
 
-_CDN_DOMAINS_RE = re.compile(
-    r'(?:cdnjs\.cloudflare\.com|cdn\.jsdelivr\.net|unpkg\.com|'
-    r'ajax\.googleapis\.com|stackpath\.bootstrapcdn\.com|'
-    r'maxcdn\.bootstrapcdn\.com|code\.jquery\.com|'
-    r'cdn\.datatables\.net|cdn\.polyfill\.io|'
-    r'static\.cloudflareinsights\.com)',
-    re.I,
-)
+_MIN_VALUE_LEN = 8
+_MIN_ENTROPY = 3.0
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers de regex
-# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Helpers para padrões com contexto ────────────────────────────────────────
 
 def _regex(pattern: str, flags: int = 0) -> re.Pattern:
     return re.compile(pattern, flags)
 
 
+def _ctx_regex(context: str, value_pattern: str, flags: int = re.I, window: int = 80) -> re.Pattern:
+    """
+    Cria regex que exige uma palavra de contexto próxima do segredo.
+    Ajuda a reduzir falsos positivos em UUIDs, hex strings e tokens curtos.
+    """
+    return re.compile(
+        rf'(?is)(?:{context})' + r'.{0,' + str(window) + r'}' + rf'({value_pattern})',
+        flags,
+    )
+
+
 def _shannon_entropy(s: str) -> float:
     if not s:
         return 0.0
-    freq  = collections.Counter(s)
+    freq = collections.Counter(s)
     total = len(s)
     return -sum((c / total) * math.log2(c / total) for c in freq.values())
 
 
 def _extract_value(raw_match: str) -> str:
-    m = re.search(r'[:=]\s*["\']?([^\s"\'`,;]{4,})', raw_match)
-    return m.group(1).strip() if m else raw_match.strip()
+    m = re.search(r'[:=]\s*["\']([^"\']*)', raw_match)
+    return m.group(1).strip() if m else ""
 
 
 def is_likely_real_credential(raw_match: str, context_line: str = "") -> bool:
@@ -125,19 +118,19 @@ def is_likely_real_credential(raw_match: str, context_line: str = "") -> bool:
     return True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Detector de strings ofuscadas via char-code arrays
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Detector de strings ofuscadas via char code arrays ────────────────────────
 
 _CHARCODE_ARRAY_RE = re.compile(r'\[\s*(\d{2,3}(?:\s*,\s*\d{2,3}){5,})\s*\]')
 
-_DECODED_SECRET_CHECKS: list[tuple[str, re.Pattern | None]] = [
-    ("bcrypt_hash_decoded",  re.compile(r'\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}')),
-    ("google_key_decoded",   re.compile(r'AIza[0-9A-Za-z\-_]{35}')),
-    ("aws_key_decoded",      re.compile(r'AKIA[0-9A-Z]{16}')),
-    ("jwt_decoded",          re.compile(r'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+')),
-    ("high_entropy_decoded", None),
+_DECODED_SECRET_CHECKS: list[tuple[str, re.Pattern]] = [
+    ("bcrypt_hash_decoded",   re.compile(r'\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}')),
+    ("google_key_decoded",    re.compile(r'AIza[0-9A-Za-z\-_]{35}')),
+    ("aws_key_decoded",       re.compile(r'AKIA[0-9A-Z]{16}')),
+    ("jwt_decoded",           re.compile(r'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+')),
+    ("high_entropy_string",   None),
 ]
+
+_DECODED_ENTROPY_MIN = 3.5
 
 
 def _decode_charcode_array(array_str: str) -> str | None:
@@ -150,8 +143,13 @@ def _decode_charcode_array(array_str: str) -> str | None:
         return None
 
 
-def scan_charcode_obfuscation(content: str, url: str, logger: logging.Logger) -> list[dict]:
-    results = []
+def scan_charcode_obfuscation(
+    content: str,
+    url: str,
+    out_file,
+    logger: logging.Logger,
+) -> int:
+    found = 0
     for m in _CHARCODE_ARRAY_RE.finditer(content):
         decoded = _decode_charcode_array(m.group(1))
         if not decoded or len(decoded) < 8:
@@ -168,22 +166,22 @@ def scan_charcode_obfuscation(content: str, url: str, logger: logging.Logger) ->
                 break
 
         if matched_label:
-            start   = max(0, m.start() - 60)
-            end     = min(len(content), m.end() + 60)
+            start = max(0, m.start() - 60)
+            end = min(len(content), m.end() + 60)
             context = content[start:end].replace("\n", " ")
-            logger.warning("[!!!] %s (ofuscado) → %s | decoded: %s", matched_label, url, decoded[:80])
-            results.append({
-                "type":    matched_label,
-                "value":   decoded,
-                "context": context,
-                "url":     url,
-            })
-    return results
+            logger.warning("[!!!] %s (ofuscado) → %s", matched_label, url)
+            logger.warning("      decoded: %s", decoded[:80])
+            out_file.write(
+                f"[{matched_label}] {url}\n"
+                f"  decoded : {decoded}\n"
+                f"  context : ...{context}...\n"
+                + "-" * 60 + "\n"
+            )
+            found += 1
+    return found
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Logging
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 
 def setup_logging(log_file: Path) -> logging.Logger:
     logger = logging.getLogger("recon")
@@ -195,7 +193,6 @@ def setup_logging(log_file: Path) -> logging.Logger:
     ch.setFormatter(fmt)
     logger.addHandler(ch)
 
-    log_file.parent.mkdir(parents=True, exist_ok=True)
     fh = logging.FileHandler(log_file, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
@@ -204,128 +201,138 @@ def setup_logging(log_file: Path) -> logging.Logger:
     return logger
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Configuração
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Configuração ──────────────────────────────────────────────────────────────
 
 def get_config(domain: str) -> dict:
-    base = Path(f"recon_{domain}")
+    base = Path(f"coleta_{domain}")
     base.mkdir(exist_ok=True)
+    (base / "gf").mkdir(exist_ok=True)
+    (base / "js").mkdir(exist_ok=True)
+    (base / "sensitive_downloads").mkdir(exist_ok=True)
 
     return {
-        "domain":   domain,
+        "domain": domain,
         "base_dir": base,
-
-        "urls_file":           base / "urls_raw.txt",
+        "urls_file":           base / "urls.txt",
         "urls_alive_file":     base / "urls_alive.txt",
         "js_file":             base / "js_urls.txt",
-        "secrets_txt":         base / "secrets.txt",
-        "secrets_csv":         base / "secrets.csv",
-        "secrets_jsonl":       base / "secrets.jsonl",
+        "result_file":         base / "js_sensiveis.txt",
         "google_keys_file":    base / "google_keys.txt",
         "google_report_file":  base / "google_keys_report.txt",
         "log_file":            base / "recon.log",
         "gf_dir":              base / "gf",
-        "sensitive_urls_file": base / "sensitive_urls.txt",
+        "sensitive_file":      base / "urls_analisar.txt",
         "sensitive_dir":       base / "sensitive_downloads",
-        "sensitive_report":    base / "sensitive_report.txt",
+        "sensitive_analysis":  base / "sensitive_analysis.txt",
         "api_endpoints_file":  base / "api_endpoints.txt",
         "summary_file":        base / "SUMMARY.txt",
 
         "gf_patterns": ["xss", "sqli", "ssrf", "redirect", "ssti"],
 
         "sensitive_regex": re.compile(
-            r'\.(env|log|bak|sql|conf|ini|yml|yaml|pem|key|crt|sh|py)$',
+            r"\.(php|html|xml|zip|gz|env|log|bak|sql|txt|conf|ini|yml|yaml|db|pem|key|crt|sh|py|jsp|asp|aspx)$",
             re.IGNORECASE,
         ),
 
+        # Padrões de segredos EXPANDIDOS
         "secret_patterns": {
-            # Google / Firebase / GCP
-            "google_api_key":       _regex(r'AIza[0-9A-Za-z\-_]{35}'),
-            "google_oauth_client":  _regex(r'[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com'),
-            "firebase_url":         _regex(r'https?://[a-z0-9\-]+\.firebaseio\.com', re.I),
-            "gcp_service_account":  _regex(r'"type"\s*:\s*"service_account"'),
+            # ── Google / Firebase ─────────────────────────────────────────────
+            "google_api_key":         _regex(r'AIza[0-9A-Za-z\-_]{35}'),
+            "google_oauth_client":    _regex(r'[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com'),
+            "firebase_database":      _regex(r'https?://[a-z0-9\-]+\.firebaseio\.com', re.I),
+            "gcp_service_account":    _regex(r'"type"\s*:\s*"service_account"'),
 
-            # AWS / Cloud
-            "aws_access_key":       _regex(r'AKIA[0-9A-Z]{16}'),
-            "amazon_mws":           _regex(r'amzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'),
-            "azure_storage_key":    _regex(r'DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[A-Za-z0-9+/=]{88}'),
-            "digitalocean_token":   _regex(r'dop_v1_[a-f0-9]{64}'),
-            "terraform_cloud":      _regex(r'[a-zA-Z0-9]{14}\.atlasv1\.[a-zA-Z0-9\-_=]{60,}'),
+            # ── AWS / Cloud / Infra ──────────────────────────────────────────
+            "aws_key":                _regex(r'AKIA[0-9A-Z]{16}'),
+            "amazon_mws":             _regex(r'amzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'),
+            "azure_storage_key":      _regex(r'DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[A-Za-z0-9+/=]{88}'),
+            "azure_client_secret":    _ctx_regex(r'azure|client[_-]?secret|clientSecret', r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'),
+            "heroku_api_key":         _ctx_regex(r'heroku', r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'),
+            "digitalocean_token":     _regex(r'dop_v1_[a-f0-9]{64}'),
+            "cloudflare_api_key":     _ctx_regex(r'cloudflare|CF_API|CF-|cf[_-]?api', r'[0-9a-f]{37}'),
+            "terraform_cloud_token":  _regex(r'[a-zA-Z0-9]{14}\.atlasv1\.[a-zA-Z0-9\-_=]{60,}'),
 
-            # Pagamento
-            "stripe_secret":        _regex(r'sk_live_[0-9a-zA-Z]{24,}'),
-            "stripe_publishable":   _regex(r'pk_live_[0-9a-zA-Z]{24,}'),
-            "stripe_webhook":       _regex(r'whsec_[a-zA-Z0-9]{32,}'),
-            "square_access_token":  _regex(r'sq0atp-[0-9A-Za-z\-_]{22}'),
-            "square_oauth_secret":  _regex(r'sq0csp-[0-9A-Za-z\-_]{43}'),
-            "braintree_token":      _regex(r'access_token\$production\$[a-z0-9]{16}\$[a-f0-9]{32}'),
+            # ── Pagamento / Financeiro ───────────────────────────────────────
+            "stripe_secret":          _regex(r'sk_live_[0-9a-zA-Z]{24,}'),
+            "stripe_publishable":     _regex(r'pk_live_[0-9a-zA-Z]{24,}'),
+            "stripe_webhook":         _regex(r'whsec_[a-zA-Z0-9]{32,}'),
+            "paypal_client_id":       _regex(r'\bA[A-Za-z0-9\-_]{79}\b'),
+            "braintree_token":        _regex(r'access_token\$production\$[a-z0-9]{16}\$[a-f0-9]{32}'),
+            "square_access_token":    _regex(r'sq0atp-[0-9A-Za-z\-_]{22}'),
+            "square_oauth_secret":    _regex(r'sq0csp-[0-9A-Za-z\-_]{43}'),
 
-            # Comunicação
-            "sendgrid_key":         _regex(r'SG\.[a-zA-Z0-9]{22}\.[a-zA-Z0-9]{43}'),
-            "mailgun_api_key":      _regex(r'key-[0-9a-zA-Z]{32}'),
-            "mailchimp_api_key":    _regex(r'[0-9a-f]{32}-us[0-9]{1,2}'),
-            "twilio_account_sid":   _regex(r'\bAC[a-z0-9]{32}\b'),
-            "twilio_auth_token":    _regex(r'\bSK[a-z0-9]{32}\b'),
+            # ── Comunicação / Email / SMS ────────────────────────────────────
+            "sendgrid_key":           _regex(r'SG\.[a-zA-Z0-9]{22}\.[a-zA-Z0-9]{43}'),
+            "mailgun_api_key":        _regex(r'key-[0-9a-zA-Z]{32}'),
+            "mailchimp_api_key":      _regex(r'[0-9a-f]{32}-us[0-9]{1,2}'),
+            "postmark_token":         _ctx_regex(r'postmark', r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'),
+            "vonage_api_secret":      _ctx_regex(r'nexmo|vonage|api_secret', r'[a-zA-Z0-9]{8}'),
+            "messagebird_token":      _ctx_regex(r'messagebird', r'[0-9a-zA-Z]{25}'),
+            "pagerduty_token":        _regex(r'u\+[a-zA-Z0-9]{18}'),
+            "twilio_account_sid":     _regex(r'AC[a-z0-9]{32}'),
+            "twilio_auth_token":      _regex(r'SK[a-z0-9]{32}'),
 
-            # DevOps / CI
-            "github_pat":           _regex(r'gh[pousr]_[A-Za-z0-9]{36}'),
-            "github_oauth":         _regex(r'gho_[A-Za-z0-9]{36}'),
-            "gitlab_pat":           _regex(r'glpat-[A-Za-z0-9\-_]{20}'),
-            "gitlab_pipeline":      _regex(r'glptt-[a-f0-9]{40}'),
-            "npm_token":            _regex(r'npm_[A-Za-z0-9]{36}'),
-            "pypi_token":           _regex(r'pypi-[A-Za-z0-9_\-]{50,}'),
-            "dockerhub_pat":        _regex(r'dckr_pat_[A-Za-z0-9_\-]{27}'),
-            "hashicorp_vault":      _regex(r'hvs\.[A-Za-z0-9_\-]{90,}'),
-            "new_relic_key":        _regex(r'NRAK-[A-Z0-9]{27}'),
-            "sentry_dsn":           _regex(r'https://[a-f0-9]{32}@[a-z0-9]+\.ingest\.sentry\.io/[0-9]+'),
-            "grafana_token":        _regex(r'glc_[A-Za-z0-9+/]{32,}'),
+            # ── Monitoramento / Analytics / DevOps ───────────────────────────
+            "datadog_api_key":        _ctx_regex(r'DD_API_KEY|datadog', r'[a-f0-9]{32}'),
+            "new_relic_key":          _regex(r'NRAK-[A-Z0-9]{27}'),
+            "sentry_dsn":             _regex(r'https://[a-f0-9]{32}@[a-z0-9]+\.ingest\.sentry\.io/[0-9]+'),
+            "grafana_token":          _regex(r'glc_[A-Za-z0-9+/]{32,}'),
+            "circleci_token":         _regex(r'circle-token\s+[a-f0-9]{40}'),
+            "travis_token":           _ctx_regex(r'travis', r'[a-zA-Z0-9]{22}'),
+            "npm_token":              _regex(r'npm_[A-Za-z0-9]{36}'),
+            "pypi_token":             _regex(r'pypi-[A-Za-z0-9_\-]{50,}'),
+            "dockerhub_pat":          _regex(r'dckr_pat_[A-Za-z0-9_\-]{27}'),
+            "artifactory_key":        _regex(r'AKC[a-zA-Z0-9]{10,}'),
 
-            # OpenAI / Slack
-            "openai_key":           _regex(r'sk-[a-zA-Z0-9]{48}'),
-            "slack_token":          _regex(r'xox[baprs]-[0-9a-zA-Z\-]{10,48}'),
-            "slack_webhook":        _regex(r'https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+'),
+            # ── Repositórios / CI-CD ─────────────────────────────────────────
+            "github_pat":             _regex(r'gh[pousr]_[A-Za-z0-9]{36}'),
+            "github_oauth":           _regex(r'gho_[A-Za-z0-9]{36}'),
+            "gitlab_pat":             _regex(r'glpat-[A-Za-z0-9\-_]{20}'),
+            "gitlab_pipeline_token":  _regex(r'glptt-[a-f0-9]{40}'),
+            "bitbucket_app_password": _ctx_regex(r'x-token-auth|bitbucket', r'[A-Za-z0-9_\-]{20,}'),
+            "hashicorp_vault_token":  _regex(r'hvs\.[A-Za-z0-9_\-]{90,}'),
+            "pulumi_token":           _regex(r'pul-[a-f0-9]{40}'),
 
-            # DB / Connection strings
-            "mongodb_dsn":          _regex(r'mongodb(?:\+srv)?://[^:\s]+:[^@\s]+@[^\s"\'`]+', re.I),
-            "postgres_dsn":         _regex(r'postgres(?:ql)?://[^:\s]+:[^@\s]+@[^\s"\'`]+', re.I),
-            "mysql_dsn":            _regex(r'mysql://[^:\s]+:[^@\s]+@[^\s"\'`]+', re.I),
-            "redis_dsn":            _regex(r'redis://:([^@\s]+)@[^\s"\'`]+', re.I),
+            # ── Banco de Dados / Connection Strings ──────────────────────────
+            "mongodb_atlas_dsn":      _regex(r'mongodb\+srv://[^:\s]+:[^@\s]+@', re.I),
+            "postgres_dsn":           _regex(r'postgres(?:ql)?://[^:\s]+:[^@\s]+@', re.I),
+            "mysql_dsn":              _regex(r'mysql://[^:\s]+:[^@\s]+@', re.I),
+            "redis_password_dsn":     _regex(r'redis://:([^@\s]+)@', re.I),
+            "elasticsearch_dsn":      _regex(r'https?://[^:\s]+:[^@\s]+@[^\s"\']*elastic[^\s"\']*', re.I),
 
-            # Misc
-            "shopify_token":        _regex(r'shp(?:at|ss)_[a-fA-F0-9]{32}'),
-            "mapbox_token":         _regex(r'pk\.eyJ1[A-Za-z0-9._\-]{20,}'),
-            "notion_token":         _regex(r'secret_[A-Za-z0-9]{43}'),
-            "linear_api_key":       _regex(r'lin_api_[A-Za-z0-9]{40}'),
+            # ── Miscelânea alto valor ────────────────────────────────────────
+            "shopify_token":          _regex(r'shp(?:at|ss)_[a-fA-F0-9]{32}'),
+            "linear_api_key":         _regex(r'lin_api_[A-Za-z0-9]{40}'),
+            "notion_token":           _regex(r'secret_[A-Za-z0-9]{43}'),
+            "airtable_key":           _regex(r'key[A-Za-z0-9]{14}'),
+            "mapbox_token":           _regex(r'pk\.eyJ1[A-Za-z0-9._\-]+'),
+            "rapidapi_key":           _ctx_regex(r'X-RapidAPI-Key|rapidapi', r'[a-zA-Z0-9]{50}'),
+            "wpengine_auth":          _ctx_regex(r'wpe_auth|wpengine', r'[A-Za-z0-9_\-]{20,}'),
 
-            # Supabase
-            "supabase_url":          _regex(r'https://[a-z0-9]{20}\.supabase\.co', re.I),
-            "supabase_anon_key":     _regex(r'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[A-Za-z0-9_\-]{50,}\.[A-Za-z0-9_\-]{43}'),
-            "supabase_service_role": _regex(r'(?:SUPABASE_SERVICE_ROLE_KEY|service_role)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-\.]{100,})["\']', re.I),
-            "supabase_env":          _regex(r'SUPABASE_(?:URL|ANON_KEY|SERVICE_ROLE_KEY)\s*[=:]\s*\S+', re.I),
+            # ── OpenAI / Slack ───────────────────────────────────────────────
+            "openai_key":             _regex(r'sk-[a-zA-Z0-9]{48}'),
+            "slack_token":            _regex(r'xox[baprs]-[0-9a-zA-Z\-]{10,48}'),
+            "slack_webhook":          _regex(r'https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+'),
 
-            # Chaves privadas
-            "private_key":          _regex(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
+            # ── Chaves privadas ───────────────────────────────────────────────
+            "private_key":            _regex(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
 
-            # JWT
-            "jwt":                  _regex(r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}'),
+            # ── Genéricos ─────────────────────────────────────────────────────
+            "api_key":                _regex(r'api[_-]?key["\']?\s*[:=]\s*["\'][A-Za-z0-9_\-]{16,}', re.I),
+            "token":                  _regex(r'token["\']?\s*[:=]\s*["\'][A-Za-z0-9_\-.]{16,}', re.I),
+            "jwt":                    _regex(r'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+'),
+            "secret":                 _regex(r'secret["\']?\s*[:=]\s*["\'][A-Za-z0-9_\-/+=]{16,}', re.I),
+            "authorization":          _regex(r'Bearer\s+[A-Za-z0-9_\-.]{16,}'),
+            "password":               _regex(r'password["\']?\s*[:=]\s*["\'][^"\']{8,}', re.I),
+            "senha":                  _regex(r'senha["\']?\s*[:=]\s*["\'][^"\']{8,}', re.I),
 
-            # Hashes
-            "bcrypt_hash":          _regex(r'\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}'),
-
-            # Padrões genéricos — validação extra de entropia obrigatória
-            "generic_api_key":      _regex(r'(?:api[_-]?key|apikey)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-]{20,})["\']', re.I),
-            "generic_token":        _regex(r'(?:access[_-]?token|auth[_-]?token)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-\.]{20,})["\']', re.I),
-            "generic_secret":       _regex(r'(?:client[_-]?secret|app[_-]?secret)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-/+=]{20,})["\']', re.I),
-            "bearer_token":         _regex(r'Authorization:\s*Bearer\s+([A-Za-z0-9_\-\.]{20,})', re.I),
-            "password_field":       _regex(r'(?:password|passwd|senha)["\']?\s*[:=]\s*["\']([^"\']{8,})["\']', re.I),
+            # ── Hashes hardcoded ──────────────────────────────────────────────
+            "bcrypt_hash":            _regex(r'\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}'),
+            "md5_hash":               _regex(r'(?:hash|md5|digest)["\']?\s*[:=]\s*["\'][0-9a-f]{32}["\']', re.I),
+            "sha_hash":               _regex(r'(?:hash|sha(?:1|256)?|digest)["\']?\s*[:=]\s*["\'][0-9a-f]{40,64}["\']', re.I),
         },
 
-        "_generic_patterns": {
-            "generic_api_key", "generic_token", "generic_secret",
-            "bearer_token", "password_field",
-        },
-
+        # Padrões para endpoints de API expostos em JS
         "api_endpoint_patterns": [
             re.compile(r'["\`](/api/v\d[a-zA-Z0-9/_\-]*)["\`]'),
             re.compile(r'["\`](/graphql)["\`\s/]', re.I),
@@ -334,67 +341,36 @@ def get_config(domain: str) -> dict:
             re.compile(r'["\`](/v\d+/[a-zA-Z0-9/_\-]{4,})["\`]'),
         ],
 
-        "google_key_regex":  re.compile(r'AIza[0-9A-Za-z\-_]{35}'),
-        "headers":           {"User-Agent": "Mozilla/5.0 recon"},
-        "js_workers":        20,
-        "request_timeout":   10,
+        "google_key_regex": re.compile(r'AIza[0-9A-Za-z\-_]{35}'),
 
+        "headers":          {"User-Agent": "Mozilla/5.0 recon"},
+        "js_workers":       20,
+        "request_timeout":  10,
+
+        # Padrões sensíveis para análise de arquivos baixados (.env, .conf, etc.)
         "sensitive_content_patterns": [
-            re.compile(r'(?:DB_PASS(?:WORD)?|DATABASE_PASSWORD|MYSQL_ROOT_PASSWORD)\s*=\s*\S+', re.I),
+            re.compile(r'(?:DB_PASS|DATABASE_PASSWORD|MYSQL_ROOT_PASSWORD)\s*=\s*\S+', re.I),
             re.compile(r'(?:SECRET_KEY|APP_KEY|ENCRYPTION_KEY)\s*=\s*\S+', re.I),
-            re.compile(r'(?:AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID)\s*=\s*\S+', re.I),
+            re.compile(r'(?:AWS_SECRET|AWS_ACCESS_KEY)\s*=\s*\S+', re.I),
             re.compile(r'AIza[0-9A-Za-z\-_]{35}'),
             re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
-            re.compile(r'(?:MAIL|SMTP)_PASS(?:WORD)?\s*=\s*\S+', re.I),
-            re.compile(r'(?:STRIPE|PAYPAL|BRAINTREE)[_-](?:SECRET|KEY|TOKEN)\s*=\s*\S+', re.I),
-            re.compile(r'SUPABASE_(?:URL|ANON_KEY|SERVICE_ROLE_KEY)\s*=\s*\S+', re.I),
-            re.compile(r'createClient\s*\(\s*["\']https://[a-z0-9]+\.supabase\.co["\']', re.I),
+            re.compile(r'password\s*=\s*\S+', re.I),
         ],
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Escrita segura de arquivos
-# ─────────────────────────────────────────────────────────────────────────────
-
-def write_if_not_empty(path: Path, lines: list[str], logger: logging.Logger) -> bool:
-    content = [l for l in lines if l.strip()]
-    if not content:
-        return False
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(content) + "\n", encoding="utf-8")
-    logger.debug("Salvo: %s (%d linhas)", path, len(content))
-    return True
-
-
-def append_line_to_file(path: Path, line: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Rate-limited requests com retry
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Rate-limited requests ─────────────────────────────────────────────────────
 
 _request_logger = logging.getLogger("recon.requests")
 
-_host_semaphores: dict[str, threading.Semaphore] = {}
-_host_sem_lock = threading.Lock()
-_MAX_PER_HOST = 4
-
-
-def _get_host_semaphore(url: str) -> threading.Semaphore:
-    host = urllib.parse.urlparse(url).netloc.lower() or "default"
-    with _host_sem_lock:
-        if host not in _host_semaphores:
-            _host_semaphores[host] = threading.Semaphore(_MAX_PER_HOST)
-        return _host_semaphores[host]
-
 
 def _make_retrying_get(cfg: dict):
+    """
+    Retorna uma função get() com retry + backoff exponencial.
+    Respeita o header Retry-After quando presente.
+    """
     @retry(
-        stop=stop_after_attempt(3),
+        stop=stop_after_attempt(4),
         wait=wait_exponential(multiplier=1, min=2, max=30),
         retry=retry_if_exception_type((
             requests.exceptions.ConnectionError,
@@ -404,309 +380,107 @@ def _make_retrying_get(cfg: dict):
         reraise=True,
     )
     def _get(url: str, **kwargs) -> requests.Response:
-        sem = _get_host_semaphore(url)
-        with sem:
-            resp = requests.get(
-                url,
-                headers=cfg["headers"],
-                timeout=cfg["request_timeout"],
-                verify=False,
-                allow_redirects=True,
-                **kwargs,
-            )
-            if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", 10))
-                logging.getLogger("recon").debug("[429] %s — aguardando %ds", url, retry_after)
-                time.sleep(min(retry_after, 60))
-                resp.raise_for_status()
-            if resp.status_code == 503:
-                time.sleep(5)
-                resp.raise_for_status()
-            return resp
+        resp = requests.get(
+            url,
+            headers=cfg["headers"],
+            timeout=cfg["request_timeout"],
+            verify=False,
+            **kwargs,
+        )
+        # Respeita Retry-After (429 / 503)
+        if resp.status_code in (429, 503):
+            retry_after = int(resp.headers.get("Retry-After", 5))
+            _request_logger.debug("Rate-limited em %s — aguardando %ds", url, retry_after)
+            time.sleep(retry_after)
+            resp.raise_for_status()   # força nova tentativa
+        return resp
 
     return _get
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers de subprocesso
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def run_cmd(cmd: list[str], logger: logging.Logger,
-            stdin: str | None = None, timeout: int = 300) -> list[str]:
+def run_cmd(cmd: list[str], logger: logging.Logger) -> list[str]:
     try:
-        result = subprocess.run(
-            cmd,
-            input=stdin,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1000)
         if result.stderr:
-            logger.debug("[stderr] %s: %s", cmd[0], result.stderr.strip()[:300])
-        return [l for l in result.stdout.splitlines() if l.strip()]
+            logger.debug("[stderr] %s: %s", cmd[0], result.stderr.strip())
+        return result.stdout.splitlines()
     except FileNotFoundError:
         logger.warning("Ferramenta não encontrada: %s — pulando.", cmd[0])
         return []
     except subprocess.TimeoutExpired:
-        logger.warning("Timeout: %s", " ".join(cmd))
+        logger.warning("Timeout ao executar: %s", " ".join(cmd))
         return []
     except Exception as exc:
-        logger.error("Erro em %s: %s", cmd[0], exc)
+        logger.error("Erro ao executar %s: %s", cmd[0], exc)
         return []
 
 
-def tool_available(name: str) -> bool:
-    return shutil.which(name) is not None
-
-
-@contextlib.contextmanager
-def popen_with_timeout(cmd: list[str], timeout_sec: int, logger: logging.Logger):
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
-    timer_fired = threading.Event()
-
-    def _killer() -> None:
-        timer_fired.set()
-        logger.warning("[watchdog] timeout (%ds) — terminando: %s", timeout_sec, cmd[0])
-        try:
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        except ProcessLookupError:
-            pass
-
-    timer = threading.Timer(timeout_sec, _killer)
-    timer.start()
-    try:
-        yield proc, timer_fired
-    finally:
-        timer.cancel()
-        if proc.poll() is None:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-
-
-def _gospider_urls(target_url: str, depth: int, timeout_sec: int, logger: logging.Logger) -> set[str]:
-    urls: set[str] = set()
-    if not tool_available("gospider"):
-        return urls
-    cmd = [
-        "gospider", "-s", target_url,
-        "-c", "5", "-d", str(depth), "--js", "-q",
-        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    ]
-    with popen_with_timeout(cmd, timeout_sec, logger) as (proc, timed_out):
-        if proc.stdout is None:
-            return urls
-        for line in proc.stdout:
-            if timed_out.is_set():
-                break
-            line = line.strip()
-            if not line:
-                continue
-            m = re.search(r'https?://[^\s"\'<>\]]+', line)
-            if m:
-                urls.add(m.group(0).rstrip('.,;)"\'>]'))
-    return urls
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Fontes passivas via API HTTP direta
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _fetch_wayback_api(domain: str, logger: logging.Logger) -> set[str]:
-    urls: set[str] = set()
-    base_url = "https://web.archive.org/cdx/search/cdx"
-    params = {
-        "url":      f"*.{domain}/*",
-        "output":   "text",
-        "fl":       "original",
-        "collapse": "urlkey",
-        "limit":    "100000",
-        "filter":   "statuscode:200",
-    }
-    try:
-        resp = requests.get(base_url, params=params, timeout=120,
-                            headers={"User-Agent": "Mozilla/5.0 recon"})
-        if resp.status_code == 200:
-            for line in resp.text.splitlines():
-                line = line.strip()
-                if line and line.startswith("http"):
-                    urls.add(line)
-        else:
-            logger.debug("[wayback-api] HTTP %d", resp.status_code)
-    except requests.exceptions.Timeout:
-        logger.warning("[wayback-api] timeout na requisição.")
-    except Exception as exc:
-        logger.debug("[wayback-api] erro: %s", exc)
-    return urls
-
-
-def _fetch_commoncrawl_api(domain: str, logger: logging.Logger) -> set[str]:
-    urls: set[str] = set()
-    try:
-        idx_resp = requests.get(
-            "https://index.commoncrawl.org/collinfo.json",
-            timeout=30, headers={"User-Agent": "Mozilla/5.0 recon"},
-        )
-        if idx_resp.status_code != 200:
-            return urls
-        indexes = idx_resp.json()
-        recent  = [i["cdx-api"] for i in indexes[:3]]
-    except Exception as exc:
-        logger.debug("[commoncrawl-api] erro ao buscar índices: %s", exc)
-        return urls
-
-    for api_url in recent:
-        try:
-            resp = requests.get(
-                api_url,
-                params={"url": f"*.{domain}", "output": "text",
-                        "fl": "url", "collapse": "urlkey", "limit": "50000"},
-                timeout=60, headers={"User-Agent": "Mozilla/5.0 recon"},
-            )
-            if resp.status_code == 200:
-                for line in resp.text.splitlines():
-                    line = line.strip()
-                    if line and line.startswith("http"):
-                        urls.add(line)
-        except Exception as exc:
-            logger.debug("[commoncrawl-api] erro em %s: %s", api_url, exc)
-    return urls
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Etapa 1: Coleta de URLs
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Etapa 1: Coleta de URLs ───────────────────────────────────────────────────
 
 def collect_urls(cfg: dict, logger: logging.Logger) -> int:
     domain = cfg["domain"]
-    all_urls: set[str] = set()
 
-    if tool_available("gau"):
-        logger.info("[gau] coletando… (domínio: %s)", domain)
-        lines = run_cmd([
-            "gau", "--threads", "5", "--subs",
-            "--providers", "wayback,commoncrawl,otx,urlscan",
-            "--retries", "2", "--timeout", "50", domain,
-        ], logger, timeout=600)
-        all_urls.update(lines)
-        logger.info("[gau] %d URLs", len(lines))
-    else:
-        logger.warning("gau não encontrado — pulando.")
+    logger.info("Coletando URLs com gau…")
+    gau = run_cmd(["gau", domain], logger)
 
-    if tool_available("waybackurls"):
-        logger.info("[waybackurls] coletando… (domínio: %s)", domain)
-        lines = run_cmd(["waybackurls", domain], logger, timeout=300)
-        all_urls.update(lines)
-        logger.info("[waybackurls] %d URLs", len(lines))
-    else:
+    logger.info("Coletando URLs com waybackurls…")
+    try:
+        wb = subprocess.run(["waybackurls"], input=domain, text=True,
+                            capture_output=True, timeout=1000)
+        wayback = wb.stdout.splitlines()
+        if wb.stderr:
+            logger.debug("[stderr] waybackurls: %s", wb.stderr.strip())
+    except FileNotFoundError:
         logger.warning("waybackurls não encontrado — pulando.")
+        wayback = []
+    except Exception as exc:
+        logger.error("Erro no waybackurls: %s", exc)
+        wayback = []
 
-    logger.info("[wayback-api] consultando CDX API…")
-    wayback_urls = _fetch_wayback_api(domain, logger)
-    if wayback_urls:
-        all_urls.update(wayback_urls)
-        logger.info("[wayback-api] %d URLs", len(wayback_urls))
-    else:
-        logger.info("[wayback-api] nenhuma URL retornada.")
+    logger.info("Coletando URLs com katana…")
+    katana = run_cmd([
+        "katana", "-u", domain, "-d", "5",
+        "-ps", "waybackarchive,commoncrawl,alienvault",
+        "-kf", "-jc",
+        "-ef", "woff,css,png,svg,jpg,woff2,jpeg,gif",
+    ], logger)
 
-    logger.info("[commoncrawl-api] consultando…")
-    cc_urls = _fetch_commoncrawl_api(domain, logger)
-    if cc_urls:
-        all_urls.update(cc_urls)
-        logger.info("[commoncrawl-api] %d URLs", len(cc_urls))
-    else:
-        logger.info("[commoncrawl-api] nenhuma URL retornada.")
-
-    if tool_available("katana"):
-        logger.info("[katana] coletando…")
-        lines = run_cmd([
-            "katana", "-u", f"https://{domain}", "-d", "5",
-            "-ps", "-pss", "waybackarchive,commoncrawl,alienvault",
-            "-kf", "-jc",
-            "-ef", "woff,css,png,svg,jpg,woff2,jpeg,gif,ico,ttf",
-            "-silent",
-        ], logger, timeout=600)
-        all_urls.update(lines)
-        logger.info("[katana] %d URLs", len(lines))
-    else:
-        logger.warning("katana não encontrado — pulando.")
-
-    if tool_available("hakrawler"):
-        logger.info("[hakrawler] coletando…")
-        lines = run_cmd(["hakrawler", "-d", "3", "-u", "-subs", "-t", "8", "-insecure"], logger, stdin=f"https://{domain}\n", timeout=300)
-        all_urls.update(lines)
-        logger.info("[hakrawler] %d URLs", len(lines))
-    else:
-        logger.info("hakrawler não encontrado — instale: go install github.com/hakluke/hakrawler@latest")
-
-    if tool_available("gospider"):
-        logger.info("[gospider] coletando…")
-        before = len(all_urls)
-        all_urls.update(_gospider_urls(f"https://{domain}", depth=3, timeout_sec=300, logger=logger))
-        logger.info("[gospider] %d URLs", len(all_urls) - before)
-    else:
-        logger.info("gospider não encontrado — instale: go install github.com/jaeles-project/gospider@latest")
-
-    if tool_available("subfinder"):
-        logger.info("[subfinder] enumerando subdomínios…")
-        subs = run_cmd(["subfinder", "-d", domain, "-silent"], logger, timeout=300)
-        logger.info("[subfinder] %d subdomínios encontrados", len(subs))
-
-        if subs and tool_available("hakrawler"):
-            logger.info("[hakrawler] crawling em %d subdomínios…", len(subs))
-            sub_input = "\n".join(f"https://{s}" for s in subs) + "\n"
-            lines = run_cmd(["hakrawler", "-d", "2", "-u", "-t", "8", "-timeout", "10", "-insecure"], logger, stdin=sub_input, timeout=max(60, len(subs) * 3))
-            all_urls.update(lines)
-            logger.info("[hakrawler/subs] %d URLs", len(lines))
-
-        if subs and tool_available("gospider"):
-            logger.info("[gospider] crawling em subdomínios…")
-            before = len(all_urls)
-            for sub in subs[:50]:
-                all_urls.update(_gospider_urls(f"https://{sub}", depth=2, timeout_sec=90, logger=logger))
-            logger.info("[gospider/subs] %d URLs", len(all_urls) - before)
-    else:
-        logger.info("subfinder não encontrado — instale: go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest")
-
-    urls = sorted(all_urls)
-    wrote = write_if_not_empty(cfg["urls_file"], urls, logger)
-    logger.info("URLs coletadas: %d%s", len(urls), f" → {cfg['urls_file']}" if wrote else " (nenhuma)")
+    urls = sorted(set(gau + wayback + katana))
+    cfg["urls_file"].write_text("\n".join(urls) + "\n", encoding="utf-8")
+    logger.info("URLs coletadas: %d → %s", len(urls), cfg["urls_file"])
     return len(urls)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Etapa 2: Validação com httpx
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Etapa 2: Validação de URLs ativas (httpx) ────────────────────────────────
 
 def validate_alive_urls(cfg: dict, logger: logging.Logger) -> int:
-    if not cfg["urls_file"].exists():
-        logger.warning("Arquivo de URLs não encontrado — pulando httpx.")
-        cfg["_active_urls_file"] = cfg["urls_file"]
-        return 0
-
+    """
+    Filtra apenas URLs que respondem com HTTP 2xx/3xx usando httpx.
+    Salva o resultado em urls_alive.txt e atualiza cfg para as etapas seguintes.
+    """
     logger.info("Validando URLs ativas com httpx…")
-    if not tool_available("httpx"):
-        logger.warning("httpx não encontrado — usando todas as URLs.")
-        cfg["_active_urls_file"] = cfg["urls_file"]
-        return sum(1 for _ in cfg["urls_file"].read_text(encoding="utf-8").splitlines() if _.strip())
-
     try:
         result = subprocess.run(
-            ["httpx", "-l", str(cfg["urls_file"]),
-             "-silent", "-mc", "200,201,204,301,302,307,308,403",
-             "-threads", "50", "-timeout", "10"],
-            capture_output=True, text=True, timeout=600,
+            [
+                "httpx",
+                "-l", str(cfg["urls_file"]),
+                "-silent",
+                "-mc", "200,201,204,301,302,307,308,403",
+                "-threads", "50",
+                "-timeout", "10",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=600,
         )
         alive = [u.strip() for u in result.stdout.splitlines() if u.strip()]
+        if result.stderr:
+            logger.debug("[stderr] httpx: %s", result.stderr.strip()[:200])
+    except FileNotFoundError:
+        logger.warning("httpx não encontrado — usando todas as URLs sem validação.")
+        alive = [u.strip() for u in cfg["urls_file"].read_text(encoding="utf-8").splitlines() if u.strip()]
     except subprocess.TimeoutExpired:
         logger.warning("Timeout no httpx — usando todas as URLs.")
         alive = [u.strip() for u in cfg["urls_file"].read_text(encoding="utf-8").splitlines() if u.strip()]
@@ -714,262 +488,211 @@ def validate_alive_urls(cfg: dict, logger: logging.Logger) -> int:
         logger.error("Erro no httpx: %s", exc)
         alive = []
 
-    wrote = write_if_not_empty(cfg["urls_alive_file"], alive, logger)
-    logger.info("URLs ativas: %d%s", len(alive),
-                f" → {cfg['urls_alive_file']}" if wrote else "")
-    cfg["_active_urls_file"] = cfg["urls_alive_file"] if wrote else cfg["urls_file"]
+    cfg["urls_alive_file"].write_text("\n".join(alive) + "\n", encoding="utf-8")
+    logger.info("URLs ativas: %d → %s", len(alive), cfg["urls_alive_file"])
+
+    # Atualiza a referência principal para as etapas seguintes
+    cfg["_active_urls_file"] = cfg["urls_alive_file"]
     return len(alive)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Etapa 3: GF
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Etapa 3: GF ───────────────────────────────────────────────────────────────
 
 def run_gf(cfg: dict, logger: logging.Logger) -> None:
-    if not tool_available("gf"):
-        logger.warning("gf não encontrado — pulando filtragem de padrões.")
-        return
-
     source = cfg.get("_active_urls_file", cfg["urls_file"])
-    if not source.exists():
-        return
-
-    source_text = source.read_text(encoding="utf-8")
-    cfg["gf_dir"].mkdir(parents=True, exist_ok=True)
-
     for pattern in cfg["gf_patterns"]:
         output = cfg["gf_dir"] / f"gf_{pattern}.txt"
+        logger.info("GF pattern: %s", pattern)
         try:
-            result = subprocess.run(
-                ["gf", pattern],
-                input=source_text,
-                capture_output=True, text=True, timeout=120,
-            )
-            lines = [l for l in result.stdout.splitlines() if l.strip()]
-            if lines:
-                write_if_not_empty(output, lines, logger)
-                logger.info("GF [%s]: %d URLs → %s", pattern, len(lines), output)
-            else:
-                logger.info("GF [%s]: nenhuma URL encontrada.", pattern)
+            with open(output, "w", encoding="utf-8") as out:
+                subprocess.run(
+                    f"cat {source} | gf {pattern}",
+                    shell=True, stdout=out, timeout=120,
+                )
+        except subprocess.TimeoutExpired:
+            logger.warning("Timeout no gf %s", pattern)
         except Exception as exc:
             logger.error("Erro no gf %s: %s", pattern, exc)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Etapa 3b: Probes XSS e SSRF
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Etapa 3b: Probe de parâmetros vulneráveis ────────────────────────────────
 
 def probe_xss(cfg: dict, logger: logging.Logger) -> int:
+    """Executa dalfox nos resultados do gf_xss para confirmar XSS exploráveis."""
     xss_file = cfg["gf_dir"] / "gf_xss.txt"
     if not xss_file.exists() or xss_file.stat().st_size == 0:
-        logger.info("Sem URLs para XSS probe.")
-        return 0
-    if not tool_available("dalfox"):
-        logger.warning("dalfox não encontrado — pulando XSS probe.")
+        logger.info("Nenhuma URL para XSS probe.")
         return 0
 
     out_file = cfg["gf_dir"] / "dalfox_results.txt"
-    logger.info("Rodando dalfox… (pode demorar bastante dependendo do volume de URLs)")
-
+    logger.info("Rodando dalfox nas URLs de XSS…")
     try:
-        proc = subprocess.Popen(
-            ["dalfox", "file", str(xss_file),
-             "--silence", "--output", str(out_file),
-             "--worker", "10", "--timeout", "10",
-             "--header", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        result = subprocess.run(
+            [
+                "dalfox", "file", str(xss_file),
+                "--silence",
+                "--output", str(out_file),
+                "--worker", "10",
+                "--timeout", "10",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=600,
         )
-        hits   = 0
-        killer = threading.Timer(3600, lambda: proc.kill())
-        killer.start()
-        try:
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                logger.debug("[dalfox] %s", line)
-                if "[V]" in line:
-                    hits += 1
-                    logger.warning("[!!!] dalfox XSS confirmado: %s", line)
-        finally:
-            killer.cancel()
-            proc.wait(timeout=15)
-
-        if hits == 0 and out_file.exists():
-            hits = out_file.read_text(encoding="utf-8").count("[V]")
-
-        if hits:
-            logger.warning("[!!!] dalfox: %d XSS confirmados → %s", hits, out_file)
-        else:
-            if out_file.exists():
-                out_file.unlink()
-            logger.info("dalfox: nenhum XSS confirmado.")
-
+        if result.stderr:
+            logger.debug("[stderr] dalfox: %s", result.stderr.strip()[:200])
+        hits = out_file.read_text(encoding="utf-8").count("[V]") if out_file.exists() else 0
+        logger.info("dalfox: %d XSS confirmados → %s", hits, out_file)
         return hits
-
+    except FileNotFoundError:
+        logger.warning("dalfox não encontrado — pulando probe de XSS.")
+        return 0
+    except subprocess.TimeoutExpired:
+        logger.warning("Timeout no dalfox.")
+        return 0
     except Exception as exc:
         logger.error("Erro no dalfox: %s", exc)
         return 0
 
 
 def probe_ssrf_redirect(cfg: dict, logger: logging.Logger) -> int:
-    found  = 0
+    """
+    Substitui parâmetros de URL por um payload SSRF/redirect usando qsreplace,
+    depois dispara requisições com curl e verifica respostas.
+    """
+    found = 0
+
     probes = {
         "ssrf":     (cfg["gf_dir"] / "gf_ssrf.txt",     "http://169.254.169.254/latest/meta-data/"),
         "redirect": (cfg["gf_dir"] / "gf_redirect.txt", "https://evil.com"),
     }
 
-    if not tool_available("qsreplace"):
-        logger.warning("qsreplace não encontrado — pulando probes SSRF/redirect.")
-        return 0
-
     for kind, (gf_file, payload) in probes.items():
         if not gf_file.exists() or gf_file.stat().st_size == 0:
             continue
 
-        logger.info("Probe %s…", kind.upper())
+        out_file = cfg["gf_dir"] / f"{kind}_probe_results.txt"
+        logger.info("Probe %s com qsreplace…", kind.upper())
+
         try:
+            # Gera URLs com payload substituído
             qsr = subprocess.run(
                 ["qsreplace", payload],
                 input=gf_file.read_text(encoding="utf-8"),
                 capture_output=True, text=True, timeout=60,
             )
             probe_urls = [u.strip() for u in qsr.stdout.splitlines() if u.strip()]
+        except FileNotFoundError:
+            logger.warning("qsreplace não encontrado — pulando probe %s.", kind.upper())
+            continue
         except Exception as exc:
-            logger.error("qsreplace (%s): %s", kind, exc)
+            logger.error("Erro no qsreplace (%s): %s", kind, exc)
             continue
 
         hits = []
-        for url in probe_urls[:200]:
+        for url in probe_urls[:200]:   # limita para não demorar demais
             try:
                 r = subprocess.run(
-                    ["curl", "-sk", "-o", "/dev/null",
-                     "-w", "%{http_code} %{redirect_url}", url],
+                    ["curl", "-sk", "-o", "/dev/null", "-w", "%{http_code} %{redirect_url}", url],
                     capture_output=True, text=True, timeout=10,
                 )
                 output = r.stdout.strip()
-                code   = output.split()[0] if output else "0"
-                if kind == "redirect" and code in ("301", "302", "307", "308") and "evil.com" in output:
-                    hits.append(url)
+                code = output.split()[0] if output else "0"
+
+                if kind == "redirect" and code in ("301", "302", "307", "308"):
+                    if "evil.com" in output:
+                        hits.append(url)
                 elif kind == "ssrf" and code == "200":
                     hits.append(url)
             except Exception:
                 pass
 
         if hits:
-            write_if_not_empty(cfg["gf_dir"] / f"{kind}_hits.txt", hits, logger)
-            logger.warning("[!!!] %s: %d hits", kind.upper(), len(hits))
+            out_file.write_text("\n".join(hits) + "\n", encoding="utf-8")
+            logger.warning("[!!!] %s probe: %d possíveis hits → %s", kind.upper(), len(hits), out_file)
             found += len(hits)
         else:
-            logger.info("%s probe: nenhum hit.", kind.upper())
+            logger.info("%s probe: nenhum hit encontrado.", kind.upper())
 
     return found
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Etapa 4: Arquivos sensíveis
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Etapa 4: Arquivos sensíveis ───────────────────────────────────────────────
 
-def extract_sensitive_urls(cfg: dict, logger: logging.Logger) -> int:
+def extract_sensitive(cfg: dict, logger: logging.Logger) -> int:
     source = cfg.get("_active_urls_file", cfg["urls_file"])
-    if not source.exists():
-        return 0
-
-    regex   = cfg["sensitive_regex"]
-    matches = [l.strip() for l in source.read_text(encoding="utf-8").splitlines()
-               if l.strip() and regex.search(l.strip())]
-
-    wrote = write_if_not_empty(cfg["sensitive_urls_file"], matches, logger)
-    logger.info("URLs de arquivos sensíveis: %d%s", len(matches),
-                f" → {cfg['sensitive_urls_file']}" if wrote else "")
+    regex = cfg["sensitive_regex"]
+    matches = []
+    with open(source, encoding="utf-8") as f:
+        for line in f:
+            if regex.search(line.strip()):
+                matches.append(line)
+    cfg["sensitive_file"].write_text("".join(matches), encoding="utf-8")
+    logger.info("Arquivos sensíveis: %d → %s", len(matches), cfg["sensitive_file"])
     return len(matches)
 
 
 def download_and_analyze_sensitive(cfg: dict, logger: logging.Logger) -> int:
-    if not cfg["sensitive_urls_file"].exists():
-        return 0
-
-    urls = [u.strip() for u in cfg["sensitive_urls_file"].read_text(encoding="utf-8").splitlines() if u.strip()]
+    """
+    Faz download dos arquivos sensíveis listados e verifica o conteúdo
+    em busca de credenciais/segredos expostos.
+    """
+    urls = [u.strip() for u in cfg["sensitive_file"].read_text(encoding="utf-8").splitlines() if u.strip()]
     if not urls:
+        logger.info("Nenhum arquivo sensível para baixar.")
         return 0
 
-    get          = _make_retrying_get(cfg)
-    findings     = 0
-    report_lines: list[str] = []
+    get = _make_retrying_get(cfg)
+    findings = 0
 
-    logger.info("Baixando %d arquivos sensíveis…", len(urls))
-    for url in urls[:500]:
-        try:
-            resp = get(url)
-        except Exception:
-            continue
+    logger.info("Baixando e analisando %d arquivos sensíveis…", len(urls))
 
-        if resp.status_code != 200:
-            continue
-        content = resp.text
-        if len(content) > 2_000_000:
-            continue
+    with open(cfg["sensitive_analysis"], "w", encoding="utf-8") as report:
+        for url in urls[:500]:   # limite de segurança
+            try:
+                resp = get(url)
+            except Exception as exc:
+                logger.debug("Falha ao baixar %s: %s", url, exc)
+                continue
 
-        local_hits: list[str] = []
-        for pattern in cfg["sensitive_content_patterns"]:
-            for m in pattern.finditer(content):
-                local_hits.append(m.group(0))
+            if resp.status_code != 200:
+                continue
 
-        if local_hits:
-            cfg["sensitive_dir"].mkdir(parents=True, exist_ok=True)
+            content = resp.text
+            if len(content) > 2_000_000:   # ignora arquivos > 2 MB
+                continue
+
+            # Salva uma cópia local
             safe_name = re.sub(r'[^\w\-.]', '_', url)[:120]
             (cfg["sensitive_dir"] / safe_name).write_text(content, encoding="utf-8", errors="replace")
-            for hit in local_hits:
-                logger.warning("[!!!] Segredo em arquivo sensível → %s", url)
-                report_lines.append(f"URL: {url}\nACHADO: {hit}\n" + "-" * 60)
-                findings += 1
 
-    if report_lines:
-        write_if_not_empty(cfg["sensitive_report"], report_lines, logger)
+            # Analisa o conteúdo
+            for pattern in cfg["sensitive_content_patterns"]:
+                for match in pattern.finditer(content):
+                    logger.warning("[!!!] Segredo em arquivo sensível → %s", url)
+                    report.write(f"[SENSITIVE FILE] {url}\n{match.group(0)}\n" + "-" * 60 + "\n")
+                    findings += 1
 
-    logger.info("Achados em arquivos sensíveis: %d", findings)
+    logger.info("Achados em arquivos sensíveis: %d → %s", findings, cfg["sensitive_analysis"])
     return findings
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Etapa 5: Coleta de JS
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Etapa 5: Coleta de JS ─────────────────────────────────────────────────────
 
 def collect_js(cfg: dict, logger: logging.Logger) -> int:
     source = cfg.get("_active_urls_file", cfg["urls_file"])
-    if not source.exists():
-        logger.warning("Arquivo de URLs não encontrado — pulando coleta de JS.")
-        return 0
-
-    js_re = re.compile(
-        r'(?:'
-        r'\.js(?:\?[^\s]*)?$'
-        r'|/(?:static|assets|dist|build|chunks|bundles)/[^\s]*\.js'
-        r')',
-        re.I,
-    )
-
-    js_urls: set[str] = set()
-    for line in source.read_text(encoding="utf-8").splitlines():
-        url = line.strip()
-        if not url:
-            continue
-        if _CDN_DOMAINS_RE.search(url):
-            continue
-        if url.endswith(".js.map"):
-            continue
-        if js_re.search(url):
-            js_urls.add(url)
-
-    wrote = write_if_not_empty(cfg["js_file"], sorted(js_urls), logger)
-    logger.info("Arquivos JS únicos: %d%s", len(js_urls),
-                f" → {cfg['js_file']}" if wrote else " (nenhum)")
+    js_urls = set()
+    with open(source, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if ".js" in line.lower():
+                js_urls.add(line)
+    cfg["js_file"].write_text("\n".join(sorted(js_urls)) + "\n", encoding="utf-8")
+    logger.info("Arquivos JS: %d → %s", len(js_urls), cfg["js_file"])
     return len(js_urls)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Google API Key — validação de endpoints
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Google API Key: validação de endpoints ────────────────────────────────────
 
 GOOGLE_ENDPOINTS = [
     ("Geocoding",           "https://maps.googleapis.com/maps/api/geocode/json?latlng=40,30&key={key}"),
@@ -979,6 +702,9 @@ GOOGLE_ENDPOINTS = [
     ("Autocomplete",        "https://maps.googleapis.com/maps/api/place/autocomplete/json?input=Bingh&types=(cities)&key={key}"),
     ("Elevation",           "https://maps.googleapis.com/maps/api/elevation/json?locations=39.74,-104.98&key={key}"),
     ("Timezone",            "https://maps.googleapis.com/maps/api/timezone/json?location=39.60,-119.68&timestamp=1331161200&key={key}"),
+    ("Roads",               "https://roads.googleapis.com/v1/nearestRoads?points=60.17,24.94&key={key}"),
+    ("Static Maps",         "https://maps.googleapis.com/maps/api/staticmap?center=45,10&zoom=7&size=400x400&key={key}"),
+    ("Street View",         "https://maps.googleapis.com/maps/api/streetview?size=400x400&location=40.72,-73.99&key={key}"),
     ("YouTube Data",        "https://www.googleapis.com/youtube/v3/search?part=snippet&q=test&key={key}"),
     ("Custom Search",       "https://www.googleapis.com/customsearch/v1?q=test&key={key}"),
     ("Cloud Translation",   "https://translation.googleapis.com/language/translate/v2?q=hello&target=pt&key={key}"),
@@ -989,182 +715,128 @@ GOOGLE_ENDPOINTS = [
 def _classify_google(r: requests.Response) -> str:
     text = r.text
     if "API key not valid" in text:
-        return "CHAVE_INVALIDA"
+        return "CHAVE INVÁLIDA"
     if "REQUEST_DENIED" in text:
         return "NEGADO"
     if "PERMISSION_DENIED" in text or r.status_code == 403:
-        return "SEM_PERMISSAO"
+        return "SEM PERMISSÃO"
     if r.status_code == 200:
-        return "VULNERAVEL"
-    return f"HTTP_{r.status_code}"
+        return "VULNERÁVEL"
+    if "error" in text.lower():
+        return "ERRO"
+    return f"HTTP {r.status_code}"
 
 
 def validate_google_key(key: str, cfg: dict, logger: logging.Logger) -> dict:
-    results: dict[str, str] = {}
+    results = {}
     get = _make_retrying_get(cfg)
 
     def _check(name: str, url_tpl: str) -> tuple[str, str]:
         url = url_tpl.format(key=key)
         try:
-            return name, _classify_google(get(url))
+            r = get(url)
+            return name, _classify_google(r)
         except requests.exceptions.Timeout:
             return name, "TIMEOUT"
         except Exception as exc:
-            return name, f"FALHA:{exc}"
+            return name, f"FALHA: {exc}"
 
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        for fut in as_completed({ex.submit(_check, n, t): n for n, t in GOOGLE_ENDPOINTS}):
-            n, s = fut.result()
-            results[n] = s
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(_check, name, tpl): name
+                   for name, tpl in GOOGLE_ENDPOINTS}
+        for future in as_completed(futures):
+            name, status = future.result()
+            results[name] = status
 
-    vuln = [n for n, s in results.items() if s == "VULNERAVEL"]
+    vuln = [n for n, s in results.items() if s == "VULNERÁVEL"]
     if vuln:
-        logger.warning("[GOOGLE KEY] %s → vulnerável: %s", key, ", ".join(vuln))
+        logger.warning("[GOOGLE KEY] %s → vulnerável em: %s", key, ", ".join(vuln))
+    else:
+        logger.info("[GOOGLE KEY] %s → sem endpoints acessíveis", key)
+
     return results
+
+
+def save_google_report(key_results: dict, cfg: dict, logger: logging.Logger) -> None:
+    lines = []
+    for key, results in key_results.items():
+        vuln = [n for n, s in results.items() if s == "VULNERÁVEL"]
+        lines.append(f"KEY: {key}")
+        lines.append(f"Vulneráveis: {len(vuln)}/{len(results)}")
+        for name, status in sorted(results.items()):
+            lines.append(f"  [{status}] {name}")
+        lines.append("-" * 60)
+
+    cfg["google_report_file"].write_text("\n".join(lines) + "\n", encoding="utf-8")
+    logger.info("Relatório Google Keys → %s", cfg["google_report_file"])
 
 
 def validate_all_google_keys(google_keys: set, cfg: dict, logger: logging.Logger) -> None:
     if not google_keys:
+        logger.info("Nenhuma Google API Key encontrada para validar.")
         return
 
-    write_if_not_empty(cfg["google_keys_file"], sorted(google_keys), logger)
-    logger.info("Validando %d Google API Key(s)…", len(google_keys))
+    cfg["google_keys_file"].write_text(
+        "\n".join(sorted(google_keys)) + "\n", encoding="utf-8"
+    )
+    logger.info("Google API Keys encontradas: %d → %s", len(google_keys), cfg["google_keys_file"])
+    logger.info("Validando endpoints Google para cada chave…")
 
-    report_lines: list[str] = []
+    key_results = {}
     for key in sorted(google_keys):
-        results = validate_google_key(key, cfg, logger)
-        vuln    = [n for n, s in results.items() if s == "VULNERAVEL"]
-        report_lines.append(f"KEY: {key}")
-        report_lines.append(f"Vulneráveis: {len(vuln)}/{len(results)}")
-        for name, status in sorted(results.items()):
-            report_lines.append(f"  [{status}] {name}")
-        report_lines.append("-" * 60)
+        key_results[key] = validate_google_key(key, cfg, logger)
 
-    if report_lines:
-        write_if_not_empty(cfg["google_report_file"], report_lines, logger)
-        logger.info("Relatório Google Keys → %s", cfg["google_report_file"])
+    save_google_report(key_results, cfg, logger)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Etapa 6: Análise de JS
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Etapa 6: Análise de JS ────────────────────────────────────────────────────
 
 def is_valid_js(resp: requests.Response, content: str) -> bool:
+    """
+    Valida se o conteúdo parece ser JavaScript.
+
+    Versão melhorada: aceita bundles modernos (Webpack, Vite, esbuild) que
+    frequentemente começam com comentários, arrow functions ou IIFEs como
+    `(()=>{...})()` — padrões rejeitados pela checagem anterior.
+
+    A lógica agora é de exclusão: descarta apenas conteúdo claramente
+    não-JS (HTML, JSON puro, XML).
+    """
     ct = resp.headers.get("Content-Type", "")
     if "javascript" in ct or "ecmascript" in ct:
         return True
+
     stripped = content.strip()
+
+    # Descarta respostas claramente não-JS
     if stripped.startswith(("<html", "<HTML", "<!DOCTYPE", "<!doctype", "<?xml")):
         return False
-    if re.match(r'^\s*[{\[]', stripped) and not re.search(
-            r'(?:var |let |const |function|=>|\bif\b|\bfor\b)', stripped[:500]):
+    # JSON puro (objeto ou array na raiz) — sem código JS ao redor
+    if re.match(r'^\s*[{\[]', stripped) and not re.search(r'(var |let |const |function|=>)', stripped[:500]):
         return False
+
+    # Aceita qualquer outra coisa que não seja HTML/XML/JSON puro
+    # (inclui bundles minificados, IIFEs, arrow functions, comentários, etc.)
     return True
 
 
-def _secret_context(content: str, start: int, end: int, radius: int = 90) -> str:
-    left  = max(0, start - radius)
-    right = min(len(content), end + radius)
-    return content[left:right].replace("\r", " ").replace("\n", " ").strip()
+def extract_api_endpoints(content: str, url: str, cfg: dict, logger: logging.Logger) -> int:
+    """Extrai endpoints de API internos expostos no código JS."""
+    found = 0
+    endpoints = set()
 
+    for pattern in cfg["api_endpoint_patterns"]:
+        for match in pattern.finditer(content):
+            endpoints.add(match.group(0).strip('"\'`'))
 
-_analyzed_js_urls: set[str]          = set()
-_analyzed_js_lock: threading.Lock    = threading.Lock()
-_seen_secrets: set[tuple[str, str]]  = set()
-_seen_secrets_lock: threading.Lock   = threading.Lock()
-_secret_write_lock                   = threading.Lock()
+    if endpoints:
+        with open(cfg["api_endpoints_file"], "a", encoding="utf-8") as f:
+            for ep in sorted(endpoints):
+                f.write(f"{ep}  ← {url}\n")
+        logger.info("[API] %d endpoints extraídos de %s", len(endpoints), url)
+        found = len(endpoints)
 
-SECRET_SEVERITY: dict[str, str] = {
-    "aws_access_key": "CRITICAL", "private_key": "CRITICAL", "stripe_secret": "CRITICAL",
-    "braintree_token": "CRITICAL", "gcp_service_account": "CRITICAL", "hashicorp_vault": "CRITICAL", "azure_storage_key": "CRITICAL",
-    "github_pat": "HIGH", "github_oauth": "HIGH", "gitlab_pat": "HIGH", "openai_key": "HIGH",
-    "sendgrid_key": "HIGH", "slack_token": "HIGH", "supabase_service_role": "HIGH",
-    "mongodb_dsn": "HIGH", "postgres_dsn": "HIGH", "mysql_dsn": "HIGH", "google_api_key": "HIGH",
-    "firebase_url": "HIGH", "twilio_auth_token": "HIGH", "jwt": "MEDIUM", "stripe_publishable": "MEDIUM",
-    "slack_webhook": "MEDIUM", "sentry_dsn": "MEDIUM", "mapbox_token": "MEDIUM", "supabase_anon_key": "MEDIUM",
-    "mailgun_api_key": "MEDIUM", "generic_api_key": "LOW", "generic_token": "LOW", "generic_secret": "LOW",
-    "bearer_token": "LOW", "password_field": "LOW", "bcrypt_hash": "LOW",
-}
-_SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
-_CASE_SENSITIVE_TYPES = frozenset({
-    "aws_access_key", "github_pat", "github_oauth", "gitlab_pat", "npm_token", "stripe_secret",
-    "stripe_publishable", "openai_key", "jwt", "bcrypt_hash", "private_key", "supabase_anon_key",
-})
-
-
-def get_severity(secret_type: str) -> str:
-    return SECRET_SEVERITY.get(secret_type, "UNKNOWN")
-
-
-def _normalize_secret_value(type_name: str, value: str) -> str:
-    v = value.strip().strip("\'\"`")
-    if type_name not in _CASE_SENSITIVE_TYPES:
-        v = v.lower()
-    if "://" in v:
-        v = v.split("?")[0].rstrip("/")
-    return v
-
-
-def _is_real_jwt(token: str) -> bool:
-    parts = token.split(".")
-    if len(parts) != 3:
-        return False
-    for part in parts[:2]:
-        padded = part + "=" * (-len(part) % 4)
-        try:
-            obj = json.loads(_b64.urlsafe_b64decode(padded))
-            if not isinstance(obj, dict):
-                return False
-        except Exception:
-            return False
-    try:
-        header_raw = parts[0] + "=" * (-len(parts[0]) % 4)
-        header = json.loads(_b64.urlsafe_b64decode(header_raw))
-        return "alg" in header
-    except Exception:
-        return False
-
-
-def _append_secret(finding: dict, cfg: dict) -> bool:
-    finding = {**finding, "severity": finding.get("severity") or get_severity(finding["type"])}
-    norm_key = (finding["type"], _normalize_secret_value(finding["type"], finding["value"]))
-    with _seen_secrets_lock:
-        if norm_key in _seen_secrets:
-            return False
-        _seen_secrets.add(norm_key)
-
-    with _secret_write_lock:
-        append_line_to_file(
-            cfg["secrets_txt"],
-            f"[{finding['severity']}] [{finding['type']}] {finding['url']}\n"
-            f"VALUE  : {finding['value']}\n"
-            f"CONTEXT: {finding['context'][:300]}\n"
-            + "-" * 60,
-        )
-        csv_new = not cfg["secrets_csv"].exists()
-        cfg["secrets_csv"].parent.mkdir(parents=True, exist_ok=True)
-        with open(cfg["secrets_csv"], "a", encoding="utf-8", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=["severity", "type", "url", "value", "context"])
-            if csv_new:
-                w.writeheader()
-            w.writerow({
-                "severity": finding["severity"],
-                "type": finding["type"],
-                "url": finding["url"],
-                "value": finding["value"],
-                "context": finding["context"][:300],
-            })
-        append_line_to_file(
-            cfg["secrets_jsonl"],
-            json.dumps({
-                "severity": finding["severity"],
-                "type": finding["type"],
-                "url": finding["url"],
-                "value": finding["value"],
-                "context": finding["context"][:300],
-            }, ensure_ascii=False),
-        )
-    return True
+    return found
 
 
 def analyze_js_content(
@@ -1175,11 +847,10 @@ def analyze_js_content(
     google_keys_found: set,
     google_keys_lock: threading.Lock,
 ) -> int:
-    found       = 0
-    lines       = content.splitlines()
-    generic_set = cfg["_generic_patterns"]
+    found = 0
+    lines = content.splitlines()
 
-    def _line_at(pos: int) -> str:
+    def _get_context(pos: int) -> str:
         char_count = 0
         for line in lines:
             char_count += len(line) + 1
@@ -1187,80 +858,34 @@ def analyze_js_content(
                 return line
         return ""
 
-    for name, pattern in cfg["secret_patterns"].items():
-        for match in pattern.finditer(content):
-            raw_value = match.group(0)
-            value     = match.group(1) if match.lastindex and match.lastindex >= 1 else raw_value
+    _credential_patterns = {"password", "senha"}
 
-            if name == "jwt" and not _is_real_jwt(value):
-                logger.debug("[SKIP FP] jwt inválido estruturalmente → %s", value[:60])
-                continue
+    with open(cfg["result_file"], "a", encoding="utf-8") as out:
+        for name, pattern in cfg["secret_patterns"].items():
+            for match in pattern.finditer(content):
+                value = match.group(0)
 
-            if name in generic_set:
-                context_line = _line_at(match.start())
-                if not is_likely_real_credential(value, context_line):
-                    logger.debug("[SKIP FP] %s → %s", name, value[:60])
-                    continue
+                if name in _credential_patterns:
+                    context_line = _get_context(match.start())
+                    if not is_likely_real_credential(value, context_line):
+                        logger.debug("[SKIP placeholder] %s → %s", name, value[:60])
+                        continue
 
-            context = _secret_context(content, match.start(), match.end())
-            finding = {"type": name, "value": value, "url": url, "context": context}
-
-            if _append_secret(finding, cfg):
-                logger.warning("[!!!] %s → %s | %s", name, value[:80], url)
+                logger.warning("[!!!] %s → %s", name, url)
+                out.write(f"[{name}] {url}\n{value}\n" + "-" * 60 + "\n")
                 found += 1
+
                 if name == "google_api_key":
+                    # ── Correção de race condition: acesso thread-safe ao set ──
                     with google_keys_lock:
                         google_keys_found.add(value)
-            else:
-                logger.debug("[DEDUP] %s já registrado — pulando.", name)
 
-    for obf in scan_charcode_obfuscation(content, url, logger):
-        _append_secret(obf, cfg)
-        found += 1
+        found += scan_charcode_obfuscation(content, url, out, logger)
 
-    endpoints: set[str] = set()
-    for pattern in cfg["api_endpoint_patterns"]:
-        for m in pattern.finditer(content):
-            endpoints.add(m.group(0).strip('"\'`'))
-    if endpoints:
-        with _secret_write_lock:
-            for ep in sorted(endpoints):
-                append_line_to_file(cfg["api_endpoints_file"], f"{ep}  ←  {url}")
+    # Extrai endpoints de API adicionalmente
+    extract_api_endpoints(content, url, cfg, logger)
 
     return found
-
-
-_JS_CACHE_VERSION = "v1"
-
-
-def _cache_path(cfg: dict, url: str) -> Path:
-    url_hash = hashlib.sha1(url.encode()).hexdigest()[:16]
-    return cfg["base_dir"] / ".js_cache" / f"{url_hash}.json"
-
-
-def _load_cached_js(cfg: dict, url: str) -> str | None:
-    path = _cache_path(cfg, url)
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if data.get("version") != _JS_CACHE_VERSION:
-            return None
-        if time.time() - data.get("ts", 0) > 86400:
-            return None
-        content = data.get("content")
-        return content if isinstance(content, str) else None
-    except Exception:
-        return None
-
-
-def _save_cached_js(cfg: dict, url: str, content: str) -> None:
-    path = _cache_path(cfg, url)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        path.write_text(json.dumps({"version": _JS_CACHE_VERSION, "ts": time.time(), "content": content}, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
 
 
 def process_js(
@@ -1271,426 +896,87 @@ def process_js(
     google_keys_lock: threading.Lock,
     get_fn,
 ) -> int:
-    url_key = url.split("?")[0]
-    with _analyzed_js_lock:
-        if url_key in _analyzed_js_urls:
-            logger.debug("[CACHE] JS já analisado — pulando: %s", url)
-            return 0
-        _analyzed_js_urls.add(url_key)
-
-    cached = _load_cached_js(cfg, url_key)
-    if cached is not None:
-        logger.debug("[cache-hit] %s", url)
-        return analyze_js_content(cached, url, cfg, logger, google_keys_found, google_keys_lock)
-
     try:
         resp = get_fn(url)
     except requests.exceptions.SSLError as exc:
         logger.debug("SSL error em %s: %s", url, exc)
         return 0
-    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-        logger.debug("Conexão falhou/timeout em %s", url)
+    except requests.exceptions.ConnectionError as exc:
+        logger.debug("Conexão falhou em %s: %s", url, exc)
+        return 0
+    except requests.exceptions.Timeout:
+        logger.debug("Timeout em %s", url)
         return 0
     except Exception as exc:
-        logger.debug("Erro em %s: %s", url, exc)
+        logger.debug("Erro inesperado em %s: %s", url, exc)
         return 0
 
     if resp.status_code != 200:
+        logger.debug("HTTP %d em %s", resp.status_code, url)
         return 0
 
     content = resp.text
     if not is_valid_js(resp, content):
-        logger.debug("Não é JS: %s", url)
+        logger.debug("Conteúdo não parece JS em %s", url)
         return 0
 
-    _save_cached_js(cfg, url_key, content)
     return analyze_js_content(content, url, cfg, logger, google_keys_found, google_keys_lock)
 
 
 def analyze_all_js(cfg: dict, logger: logging.Logger) -> tuple[int, set]:
-    if not cfg["js_file"].exists():
-        logger.warning("Nenhum arquivo JS para analisar.")
-        return 0, set()
-
     urls = [u.strip() for u in cfg["js_file"].read_text(encoding="utf-8").splitlines() if u.strip()]
-    if not urls:
-        return 0, set()
-
-    total_found:       int           = 0
-    google_keys_found: set           = set()
-    google_keys_lock:  threading.Lock = threading.Lock()
-    get_fn                           = _make_retrying_get(cfg)
+    total_found = 0
+    google_keys_found: set = set()
+    google_keys_lock = threading.Lock()          # ← lock para thread-safety
 
     logger.info("Analisando %d arquivos JS com %d workers…", len(urls), cfg["js_workers"])
+
+    # Cria uma instância de get com retry por worker (cada thread usa a própria sessão implícita)
+    get_fn = _make_retrying_get(cfg)
 
     with ThreadPoolExecutor(max_workers=cfg["js_workers"]) as executor:
         futures = {
             executor.submit(
-                process_js, url, cfg, logger,
-                google_keys_found, google_keys_lock, get_fn,
-            ): url for url in urls
+                process_js, url, cfg, logger, google_keys_found, google_keys_lock, get_fn
+            ): url
+            for url in urls
         }
         for future in as_completed(futures):
             try:
                 total_found += future.result()
             except Exception as exc:
-                logger.error("Thread error: %s", exc)
+                logger.error("Erro inesperado na thread: %s", exc)
 
-    if total_found:
-        logger.info("Segredos encontrados em JS: %d → %s", total_found, cfg["secrets_txt"])
-    else:
-        logger.info("Nenhum segredo encontrado em JS.")
-
+    logger.info("Achados em JS: %d → %s", total_found, cfg["result_file"])
     return total_found, google_keys_found
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Etapas extras: Source maps e inline scripts
-# ─────────────────────────────────────────────────────────────────────────────
-
-_INLINE_SCRIPT_RE = re.compile(r'<script(?:\s[^>]*)?>(.+?)</script>', re.DOTALL | re.IGNORECASE)
-_FRAMEWORK_DATA_RE = re.compile(
-    r'(?:__NEXT_DATA__|__NUXT__|__INITIAL_STATE__|__APP_STATE__|'
-    r'window\.__config|window\.__env|globalThis\.__env)\s*=\s*(\{.{20,}?\})',
-    re.DOTALL,
-)
-
-
-def collect_and_analyze_sourcemaps(cfg: dict, logger: logging.Logger, google_keys_found: set, google_keys_lock: threading.Lock) -> int:
-    source = cfg.get("_active_urls_file", cfg["urls_file"])
-    if not source.exists():
-        return 0
-    all_urls = [l.strip() for l in source.read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip()]
-    get_fn = _make_retrying_get(cfg)
-    map_urls: set[str] = {u for u in all_urls if u.split("?")[0].endswith(".js.map")}
-    js_urls_for_map = [u for u in all_urls if re.search(r'\.js(?:\?|$)', u) and not u.endswith(".js.map")]
-    for url in js_urls_for_map[:300]:
-        map_urls.add(re.sub(r'\.js(\?.*)?$', '.js.map', url))
-    if not map_urls:
-        logger.info("[sourcemaps] nenhuma URL de source map encontrada.")
-        return 0
-    logger.info("[sourcemaps] tentando %d URLs de source map…", len(map_urls))
-    sourcemap_dir = cfg["base_dir"] / "sourcemaps"
-    findings = 0
-    confirmed: list[str] = []
-    confirmed_lock = threading.Lock()
-
-    def _process_map(map_url: str) -> int:
-        local_findings = 0
-        try:
-            resp = get_fn(map_url)
-        except Exception:
-            return 0
-        if resp.status_code != 200 or "<html" in resp.text[:200].lower():
-            return 0
-        try:
-            data = resp.json()
-        except Exception:
-            return 0
-        sources_content = data.get("sourcesContent", [])
-        sources_names = data.get("sources", [])
-        if not sources_content:
-            return 0
-        with confirmed_lock:
-            confirmed.append(map_url)
-        sourcemap_dir.mkdir(parents=True, exist_ok=True)
-        safe = re.sub(r'[^\w\-.]', '_', map_url)[:100]
-        logger.warning("[!!!] Source map confirmado: %s (%d fontes)", map_url, len(sources_content))
-        for i, src_content in enumerate(sources_content):
-            if not src_content or not isinstance(src_content, str):
-                continue
-            src_name = sources_names[i] if i < len(sources_names) else f"source_{i}"
-            virtual_url = f"{map_url}::{src_name}"
-            try:
-                (sourcemap_dir / (safe + f"_src{i}.js")).write_text(src_content, encoding="utf-8", errors="replace")
-            except Exception:
-                pass
-            local_findings += analyze_js_content(src_content, virtual_url, cfg, logger, google_keys_found, google_keys_lock)
-        return local_findings
-
-    with ThreadPoolExecutor(max_workers=cfg["js_workers"]) as executor:
-        for fut in as_completed({executor.submit(_process_map, u): u for u in map_urls}):
-            try:
-                findings += fut.result()
-            except Exception as exc:
-                logger.debug("[sourcemaps] erro: %s", exc)
-    if confirmed:
-        write_if_not_empty(cfg["base_dir"] / "sourcemaps_found.txt", sorted(confirmed), logger)
-        logger.warning("[!!!] Source maps confirmados: %d — segredos: %d", len(confirmed), findings)
-    else:
-        logger.info("[sourcemaps] nenhum source map público confirmado.")
-    return findings
-
-
-def analyze_inline_scripts(cfg: dict, logger: logging.Logger, google_keys_found: set, google_keys_lock: threading.Lock) -> int:
-    source = cfg.get("_active_urls_file", cfg["urls_file"])
-    if not source.exists():
-        return 0
-    static_ext = re.compile(r'\.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|map|pdf)(\?|$)', re.I)
-    candidate_urls = [u.strip() for u in source.read_text(encoding="utf-8", errors="ignore").splitlines() if u.strip() and not static_ext.search(u.strip())]
-    if not candidate_urls:
-        return 0
-    get_fn = _make_retrying_get(cfg)
-    total = 0
-    sampled = candidate_urls[:300]
-    logger.info("[inline-scripts] analisando %d URLs HTML…", len(sampled))
-
-    def _process_html(url: str) -> int:
-        local = 0
-        try:
-            resp = get_fn(url)
-        except Exception:
-            return 0
-        if resp.status_code != 200:
-            return 0
-        ct = resp.headers.get("Content-Type", "")
-        if "html" not in ct and "text" not in ct:
-            return 0
-        content = resp.text
-        if len(content) > 5_000_000:
-            return 0
-        scripts = [m.group(1) for m in _INLINE_SCRIPT_RE.finditer(content) if "src=" not in m.group(0)[:120].lower()]
-        for i, script_content in enumerate(scripts):
-            if len(script_content.strip()) < 20:
-                continue
-            local += analyze_js_content(script_content, f"{url}::inline_script_{i}", cfg, logger, google_keys_found, google_keys_lock)
-            for fm in _FRAMEWORK_DATA_RE.finditer(script_content):
-                try:
-                    flat_str = json.dumps(json.loads(fm.group(1)))
-                    local += analyze_js_content(flat_str, f"{url}::framework_data", cfg, logger, google_keys_found, google_keys_lock)
-                except Exception:
-                    pass
-        return local
-
-    with ThreadPoolExecutor(max_workers=cfg["js_workers"]) as executor:
-        for fut in as_completed({executor.submit(_process_html, u): u for u in sampled}):
-            try:
-                total += fut.result()
-            except Exception as exc:
-                logger.debug("[inline-scripts] erro: %s", exc)
-    if total:
-        logger.warning("[!!!] Segredos em inline scripts: %d", total)
-    else:
-        logger.info("[inline-scripts] nenhum segredo encontrado.")
-    return total
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Etapa extra: Análise por subdomínio
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _probe_alive_urls(urls: list[str], timeout: int, logger: logging.Logger) -> list[str]:
-    if not urls:
-        return []
-    if not tool_available("httpx"):
-        logger.warning("httpx não encontrado — usando todos os subdomínios sem validação.")
-        return urls
-
-    input_text = "\n".join(urls) + "\n"
-    try:
-        result = subprocess.run(
-            ["httpx", "-silent",
-             "-mc", "200,201,204,301,302,307,308,403",
-             "-threads", "50", "-timeout", str(timeout)],
-            input=input_text,
-            capture_output=True, text=True, timeout=300,
-        )
-        return [u.strip() for u in result.stdout.splitlines() if u.strip()]
-    except Exception as exc:
-        logger.error("httpx (subs): %s", exc)
-        return urls
-
-
-def _collect_js_from_sub(sub_url: str, cfg: dict, logger: logging.Logger) -> set[str]:
-    all_urls: set[str] = set()
-
-    js_re = re.compile(
-        r'(?:\.js(?:\?[^\s]*)?$'
-        r'|/(?:static|assets|dist|build|chunks|bundles)/[^\s]*\.js)',
-        re.I,
-    )
-
-    if tool_available("hakrawler"):
-        lines = run_cmd(
-            ["hakrawler", "-d", "2", "-u", "-t", "8", "-insecure"],
-            logger, stdin=sub_url + "\n", timeout=60,
-        )
-        all_urls.update(lines)
-
-    if tool_available("gospider"):
-        raw = run_cmd([
-            "gospider", "-s", sub_url, "-c", "5", "-d", "2", "--js", "-q",
-        ], logger, timeout=60)
-        for line in raw:
-            m = re.search(r'https?://[^\s"\'<>\]]+', line)
-            if m:
-                all_urls.add(m.group(0).rstrip('.,;)"\'>]'))
-
-    js_urls: set[str] = set()
-    for url in all_urls:
-        if _CDN_DOMAINS_RE.search(url):
-            continue
-        if url.endswith(".js.map"):
-            continue
-        if js_re.search(url):
-            js_urls.add(url)
-
-    return js_urls
-
-
-def analyze_subdomains(
-    root_domain: str,
-    args: argparse.Namespace,
-    cfg: dict,
-    logger: logging.Logger,
-    all_google_keys: set,
-    google_keys_lock: threading.Lock,
-) -> dict:
-    banner_sub = "=" * 60
-    logger.info(banner_sub)
-    logger.info("ANÁLISE DE SUBDOMÍNIOS — %s", root_domain)
-    logger.info(banner_sub)
-
-    subs: set[str] = set()
-
-    if tool_available("subfinder"):
-        logger.info("[subfinder] enumerando subdomínios de %s…", root_domain)
-        lines = run_cmd(["subfinder", "-d", root_domain, "-silent"], logger, timeout=300)
-        subs.update(lines)
-        logger.info("[subfinder] %d subdomínios", len(lines))
-    else:
-        logger.warning("subfinder não encontrado — pulando enumeração de subdomínios.")
-        return {}
-
-    subs_clean = sorted({
-        s.strip().lower() for s in subs
-        if s.strip()
-        and "*" not in s
-        and s.strip().lower() != root_domain
-        and root_domain in s
-    })
-
-    if not subs_clean:
-        logger.info("Nenhum subdomínio encontrado para %s.", root_domain)
-        return {}
-
-    logger.info("Subdomínios únicos: %d", len(subs_clean))
-
-    sub_urls   = [f"https://{s}" for s in subs_clean]
-    alive_urls = _probe_alive_urls(sub_urls, cfg["request_timeout"], logger)
-
-    https_alive      = set(alive_urls)
-    http_candidates  = [
-        f"http://{s}" for s in subs_clean
-        if f"https://{s}" not in https_alive
-    ]
-    if http_candidates:
-        http_alive = _probe_alive_urls(http_candidates, cfg["request_timeout"], logger)
-        alive_urls.extend(http_alive)
-
-    alive_urls = sorted(set(alive_urls))
-    logger.info("Subdomínios vivos: %d / %d", len(alive_urls), len(subs_clean))
-
-    if not alive_urls:
-        logger.info("Nenhum subdomínio vivo encontrado.")
-        return {}
-
-    write_if_not_empty(cfg["base_dir"] / "subdomains_alive.txt", alive_urls, logger)
-
-    sub_stats: dict[str, dict] = {}
-    get_fn = _make_retrying_get(cfg)
-
-    for sub_url in alive_urls:
-        sub_host = re.sub(r'^https?://', '', sub_url).rstrip('/')
-        logger.info("─── Analisando subdomínio: %s", sub_host)
-
-        safe_sub = re.sub(r'[^\w\-.]', '_', sub_host)
-        sub_dir  = cfg["base_dir"] / "subdomains" / safe_sub
-        sub_dir.mkdir(parents=True, exist_ok=True)
-
-        js_urls = _collect_js_from_sub(sub_url, cfg, logger)
-        logger.info("  JS encontrado: %d arquivos", len(js_urls))
-
-        if not js_urls:
-            sub_stats[sub_host] = {"js": 0, "secrets": 0}
-            continue
-
-        write_if_not_empty(sub_dir / "js_urls.txt", sorted(js_urls), logger)
-
-        sub_findings = 0
-        for js_url in js_urls:
-            sub_findings += process_js(
-                js_url, cfg, logger,
-                all_google_keys, google_keys_lock, get_fn,
-            )
-
-        sub_stats[sub_host] = {"js": len(js_urls), "secrets": sub_findings}
-
-        if sub_findings:
-            logger.warning("  [!!!] %d segredo(s) em %s", sub_findings, sub_host)
-        else:
-            logger.info("  Nenhum segredo em %s", sub_host)
-
-    total_subs_secrets = sum(v["secrets"] for v in sub_stats.values())
-    total_subs_js      = sum(v["js"]      for v in sub_stats.values())
-
-    logger.info(banner_sub)
-    logger.info("SUBDOMÍNIOS — RESUMO")
-    logger.info("  Total analisados : %d", len(sub_stats))
-    logger.info("  JS coletados     : %d", total_subs_js)
-    logger.info("  Segredos totais  : %d", total_subs_secrets)
-    logger.info(banner_sub)
-
-    report_lines = [
-        "ANÁLISE POR SUBDOMÍNIO",
-        f"Domínio raiz: {root_domain}",
-        "=" * 60,
-        "",
-    ]
-    for sub, data in sorted(sub_stats.items(), key=lambda x: -x[1]["secrets"]):
-        status = "[!!!]" if data["secrets"] > 0 else "[ ok]"
-        report_lines.append(
-            f"{status} {sub:<50}  JS: {data['js']:>4}  Segredos: {data['secrets']:>4}"
-        )
-
-    write_if_not_empty(cfg["base_dir"] / "subdomains_report.txt", report_lines, logger)
-
-    return {
-        "subs_found":   len(subs_clean),
-        "subs_alive":   len(alive_urls),
-        "subs_js":      total_subs_js,
-        "subs_secrets": total_subs_secrets,
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Sumário
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Sumário consolidado ───────────────────────────────────────────────────────
 
 def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
-    def _count(path: Path) -> int:
+    """Gera um relatório final consolidado com todos os contadores da execução."""
+
+    def _count_lines(path: Path) -> int:
         if not path.exists():
             return 0
-        return sum(1 for l in path.read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip())
+        return sum(1 for _ in path.read_text(encoding="utf-8", errors="ignore").splitlines() if _)
 
-    type_counts: dict[str, int] = collections.Counter()
-    if cfg["secrets_jsonl"].exists():
-        for line in cfg["secrets_jsonl"].read_text(encoding="utf-8", errors="ignore").splitlines():
-            try:
-                obj = json.loads(line)
-                type_counts[obj.get("type", "?")] += 1
-            except json.JSONDecodeError:
-                pass
+    # Conta achados por tipo em js_sensiveis.txt
+    js_breakdown: dict[str, int] = collections.Counter()
+    if cfg["result_file"].exists():
+        for line in cfg["result_file"].read_text(encoding="utf-8", errors="ignore").splitlines():
+            m = re.match(r'^\[([^\]]+)\]', line)
+            if m:
+                js_breakdown[m.group(1)] += 1
 
+    # Conta Google Keys vulneráveis
     vuln_google = 0
     if cfg["google_report_file"].exists():
-        for line in cfg["google_report_file"].read_text(encoding="utf-8", errors="ignore").splitlines():
+        report_text = cfg["google_report_file"].read_text(encoding="utf-8", errors="ignore")
+        for line in report_text.splitlines():
             m = re.search(r'Vulneráveis:\s*(\d+)/', line)
             if m and int(m.group(1)) > 0:
                 vuln_google += 1
-
-    def _f(key: str) -> str:
-        return str(stats.get(key, 0)).rjust(6)
 
     lines = [
         "=" * 64,
@@ -1699,257 +985,140 @@ def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
         f"  Saída : {cfg['base_dir']}",
         "=" * 64,
         "",
-        f"  URLs coletadas           : {_f('urls_total')}",
-        f"  URLs ativas (httpx)      : {_f('urls_alive')}",
-        f"  Arquivos JS              : {_f('js_total')}",
-        f"  URLs sensíveis           : {_f('sensitive_total')}",
+        "── Coleta ───────────────────────────────────────────────────",
+        f"  URLs coletadas           : {stats.get('urls_total', 0):>6}",
+        f"  URLs ativas (httpx)      : {stats.get('urls_alive', 0):>6}",
+        f"  Arquivos JS              : {stats.get('js_total', 0):>6}",
+        f"  Arquivos sensíveis       : {stats.get('sensitive_total', 0):>6}",
         "",
-        f"  Segredos encontrados     : {_f('js_findings')}",
-        f"  Source maps findings     : {_f('sourcemap_findings')}",
-        f"  Inline scripts findings  : {_f('inline_findings')}",
+        "── Análise JS ───────────────────────────────────────────────",
+        f"  Segredos encontrados     : {stats.get('js_findings', 0):>6}",
     ]
 
-    if type_counts:
-        lines.append("")
-        lines.append("  Por tipo:")
-        for name, count in sorted(type_counts.items(), key=lambda x: -x[1]):
-            lines.append(f"    {name}: {count}")
+    for name, count in sorted(js_breakdown.items()):
+        lines.append(f"    [{name}]: {count}")
 
     lines += [
         "",
-        f"  Google Keys encontradas  : {_f('google_keys')}",
-        f"  Google Keys vulneráveis  : {str(vuln_google).rjust(6)}",
+        "── Google API Keys ──────────────────────────────────────────",
+        f"  Chaves encontradas       : {stats.get('google_keys', 0):>6}",
+        f"  Chaves vulneráveis       : {vuln_google:>6}",
         "",
-        f"  Segredos em .env/.conf   : {_f('sensitive_findings')}",
-        f"  XSS confirmados (dalfox) : {_f('xss_hits')}",
-        f"  SSRF/Redirect hits       : {_f('ssrf_redirect_hits')}",
-        f"  Endpoints de API         : {str(_count(cfg['api_endpoints_file'])).rjust(6)}",
+        "── Arquivos sensíveis ───────────────────────────────────────",
+        f"  Segredos em .env/.conf   : {stats.get('sensitive_findings', 0):>6}",
+        "",
+        "── Probes ───────────────────────────────────────────────────",
+        f"  XSS confirmados (dalfox) : {stats.get('xss_hits', 0):>6}",
+        f"  SSRF/Redirect hits       : {stats.get('ssrf_redirect_hits', 0):>6}",
+        "",
+        "── Endpoints de API expostos ────────────────────────────────",
+        f"  Endpoints únicos         : {_count_lines(cfg['api_endpoints_file']):>6}",
+        "",
+        "── Arquivos de saída ────────────────────────────────────────",
+        f"  JS segredos    : {cfg['result_file']}",
+        f"  Google Keys    : {cfg['google_report_file']}",
+        f"  Sensíveis      : {cfg['sensitive_analysis']}",
+        f"  API Endpoints  : {cfg['api_endpoints_file']}",
+        f"  Log completo   : {cfg['log_file']}",
+        "=" * 64,
     ]
 
-    if stats.get("subs_found", 0) > 0:
-        lines += [
-            "",
-            "── Subdomínios ──────────────────────────────────────────",
-            f"  Subdomínios encontrados  : {_f('subs_found')}",
-            f"  Subdomínios vivos        : {_f('subs_alive')}",
-            f"  JS em subdomínios        : {_f('subs_js')}",
-            f"  Segredos em subdomínios  : {_f('subs_secrets')}",
-        ]
-        sub_report = cfg["base_dir"] / "subdomains_report.txt"
-        if sub_report.exists():
-            lines.append(f"  Relatório subs           : {sub_report}")
+    summary_text = "\n".join(lines) + "\n"
+    cfg["summary_file"].write_text(summary_text, encoding="utf-8")
 
-    output_files = [
-        ("Segredos TXT",   cfg["secrets_txt"]),
-        ("Segredos CSV",   cfg["secrets_csv"]),
-        ("Segredos JSONL", cfg["secrets_jsonl"]),
-        ("Google Keys",    cfg["google_report_file"]),
-        ("API Endpoints",  cfg["api_endpoints_file"]),
-        ("Sensíveis",      cfg["sensitive_report"]),
-        ("Log completo",   cfg["log_file"]),
-        ("SUMMARY HTML",   cfg["base_dir"] / "SUMMARY.html"),
-    ]
-    existing = [(label, path) for label, path in output_files if path.exists()]
-    if existing:
-        lines += ["", "  Arquivos gerados:"]
-        for label, path in existing:
-            lines.append(f"    {label}: {path}")
-
-    lines += ["", "=" * 64]
-
-    write_if_not_empty(cfg["summary_file"], lines, logger)
+    # Também imprime no stdout
     for line in lines:
         logger.info(line)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Relatório HTML e preflight
-# ─────────────────────────────────────────────────────────────────────────────
-
-_TOOL_META: dict[str, dict] = {
-    "gau": {"install": "go install github.com/lc/gau/v2/cmd/gau@latest", "impact": "coleta passiva de URLs"},
-    "waybackurls": {"install": "go install github.com/tomnomnom/waybackurls@latest", "impact": "coleta passiva via Wayback Machine"},
-    "katana": {"install": "go install github.com/projectdiscovery/katana/cmd/katana@latest", "impact": "crawling ativo com suporte a JS"},
-    "hakrawler": {"install": "go install github.com/hakluke/hakrawler@latest", "impact": "crawling de subdomínios"},
-    "gospider": {"install": "go install github.com/jaeles-project/gospider@latest", "impact": "crawling com suporte a sitemap/robots"},
-    "httpx": {"install": "go install github.com/projectdiscovery/httpx/cmd/httpx@latest", "impact": "validação de URLs ativas"},
-    "subfinder": {"install": "go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest", "impact": "enumeração de subdomínios"},
-    "gf": {"install": "go install github.com/tomnomnom/gf@latest", "impact": "filtragem XSS/SQLi/SSRF/redirect"},
-    "dalfox": {"install": "go install github.com/hahwul/dalfox/v2@latest", "impact": "probe XSS ativo"},
-    "qsreplace": {"install": "go install github.com/tomnomnom/qsreplace@latest", "impact": "probe SSRF/redirect"},
-    "curl": {"install": "apt install curl / brew install curl", "impact": "validação de redirect hits"},
-}
-_CRITICAL_TOOLS = {"httpx"}
-
-
-def preflight_check(logger: logging.Logger, args: argparse.Namespace) -> bool:
-    missing: list[tuple[str, str, str]] = []
-    present: list[str] = []
-    for tool, meta in _TOOL_META.items():
-        if tool_available(tool):
-            present.append(tool)
-        else:
-            missing.append((tool, meta["install"], meta["impact"]))
-    logger.info("─── Preflight check ─────────────────────────────────────────")
-    logger.info("Ferramentas disponíveis (%d): %s", len(present), ", ".join(sorted(present)) or "nenhuma")
-    if missing:
-        logger.warning("Ferramentas ausentes (%d):", len(missing))
-        for tool, install_cmd, impact in sorted(missing):
-            level = logging.ERROR if tool in _CRITICAL_TOOLS else logging.WARNING
-            logger.log(level, "  ✗ %-15s | impacto: %-45s | instalar: %s", tool, impact, install_cmd)
-    critical_missing = [t for t, _, _ in missing if t in _CRITICAL_TOOLS]
-    if "httpx" in critical_missing and args.no_httpx:
-        critical_missing.remove("httpx")
-    if critical_missing:
-        logger.error("Ferramentas críticas ausentes: %s — abortando.", ", ".join(critical_missing))
-        return False
-    logger.info("─────────────────────────────────────────────────────────────")
-    return True
-
-
-def write_summary_html(cfg: dict, logger: logging.Logger, stats: dict) -> None:
-    findings: list[dict] = []
-    if cfg["secrets_jsonl"].exists():
-        for line in cfg["secrets_jsonl"].read_text(encoding="utf-8", errors="ignore").splitlines():
-            try:
-                obj = json.loads(line)
-                obj.setdefault("severity", get_severity(obj.get("type", "")))
-                findings.append(obj)
-            except json.JSONDecodeError:
-                pass
-    findings.sort(key=lambda x: (_SEVERITY_ORDER.get(x.get("severity", "UNKNOWN"), 4), x.get("type", "")))
-    sev_colors = {"CRITICAL": "#c0392b", "HIGH": "#e67e22", "MEDIUM": "#2980b9", "LOW": "#27ae60", "UNKNOWN": "#7f8c8d"}
-    rows_html = []
-    for f in findings:
-        sev = html_lib.escape(f.get("severity", "UNKNOWN"))
-        typ = html_lib.escape(f.get("type", ""))
-        url = html_lib.escape(f.get("url", ""))
-        val = html_lib.escape(str(f.get("value", ""))[:120])
-        ctx = html_lib.escape(str(f.get("context", ""))[:200])
-        color = sev_colors.get(sev, "#7f8c8d")
-        rows_html.append(f'<tr data-sev="{sev}" data-type="{typ}"><td><span style="background:{color};color:#fff;padding:2px 7px;border-radius:3px;font-size:11px;font-weight:600">{sev}</span></td><td><code style="font-size:12px">{typ}</code></td><td style="word-break:break-all;font-size:12px"><a href="{url}" target="_blank" style="color:#2980b9">{url[:120]}</a></td><td style="font-family:monospace;font-size:11px;word-break:break-all">{val}</td><td style="font-size:11px;color:#555;word-break:break-all">{ctx}</td></tr>')
-    type_options = "".join(f"<option>{html_lib.escape(t)}</option>" for t in sorted({f.get("type", "") for f in findings}))
-    stats_cards = "".join(f'<div class="stat"><div class="n" style="color:{sev_colors[s]}">{sum(1 for f in findings if f.get("severity") == s)}</div><div class="l">{s}</div></div>' for s in ["CRITICAL", "HIGH", "MEDIUM", "LOW"])
-    domain_esc = html_lib.escape(cfg["domain"])
-    rows_joined = "".join(rows_html)
-    generated = time.strftime("%Y-%m-%d %H:%M")
-    html = f"""<!DOCTYPE html>
-<html lang="pt-BR"><head><meta charset="utf-8"><title>recon - {domain_esc}</title>
-<style>body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:0;background:#f5f5f5;color:#222}}header{{background:#1a1a2e;color:#fff;padding:1.2rem 2rem}}header h1{{font-size:18px;margin:0;font-weight:500}}header p{{font-size:13px;margin:.25rem 0 0;color:#aaa}}.controls{{background:#fff;border-bottom:1px solid #ddd;padding:.75rem 2rem;display:flex;gap:1rem;flex-wrap:wrap;align-items:center}}select,input{{border:1px solid #ccc;border-radius:4px;padding:4px 8px;font-size:13px}}table{{width:100%;border-collapse:collapse;background:#fff}}th{{background:#1a1a2e;color:#fff;padding:8px 10px;font-size:12px;text-align:left;cursor:pointer;white-space:nowrap}}th:hover{{background:#2d2d5e}}td{{padding:7px 10px;border-bottom:1px solid #eee;vertical-align:top}}tr:hover td{{background:#f9f9ff}}tr.hidden{{display:none}}.stats{{display:flex;gap:1rem;padding:.75rem 2rem;background:#fff;border-bottom:1px solid #ddd;flex-wrap:wrap}}.stat{{text-align:center}}.stat .n{{font-size:22px;font-weight:600;color:#1a1a2e}}.stat .l{{font-size:11px;color:#888}}footer{{padding:1rem 2rem;font-size:11px;color:#aaa;text-align:center}}</style></head>
-<body><header><h1>Reconhecimento - {domain_esc}</h1><p>Gerado por recon.py - {generated} - {len(findings)} achados - {stats.get('urls_total', 0)} URLs coletadas</p></header>
-<div class="stats">{stats_cards}<div class="stat"><div class="n">{stats.get('js_total',0)}</div><div class="l">JS analisados</div></div><div class="stat"><div class="n">{stats.get('urls_alive',0)}</div><div class="l">URLs ativas</div></div></div>
-<div class="controls"><label style="font-size:13px">Severidade: <select id="sev-filter" onchange="applyFilters()"><option value="">Todas</option><option>CRITICAL</option><option>HIGH</option><option>MEDIUM</option><option>LOW</option><option>UNKNOWN</option></select></label><label style="font-size:13px">Tipo: <select id="type-filter" onchange="applyFilters()"><option value="">Todos</option>{type_options}</select></label><input id="search" type="search" placeholder="Buscar URL ou valor" oninput="applyFilters()" style="width:220px"><span id="count" style="font-size:12px;color:#888"></span></div>
-<table id="tbl"><thead><tr><th onclick="sortTable(0)">Severidade</th><th onclick="sortTable(1)">Tipo</th><th onclick="sortTable(2)">URL</th><th>Valor</th><th>Contexto</th></tr></thead><tbody>{rows_joined}</tbody></table><footer>recon.py - {domain_esc} - {len(findings)} achados no total</footer>
-<script>const tbody=document.querySelector('#tbl tbody');const rows=Array.from(tbody.querySelectorAll('tr'));function applyFilters(){{const sev=document.getElementById('sev-filter').value;const typ=document.getElementById('type-filter').value;const srch=document.getElementById('search').value.toLowerCase();let vis=0;rows.forEach(r=>{{const ok=(!sev||r.dataset.sev===sev)&&(!typ||r.dataset.type===typ)&&(!srch||r.textContent.toLowerCase().includes(srch));r.classList.toggle('hidden',!ok);if(ok)vis++;}});document.getElementById('count').textContent=vis+' de {len(findings)} achados';}}let sortDir=1;function sortTable(col){{const sorted=rows.sort((a,b)=>{{const ta=a.cells[col]?.textContent.trim()||'';const tb=b.cells[col]?.textContent.trim()||'';return sortDir*ta.localeCompare(tb);}});sortDir*=-1;sorted.forEach(r=>tbody.appendChild(r));applyFilters();}}applyFilters();</script></body></html>"""
-    html_path = cfg["base_dir"] / "SUMMARY.html"
-    html_path.write_text(html, encoding="utf-8")
-    logger.info("SUMMARY HTML → %s", html_path)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Reconhecimento web focado em JS: coleta URLs, extrai segredos, valida chaves."
+        description="Recon web com coleta de URLs, análise de JS, segredos e probes opcionais."
     )
-    parser.add_argument("domain",            nargs="?",            help="Domínio alvo. Ex: exemplo.com.br")
-    parser.add_argument("--no-dalfox",       action="store_true",  help="Pula probe XSS com dalfox")
-    parser.add_argument("--no-ssrf-probe",   action="store_true",  help="Pula probe SSRF/redirect")
-    parser.add_argument("--no-sensitive-dl", action="store_true",  help="Pula download de arquivos sensíveis")
-    parser.add_argument("--no-httpx",        action="store_true",  help="Usa todas as URLs sem validar com httpx")
-    parser.add_argument("--no-google-val",   action="store_true",  help="Pula validação de endpoints Google")
-    parser.add_argument("--no-subs",         action="store_true",  help="Pula análise de subdomínios")
-    parser.add_argument("--workers",         type=int, default=20, help="Workers JS (padrão: 20)")
-    parser.add_argument("--timeout",         type=int, default=10, help="Timeout de requisições em segundos (padrão: 10)")
+    parser.add_argument("domain", nargs="?", help="Domínio alvo. Ex: exemplo.com.br")
+    parser.add_argument("--no-dalfox", action="store_true", help="Pula o probe de XSS com dalfox")
+    parser.add_argument("--no-ssrf-probe", action="store_true", help="Pula o probe de SSRF/redirect com qsreplace")
+    parser.add_argument("--no-sensitive-dl", action="store_true", help="Pula o download/análise de arquivos sensíveis")
+    parser.add_argument("--no-httpx", action="store_true", help="Pula validação de URLs ativas com httpx e usa todas as URLs")
+    parser.add_argument("--no-google-val", action="store_true", help="Pula validação online de endpoints Google")
+    parser.add_argument("--workers", type=int, default=20, help="Número de workers JS. Padrão: 20")
+    parser.add_argument("--timeout", type=int, default=10, help="Timeout de requisições em segundos. Padrão: 10")
     return parser.parse_args()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
-
 def main() -> None:
-    args   = parse_args()
+    args = parse_args()
     domain = args.domain or input("Domínio: ").strip()
     if not domain:
         print("Domínio inválido.")
         sys.exit(1)
 
-    cfg                    = get_config(domain)
-    cfg["js_workers"]      = max(1, args.workers)
+    cfg = get_config(domain)
+    cfg["js_workers"] = max(1, args.workers)
     cfg["request_timeout"] = max(1, args.timeout)
-    logger                 = setup_logging(cfg["log_file"])
-    stats: dict[str, int]  = {}
+    logger = setup_logging(cfg["log_file"])
 
     logger.info("=" * 60)
     logger.info("Iniciando recon para: %s", domain)
-    logger.info("Diretório de saída : %s", cfg["base_dir"])
+    logger.info("Diretório de saída: %s", cfg["base_dir"])
     logger.info("=" * 60)
 
-    if not preflight_check(logger, args):
-        sys.exit(1)
+    stats: dict[str, int] = {}
 
+    # 1. Coleta de URLs
     stats["urls_total"] = collect_urls(cfg, logger)
 
+    # 2. Validação de URLs ativas
     if args.no_httpx:
         cfg["_active_urls_file"] = cfg["urls_file"]
-        stats["urls_alive"]      = stats["urls_total"]
-        logger.info("--no-httpx: usando todas as URLs.")
+        stats["urls_alive"] = stats["urls_total"]
+        logger.info("--no-httpx ativo: usando todas as URLs coletadas.")
     else:
         stats["urls_alive"] = validate_alive_urls(cfg, logger)
 
+    # 3. GF + probes de parâmetros
     run_gf(cfg, logger)
-    stats["xss_hits"]           = 0 if args.no_dalfox     else probe_xss(cfg, logger)
-    stats["ssrf_redirect_hits"] = 0 if args.no_ssrf_probe else probe_ssrf_redirect(cfg, logger)
+    if args.no_dalfox:
+        stats["xss_hits"] = 0
+        logger.info("--no-dalfox ativo: probe de XSS pulado.")
+    else:
+        stats["xss_hits"] = probe_xss(cfg, logger)
 
-    stats["sensitive_total"]    = extract_sensitive_urls(cfg, logger)
-    stats["sensitive_findings"] = 0 if args.no_sensitive_dl \
-                                    else download_and_analyze_sensitive(cfg, logger)
+    if args.no_ssrf_probe:
+        stats["ssrf_redirect_hits"] = 0
+        logger.info("--no-ssrf-probe ativo: probe de SSRF/redirect pulado.")
+    else:
+        stats["ssrf_redirect_hits"] = probe_ssrf_redirect(cfg, logger)
 
+    # 4. Arquivos sensíveis
+    stats["sensitive_total"] = extract_sensitive(cfg, logger)
+    if args.no_sensitive_dl:
+        stats["sensitive_findings"] = 0
+        logger.info("--no-sensitive-dl ativo: download/análise de arquivos sensíveis pulado.")
+    else:
+        stats["sensitive_findings"] = download_and_analyze_sensitive(cfg, logger)
+
+    # 5. Coleta de JS
     stats["js_total"] = collect_js(cfg, logger)
 
-    google_keys_found: set           = set()
-    google_keys_lock:  threading.Lock = threading.Lock()
-
-    js_findings, gkeys = analyze_all_js(cfg, logger)
+    # 6. Análise de JS + Google Keys
+    js_findings, google_keys = analyze_all_js(cfg, logger)
     stats["js_findings"] = js_findings
-    with google_keys_lock:
-        google_keys_found.update(gkeys)
-
-    sourcemap_findings = collect_and_analyze_sourcemaps(cfg, logger, google_keys_found, google_keys_lock)
-    stats["sourcemap_findings"] = sourcemap_findings
-    stats["js_findings"] += sourcemap_findings
-
-    inline_findings = analyze_inline_scripts(cfg, logger, google_keys_found, google_keys_lock)
-    stats["inline_findings"] = inline_findings
-    stats["js_findings"] += inline_findings
-
-    if args.no_subs:
-        logger.info("--no-subs: análise de subdomínios pulada.")
-        stats.update({"subs_found": 0, "subs_alive": 0, "subs_js": 0, "subs_secrets": 0})
-    else:
-        sub_stats = analyze_subdomains(
-            domain, args, cfg, logger,
-            google_keys_found, google_keys_lock,
-        )
-        stats.update(sub_stats)
-
-    stats["google_keys"] = len(google_keys_found)
-
+    stats["google_keys"] = len(google_keys)
     if args.no_google_val:
-        if google_keys_found:
-            write_if_not_empty(cfg["google_keys_file"], sorted(google_keys_found), logger)
-        logger.info("--no-google-val: validação de endpoints Google pulada.")
+        logger.info("--no-google-val ativo: validação de endpoints Google pulada.")
+        if google_keys:
+            cfg["google_keys_file"].write_text("\n".join(sorted(google_keys)) + "\n", encoding="utf-8")
     else:
-        validate_all_google_keys(google_keys_found, cfg, logger)
+        validate_all_google_keys(google_keys, cfg, logger)
 
+    # 7. Sumário final
     write_summary(cfg, logger, stats)
-    write_summary_html(cfg, logger, stats)
 
     logger.info("=" * 60)
-    logger.info("Recon finalizado. Log: %s", cfg["log_file"])
+    logger.info("Recon finalizado. Logs completos em: %s", cfg["log_file"])
     logger.info("=" * 60)
 
 
