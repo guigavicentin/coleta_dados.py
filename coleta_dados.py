@@ -509,30 +509,17 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
     all_urls: set[str] = set()
 
     # ── gau ──────────────────────────────────────────────────
-    if tool_available("gau"):
-        logger.info("[gau] coletando… (domínio: %s)", domain)
-        try:
-            proc = subprocess.Popen(
-                ["gau", "--threads", "5", "--subs",
-                 "--providers", "wayback,commoncrawl,otx,urlscan",
-                 "--retries", "2", "--timeout", "50", domain],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            )
-            gau_lines: list[str] = []
-            try:
-                for line in proc.stdout:
-                    line = line.strip()
-                    if line:
-                        gau_lines.append(line)
-            finally:
-                proc.wait()
-
-            all_urls.update(gau_lines)
-            logger.info("[gau] %d URLs", len(gau_lines))
-        except Exception as exc:
-            logger.error("[gau] erro: %s", exc)
-    else:
-        logger.warning("gau não encontrado — pulando.")
+if tool_available("gau"):
+    logger.info("[gau] coletando… (domínio: %s)", domain)
+    lines = run_cmd([
+        "gau", "--threads", "5", "--subs",
+        "--providers", "wayback,commoncrawl,otx,urlscan",
+        "--retries", "2", "--timeout", "50", domain
+    ], logger, timeout=600)
+    all_urls.update(lines)
+    logger.info("[gau] %d URLs", len(lines))
+else:
+    logger.warning("gau não encontrado — pulando.")
 
     # ── waybackurls ───────────────────────────────────────────
     if tool_available("waybackurls"):
