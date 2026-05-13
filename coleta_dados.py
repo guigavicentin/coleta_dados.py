@@ -514,7 +514,7 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
         lines = run_cmd([
             "gau", "--threads", "5", "--subs",
             "--providers", "wayback,commoncrawl,otx,urlscan",
-            "--retries", "2", "--timeout", "50", domain
+            "--retries", "2", "--timeout", "80", domain
         ], logger, timeout=900)
         all_urls.update(lines)
         logger.info("[gau] %d URLs", len(lines))
