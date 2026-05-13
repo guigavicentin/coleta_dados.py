@@ -22,7 +22,7 @@ MELHORIAS IMPLEMENTADAS:
 
 Ferramentas SEM token obrigatório:
   subfinder, assetfinder, crt.sh (HTTP), otx (HTTP), dnsx, puredns,
-  httpx, wafw00f, gowitness, subzy, subjack, nuclei, nmap
+  httpx, wafw00f, subzy, subjack, nuclei, nmap
 
 Ferramentas COM token OPCIONAL (rendem mais com token):
   subfinder  → ~/.config/subfinder/provider-config.yaml
@@ -62,6 +62,9 @@ DEFAULT_SUBDOMAINS_WORDLIST = os.environ.get("SUBDOMAINS_WORDLIST", "/usr/share/
 
 THREADS      = 50
 HTTPX_PORTS  = "80,443,8080,8443,8888,4443,3000,5000"
+
+# Severity padrão para nuclei — baixo/médio/alto/crítico
+NUCLEI_DEFAULT_SEVERITY = "low,medium,high,critical"
 
 # Versões mínimas aceitáveis — [RES-2]
 MIN_TOOL_VERSIONS: dict[str, tuple[str, list[str]]] = {
@@ -216,23 +219,16 @@ def tool_available(name: str) -> bool:
 
 # [RES-2] Verificação de versão mínima das ferramentas
 def check_tool_version(name: str, logger: logging.Logger) -> bool:
-    """
-    MELHORIA [RES-2] — Verificação de versão mínima
-    Por quê: versões antigas de nuclei e httpx têm comportamentos diferentes
-    (flags renomeadas, formatos de output incompatíveis), causando erros silenciosos.
-    Verificar antes de rodar evita falsos negativos por incompatibilidade.
-    """
     if name not in MIN_TOOL_VERSIONS:
         return True
     min_ver_str, ver_cmd = MIN_TOOL_VERSIONS[name]
     try:
         result = subprocess.run(ver_cmd, capture_output=True, text=True, timeout=10)
         output = result.stdout + result.stderr
-        # Extrai semver da saída (ex: "nuclei v3.1.2" → "3.1.2")
         match = re.search(r'v?(\d+)\.(\d+)\.(\d+)', output)
         if not match:
             logger.debug("[versão] Não foi possível detectar versão de %s", name)
-            return True  # continua mesmo sem saber
+            return True
         actual = tuple(int(x) for x in match.groups())
         minimum = tuple(int(x) for x in min_ver_str.split("."))
         if actual < minimum:
@@ -303,11 +299,6 @@ def http_get_with_retry(
     max_retries: int = 3,
     headers: dict | None = None,
 ) -> Optional[requests.Response]:
-    """
-    MELHORIA [RES-1] — Retry com backoff exponencial
-    Por quê: crt.sh e OTX têm rate limiting e falhas intermitentes.
-    Retry automático reduz dados perdidos sem intervenção manual.
-    """
     base_headers = {"User-Agent": "Mozilla/5.0 takeover-recon"}
     if headers:
         base_headers.update(headers)
@@ -432,12 +423,6 @@ def _crt_sh(domain: str, logger: logging.Logger) -> list[str]:
 
 # [COB-2] AlienVault OTX — fonte pública sem token
 def _otx_subdomains(domain: str, logger: logging.Logger) -> list[str]:
-    """
-    MELHORIA [COB-2] — AlienVault OTX como fonte adicional
-    Por quê: OTX indexa subdomínios vistos em logs de ameaças e campanhas de C2,
-    encontrando ativos que crt.sh e subfinder não cobrem (ex: subdomínios efêmeros,
-    infraestrutura legada). API pública sem autenticação obrigatória.
-    """
     subs: set[str] = set()
     page = 1
     while True:
@@ -456,7 +441,6 @@ def _otx_subdomains(domain: str, logger: logging.Logger) -> list[str]:
                 hostname = entry.get("hostname", "").strip().lstrip("*.")
                 if hostname and domain in hostname:
                     subs.add(hostname)
-            # OTX tem paginação; para quando não tem próxima página
             if not data.get("has_next"):
                 break
             page += 1
@@ -479,9 +463,6 @@ def resolve_dns(
     """
     Retorna (resolvidos, cname_map).
     MELHORIA [COB-3] — Coleta CNAMEs em massa com dnsx -cname
-    Por quê: CNAMEs apontando para serviços externos são o pré-requisito
-    de praticamente todo takeover. Coletá-los aqui permite pré-filtrar
-    quais URLs precisam de verificação de fingerprint, reduzindo requisições.
     """
     banner("Resolução DNS + CNAMEs (dnsx)", logger)
 
@@ -508,12 +489,10 @@ def resolve_dns(
         cmd_cname += ["-r", resolvers_file]
     lines_cname = run_cmd(cmd_cname, logger, timeout=300)
 
-    # dnsx -cname retorna: "sub.domain.com [CNAME → externo.service.com]"
     for line in lines_cname:
         parts = line.split()
         if len(parts) >= 2:
             sub  = parts[0]
-            # captura o valor após "[" ou "→" dependendo da versão
             cname_val = " ".join(parts[1:])
             cname_clean = re.sub(r'[\[\]→]', '', cname_val).strip().rstrip(".")
             if cname_clean:
@@ -573,8 +552,6 @@ def probe_alive(
     """
     Retorna (urls_completas, dominios_limpos).
     MELHORIA [PER-1] — rate-limit via -rate-limit para evitar ban de WAF/IPS
-    Por quê: disparar 50 threads sem rate limit contra o mesmo ASN pode
-    acionar bloqueios temporários e mascarar hosts vivos como mortos.
     """
     banner("Hosts Vivos (httpx)", logger)
 
@@ -599,11 +576,11 @@ def probe_alive(
             "-mc", "200,201,204,301,302,307,308,403",
             "-threads", "50",
             "-timeout", str(httpx_timeout),
-            "-rate-limit", str(httpx_rate),   # [PER-1]
+            "-rate-limit", str(httpx_rate),
             "-title",
             "-sc",
             "-ip",
-            "-cdn",        # identifica se está atrás de CDN (reduz falsos positivos)
+            "-cdn",
             "-json",
         ],
         capture_output=True, text=True, timeout=600,
@@ -669,9 +646,6 @@ def _waf_worker(url: str, timeout: int = 20) -> tuple[str, str]:
 def detect_waf(alive_urls: list[str], base: Path, logger: logging.Logger) -> dict[str, str]:
     """
     MELHORIA [PER-2] — wafw00f paralelizado com ThreadPoolExecutor
-    Por quê: a versão original rodava serial (um por um), tornando essa etapa
-    gargalo para programas com centenas de hosts. A paralelização reduz de
-    ~100s para ~10s para 100 hosts com timeout de 20s cada.
     """
     banner("WAF Detection (wafw00f)", logger)
     waf_map: dict[str, str] = {}
@@ -705,76 +679,26 @@ def detect_waf(alive_urls: list[str], base: Path, logger: logging.Logger) -> dic
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Etapa 6: Screenshots com gowitness
+# Etapa 6: Takeover Detection
 # ─────────────────────────────────────────────────────────────────────────────
 
-def take_screenshots(alive_urls: list[str], base: Path, logger: logging.Logger) -> bool:
-    banner("Screenshots (gowitness)", logger)
-
-    if not tool_available("gowitness"):
-        logger.info("gowitness não encontrado — pulando screenshots.")
-        logger.info("Instale: go install github.com/sensepost/gowitness@latest")
-        return False
-
-    if not alive_urls:
-        return False
-
-    input_file = base / "_gowitness_input.txt"
-    write_lines(input_file, alive_urls, logger)
-    screenshots_dir = base / "screenshots"
-    screenshots_dir.mkdir(exist_ok=True)
-
-    try:
-        subprocess.run(
-            [
-                "gowitness", "file",
-                "-f", str(input_file),
-                "--screenshot-path", str(screenshots_dir),
-                "--disable-db",
-                "--timeout", "10",
-                "--threads", "5",
-            ],
-            capture_output=True, text=True, timeout=600,
-        )
-        count = len(list(screenshots_dir.glob("*.png")))
-        logger.info("Screenshots capturados: %d → %s", count, screenshots_dir)
-        return count > 0
-    except Exception as exc:
-        logger.error("gowitness erro: %s", exc)
-        return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Etapa 7: Takeover Detection
-# ─────────────────────────────────────────────────────────────────────────────
-
-# [PRE-2] Verificação real de bucket S3 (evita falso positivo por CNAME genérico)
+# [PRE-2] Verificação real de bucket S3
 def _s3_bucket_exists(url: str, logger: logging.Logger) -> bool:
-    """
-    MELHORIA [PRE-2] — Verificação de bucket S3 via API pública
-    Por quê: um CNAME para *.s3.amazonaws.com pode ser de um bucket privado
-    existente (retorna 403, não takeover). Checar HEAD no endpoint S3
-    distingue "bucket existe mas privado" de "bucket não existe" (404/NoSuchBucket).
-    Reduz falsos positivos significativamente em programas com uso de S3.
-    """
     try:
         parsed    = urlparse(url)
         hostname  = parsed.hostname or ""
-        # Extrai nome do bucket do hostname (ex: mybucket.s3.amazonaws.com)
         bucket_name = hostname.split(".s3")[0] if ".s3" in hostname else None
         if not bucket_name:
-            return True  # não conseguiu determinar — assume que existe
+            return True
 
         check_url = f"https://s3.amazonaws.com/{bucket_name}"
         resp = requests.head(check_url, timeout=8, allow_redirects=True)
-        # 403 = bucket existe mas privado → não é takeover
-        # 404 = bucket não existe → possível takeover
         if resp.status_code == 403:
             logger.debug("[S3] bucket %s existe (403 Forbidden) — não é takeover", bucket_name)
             return True
         return False
     except Exception:
-        return True  # na dúvida, assume que existe (conservador)
+        return True
 
 
 def _takeover_fingerprint_worker(
@@ -783,15 +707,10 @@ def _takeover_fingerprint_worker(
 ) -> Optional[dict]:
     """
     MELHORIA [PRE-1] — Pré-filtro por CNAME antes da requisição HTTP
-    Por quê: verificar fingerprint HTTP em 500+ URLs sem CNAME externo é
-    desperdício de tempo e gera requisições desnecessárias. Filtrar por CNAME
-    primeiro reduz em ~80% as requisições HTTP de fingerprint em programas grandes.
-
     MELHORIA [PRE-2] — Verificação de bucket S3 antes de confirmar
     MELHORIA [PRE-3] — Retorna dict com severidade para deduplicação enriquecida
     """
-    # Normaliza hostname para lookup no cname_map
-    hostname = re.sub(r'^https?://', '', url).split('/')[0].split(':')[0]
+    hostname  = re.sub(r'^https?://', '', url).split('/')[0].split(':')[0]
     cname_val = cname_map.get(hostname, "")
 
     try:
@@ -802,17 +721,15 @@ def _takeover_fingerprint_worker(
         body = result.stdout
 
         for fp in TAKEOVER_FINGERPRINTS:
-            # [PRE-1] Se existe padrão de CNAME definido, verifica antes do HTTP
             cname_pattern = fp.get("cname", "")
             if cname_pattern and cname_val:
                 if not re.search(cname_pattern, cname_val, re.IGNORECASE):
-                    continue  # CNAME não bate — pula sem fazer HTTP
+                    continue
 
             if fp["fingerprint"].lower() in body.lower():
                 service  = fp["service"]
                 severity = fp.get("severity", "medium")
 
-                # [PRE-2] S3: confirma que bucket realmente não existe
                 if "s3" in service.lower() and _s3_bucket_exists(url, logging.getLogger("takeover")):
                     logging.getLogger("takeover").debug(
                         "[PRE-2] %s → S3 fingerprint mas bucket existe — descartado", url
@@ -869,11 +786,6 @@ def check_dangling_cnames(
 ) -> list[dict]:
     """
     MELHORIA [COB-1] — Detecção de CNAMEs pendentes (dangling CNAMEs)
-    Por quê: subdomínios que apontam via CNAME para um hostname que não resolve
-    (NXDOMAIN) são vulneráveis a takeover via registro do hostname externo.
-    Esta verificação pega casos que subzy/subjack podem perder porque o host
-    sequer responde HTTP — só existe o CNAME no DNS.
-    Retorna lista de CNAMEs que não resolvem (possível takeover de DNS).
     """
     banner("Dangling CNAME Check", logger)
     dangling: list[dict] = []
@@ -882,18 +794,16 @@ def check_dangling_cnames(
         logger.info("dnsx não disponível para checar dangling CNAMEs.")
         return dangling
 
-    # Coleta CNAMEs que apontam para fora do domínio alvo
     external_cnames = {
         sub: cname
         for sub, cname in cname_map.items()
-        if domain not in cname  # aponta para domínio externo
+        if domain not in cname
     }
 
     if not external_cnames:
         logger.info("Nenhum CNAME externo para verificar.")
         return dangling
 
-    # Verifica se o destino do CNAME resolve
     cname_targets = list(set(external_cnames.values()))
     target_file   = base / "_cname_targets.txt"
     write_lines(target_file, cname_targets, logger)
@@ -908,7 +818,6 @@ def check_dangling_cnames(
     for sub, cname in external_cnames.items():
         cname_stripped = cname.rstrip(".")
         if cname_stripped not in resolved_cnames:
-            # Verifica padrão de serviço conhecido
             service = "Desconhecido"
             for pattern, svc_name in SUSPICIOUS_CNAME_PATTERNS:
                 if re.search(pattern, cname, re.IGNORECASE):
@@ -948,15 +857,14 @@ def _collect_suspicious_cnames(
 ) -> list[dict]:
     """
     [REL-3] Coleta CNAMEs suspeitos (externos mas sem fingerprint confirmado)
-    para seção dedicada no relatório HTML.
     """
     suspicious: list[dict] = []
     for sub, cname in cname_map.items():
         if domain in cname:
-            continue  # CNAME interno, não suspeito
+            continue
         url_key = f"http://{sub}"
         if url_key in confirmed_urls:
-            continue  # já está em takeovers confirmados
+            continue
         for pattern, svc_name in SUSPICIOUS_CNAME_PATTERNS:
             if re.search(pattern, cname, re.IGNORECASE):
                 suspicious.append({
@@ -986,7 +894,6 @@ def run_subzy(domains: list[str], base: Path, logger: logging.Logger) -> list[di
         logger.warning("[subzy] %d vulneráveis encontrados", len(hits))
     else:
         logger.info("[subzy] nenhum takeover encontrado.")
-    # Normaliza para dict com severidade
     return [{"url": h, "source": "subzy", "detail": "", "severity": "high", "cname": ""} for h in hits]
 
 
@@ -1055,6 +962,11 @@ def run_all_nuclei(
     args: argparse.Namespace,
     logger: logging.Logger,
 ) -> list[dict]:
+    """
+    Roda nuclei com TODOS os templates em /root/nuclei-templates/ (full scan).
+    Severity padrão: low,medium,high,critical (sobrescrito por --severity).
+    Templates extras em --nuclei-extra são rodados adicionalmente.
+    """
     if not tool_available("nuclei"):
         logger.info("nuclei não encontrado — pulando todos os scans nuclei.")
         return []
@@ -1063,47 +975,47 @@ def run_all_nuclei(
 
     check_tool_version("nuclei", logger)
 
-    severity_flag = ["-severity", args.severity] if getattr(args, "severity", None) else []
+    # Severity: usa argumento se fornecido, senão o padrão definido acima
+    severity_str  = getattr(args, "severity", None) or NUCLEI_DEFAULT_SEVERITY
+    severity_flag = ["-severity", severity_str]
+
     takeover_hits: list[dict] = []
-
     main_templates = Path(args.nuclei_templates or DEFAULT_NUCLEI_TEMPLATES)
-    takeover_dir   = main_templates / "http" / "takeovers"
-    hits = _nuclei_run_dir(
-        label         = "takeovers",
-        template_dir  = takeover_dir,
-        alive_file    = alive_file,
-        output_file   = base / "nuclei_takeovers.txt",
-        severity_flag = severity_flag,
-        logger        = logger,
-    )
-    takeover_hits.extend([
-        {"url": h, "source": "nuclei", "detail": "", "severity": "high", "cname": ""}
-        for h in hits
-    ])
 
-    if not getattr(args, "no_network", False):
-        _nuclei_run_dir(
-            label         = "network",
-            template_dir  = main_templates / "network",
-            alive_file    = alive_file,
-            output_file   = base / "nuclei_network.txt",
-            severity_flag = severity_flag,
-            logger        = logger,
-            timeout       = 900,
+    # ── Full scan: todos os templates do repositório principal ────────────────
+    banner("Nuclei [full]  →  " + str(main_templates), logger)
+    if not main_templates.exists():
+        logger.warning("[nuclei/full] diretório não encontrado: %s", main_templates)
+    else:
+        full_output = base / "nuclei_full.txt"
+        run_cmd(
+            [
+                "nuclei",
+                "-l",        str(alive_file),
+                "-t",        str(main_templates),
+                "-silent",
+                "-o",        str(full_output),
+                "-timeout",  "10",
+            ] + severity_flag,
+            logger,
+            timeout=7200,  # 2h — full scan pode demorar bastante
         )
+        hits = read_lines(full_output)
+        if hits:
+            logger.warning("[nuclei/full] %d achados → %s", len(hits), full_output)
+            takeover_hits.extend([
+                {"url": h, "source": "nuclei/full", "detail": "", "severity": "high", "cname": ""}
+                for h in hits
+            ])
+        else:
+            logger.info("[nuclei/full] nenhum achado.")
+            if full_output.exists():
+                full_output.unlink()
 
-    if not getattr(args, "no_http", False):
-        _nuclei_run_dir(
-            label         = "http",
-            template_dir  = main_templates / "http",
-            alive_file    = alive_file,
-            output_file   = base / "nuclei_http.txt",
-            severity_flag = severity_flag,
-            logger        = logger,
-            timeout       = 1800,
-        )
+    # ── Templates extras: /home/guigavicentin/rxerium-templates/ e --nuclei-extra ──
+    extra_paths: list[str] = list(getattr(args, "nuclei_extra", []) or [])
 
-    for extra_path in getattr(args, "nuclei_extra", []) or []:
+    for extra_path in extra_paths:
         extra_dir = Path(extra_path)
         if not extra_dir.exists():
             logger.warning("[nuclei/extra] path não encontrado: %s", extra_dir)
@@ -1121,10 +1033,10 @@ def run_all_nuclei(
             output_file   = output_file,
             severity_flag = severity_flag,
             logger        = logger,
-            timeout       = 900,
+            timeout       = 1800,
         )
         takeover_hits.extend([
-            {"url": h, "source": "nuclei/extra", "detail": "", "severity": "high", "cname": ""}
+            {"url": h, "source": f"nuclei/extra/{extra_dir.name}", "detail": "", "severity": "high", "cname": ""}
             for h in hits
         ])
 
@@ -1142,10 +1054,6 @@ def detect_takeovers(
     """
     Retorna (takeovers_confirmados, dangling_cnames).
     MELHORIA [PRE-3] — Deduplicação por (url_normalizada + serviço)
-    Por quê: a mesma URL pode ser reportada por fingerprint E por subzy.
-    Deduplicar só por URL perde a informação de qual ferramenta confirmou.
-    Deduplicar por (url+serviço) mantém fontes distintas mas evita duplicatas
-    redundantes do mesmo par, melhorando precisão na triagem.
     """
     banner("Takeover Detection", logger)
     all_findings: list[dict] = []
@@ -1166,12 +1074,12 @@ def detect_takeovers(
     subjack_hits = run_subjack(alive_domains, base, logger)
     all_findings.extend(subjack_hits)
 
-    # nuclei
-    alive_file   = base / "alive.txt"
-    nuclei_hits  = run_all_nuclei(alive_file, base, args, logger)
+    # nuclei (full + extras)
+    alive_file  = base / "alive.txt"
+    nuclei_hits = run_all_nuclei(alive_file, base, args, logger)
     all_findings.extend(nuclei_hits)
 
-    # [PRE-3] Deduplicação por (url_normalizada + serviço)
+    # [PRE-3] Deduplicação por (url_normalizada + source)
     seen: set[tuple[str, str]] = set()
     deduped: list[dict] = []
     for f in all_findings:
@@ -1206,7 +1114,7 @@ def detect_takeovers(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Etapa 8: Nmap
+# Etapa 7: Nmap
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_ips(httpx_jsonl: Path, logger: logging.Logger) -> list[str]:
@@ -1255,14 +1163,15 @@ def run_nmap(base: Path, logger: logging.Logger, timeout: int = 3600) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Etapa 9: Relatório HTML + JSON estruturado
+# Etapa 8: Relatório HTML + JSON estruturado
 # ─────────────────────────────────────────────────────────────────────────────
 
 SEVERITY_COLOR = {
-    "high":   "#f85149",
-    "medium": "#d29922",
-    "low":    "#3fb950",
-    "":       "#8b949e",
+    "high":     "#f85149",
+    "medium":   "#d29922",
+    "low":      "#3fb950",
+    "critical": "#ff6e6e",
+    "":         "#8b949e",
 }
 
 
@@ -1283,10 +1192,9 @@ def generate_html_report(
     """
     banner("Relatório HTML + JSON", logger)
 
-    alive_urls      = read_lines(base / "alive.txt")
-    screenshots_dir = base / "screenshots"
+    alive_urls = read_lines(base / "alive.txt")
 
-    # [REL-2] JSON estruturado — machine-readable para importar em Burp/JIRA/etc
+    # [REL-2] JSON estruturado
     report_json = {
         "domain":      domain,
         "generated":   datetime.now().isoformat(),
@@ -1300,8 +1208,8 @@ def generate_html_report(
     json_file.write_text(json.dumps(report_json, indent=2, ensure_ascii=False), encoding="utf-8")
     logger.info("JSON estruturado → %s", json_file)
 
-    # [REL-3] CNAMEs suspeitos (externos, sem fingerprint confirmado)
-    confirmed_urls  = {f["url"] for f in takeovers}
+    # [REL-3] CNAMEs suspeitos
+    confirmed_urls    = {f["url"] for f in takeovers}
     suspicious_cnames = _collect_suspicious_cnames(cname_map, domain, confirmed_urls)
 
     # ── Blocos HTML ──────────────────────────────────────────────────────────
@@ -1310,7 +1218,7 @@ def generate_html_report(
         sev   = f.get("severity", "")
         color = SEVERITY_COLOR.get(sev, SEVERITY_COLOR[""])
         cname_disp = f.get("cname") or "—"
-        cvss_hint  = {"high": "7.5–9.8", "medium": "4.0–6.9", "low": "1.0–3.9"}.get(sev, "—")
+        cvss_hint  = {"critical": "9.0–10.0", "high": "7.5–8.9", "medium": "4.0–6.9", "low": "1.0–3.9"}.get(sev, "—")
         return (
             f"<tr class='vuln'>"
             f"<td><a href='{f['url']}' target='_blank'>{f['url']}</a></td>"
@@ -1350,13 +1258,6 @@ def generate_html_report(
     for url in alive_urls[:500]:
         waf = waf_map.get(url, "—")
         waf_color = "#f85149" if waf != "—" else "#8b949e"
-        screenshot_file = screenshots_dir / f"{re.sub(r'[^\w]', '_', url)}.png"
-        screenshot_html = (
-            f'<a href="screenshots/{screenshot_file.name}" target="_blank">'
-            f'<img src="screenshots/{screenshot_file.name}" width="120" loading="lazy"></a>'
-            if screenshot_file.exists() else "—"
-        )
-        # Destaca se tem CNAME externo suspeito
         hostname  = re.sub(r'^https?://', '', url).split('/')[0].split(':')[0]
         cname_val = cname_map.get(hostname, "")
         cname_flag = ""
@@ -1369,7 +1270,6 @@ def generate_html_report(
             f"<tr>"
             f"<td><a href='{url}' target='_blank'>{url}</a>{cname_flag}</td>"
             f"<td style='color:{waf_color}'>{waf}</td>"
-            f"<td>{screenshot_html}</td>"
             "</tr>\n"
         )
 
@@ -1405,21 +1305,12 @@ def generate_html_report(
   tr.warn td {{ background: rgba(210,153,34,.07); }}
   a {{ color: var(--accent); text-decoration: none; }}
   a:hover {{ text-decoration: underline; }}
-  img {{ border-radius: 4px; border: 1px solid var(--border); }}
-  /* [REL-1] Filtro JS */
   .filter-bar {{ margin: .6rem 0; }}
   .filter-bar input {{
     background: var(--surface); border: 1px solid var(--border);
     color: var(--text); padding: .4rem .8rem; border-radius: 4px;
     font-family: var(--font); font-size: .85rem; width: 320px;
   }}
-  .badge {{
-    display:inline-block; border-radius: 3px; padding: 1px 6px;
-    font-size:.75rem; font-weight:bold;
-  }}
-  .badge-high   {{ background:#f8514933; color:#f85149; }}
-  .badge-medium {{ background:#d2992233; color:#d29922; }}
-  .badge-low    {{ background:#3fb95033; color:#3fb950; }}
 </style>
 </head>
 <body>
@@ -1466,7 +1357,7 @@ def generate_html_report(
   <input id="filter-hosts" type="text" placeholder="Filtrar hosts…" oninput="filterTable(this,'tbl-hosts')">
 </div>
 <table id="tbl-hosts">
-  <tr><th>URL</th><th>WAF</th><th>Screenshot</th></tr>
+  <tr><th>URL</th><th>WAF</th></tr>
   {host_rows}
 </table>
 
@@ -1492,7 +1383,6 @@ function filterTable(input, tableId) {{
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_domain(domain: str, args: argparse.Namespace, logger: logging.Logger) -> None:
-    # Injeta domain no args para acesso em subfunções (ex: dangling CNAME check)
     args.domain = domain
     base = Path(domain)
     base.mkdir(exist_ok=True)
@@ -1533,22 +1423,18 @@ def process_domain(domain: str, args: argparse.Namespace, logger: logging.Logger
     else:
         stats["wafs"] = 0
 
-    # 6. Screenshots
-    if not args.no_screenshots:
-        take_screenshots(alive_urls, base, logger)
-
-    # 7. Takeover (inclui dangling CNAME check)
+    # 6. Takeover (inclui dangling CNAME check + nuclei full + extras)
     takeovers, dangling = detect_takeovers(
         alive_urls, alive_domains, cname_map, base, args, logger,
     )
     stats["takeovers"] = len(takeovers)
     stats["dangling"]  = len(dangling)
 
-    # 8. Nmap
+    # 7. Nmap
     if not args.no_nmap:
-        run_nmap(base, logger, timeout=args.nmap_timeout)
+        run_nmap(base, logger)
 
-    # 9. Relatório HTML + JSON
+    # 8. Relatório HTML + JSON
     generate_html_report(domain, base, stats, takeovers, dangling, waf_map, cname_map, logger)
 
     # Sumário no terminal
@@ -1580,6 +1466,11 @@ Variáveis de ambiente opcionais:
   NUCLEI_TEMPLATES     Path dos templates nuclei  (padrão: /root/nuclei-templates)
   RESOLVERS_FILE       Path do arquivo de resolvers DNS
   SUBDOMAINS_WORDLIST  Wordlist para bruteforce puredns
+
+Nuclei:
+  Por padrão roda FULL SCAN em /root/nuclei-templates/ com severity low,medium,high,critical.
+  Templates personalizados em /home/guigavicentin/rxerium-templates/ podem ser adicionados via --nuclei-extra.
+  Use --severity para sobrescrever o filtro de severidade.
 """,
     )
     p.add_argument("domain",              nargs="?",           help="Domínio alvo")
@@ -1587,19 +1478,16 @@ Variáveis de ambiente opcionais:
     p.add_argument("--nuclei-templates",  default=None,
                    help=f"Path do repositório principal de templates nuclei (padrão: {DEFAULT_NUCLEI_TEMPLATES})")
     p.add_argument("--nuclei-extra",      action="append", metavar="PATH", default=[],
-                   help="Diretório extra de templates nuclei — pode ser usado várias vezes.")
+                   help="Diretório extra de templates nuclei (ex: /home/guigavicentin/rxerium-templates/) — pode ser usado várias vezes.")
     p.add_argument("--resolvers",         default=None,        help="Path do arquivo resolvers.txt")
     p.add_argument("--wordlist",          default=None,        help="Wordlist para puredns bruteforce")
-    p.add_argument("--severity",          default=None,        help="Filtro de severity no nuclei (ex: critical,high)")
-    p.add_argument("--nmap-timeout",      type=int, default=3600, help="Timeout do nmap em segundos")
+    p.add_argument("--severity",          default=None,
+                   help=f"Filtro de severity no nuclei (padrão: {NUCLEI_DEFAULT_SEVERITY})")
     # [RES-3] Timeouts granulares por ferramenta
     p.add_argument("--httpx-timeout",     type=int, default=10,  help="Timeout por request httpx (s)")
     p.add_argument("--httpx-rate",        type=int, default=150, help="Rate limit httpx (req/s)")
     p.add_argument("--no-nmap",           action="store_true",   help="Pula nmap")
-    p.add_argument("--no-network",        action="store_true",   help="Pula nuclei/network")
-    p.add_argument("--no-http",           action="store_true",   help="Pula nuclei/http")
     p.add_argument("--no-waf",            action="store_true",   help="Pula WAF detection")
-    p.add_argument("--no-screenshots",    action="store_true",   help="Pula gowitness")
     p.add_argument("--no-bruteforce",     action="store_true",   help="Pula puredns bruteforce")
     return p.parse_args()
 
