@@ -451,7 +451,7 @@ def _fetch_wayback_api(domain: str, logger: logging.Logger) -> set[str]:
         "filter":   "statuscode:200",
     }
     try:
-        resp = requests.get(base_url, params=params, timeout=600,
+        resp = requests.get(base_url, params=params, timeout=900,
                             headers={"User-Agent": "Mozilla/5.0 recon"})
         if resp.status_code == 200:
             for line in resp.text.splitlines():
@@ -515,7 +515,7 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
             "gau", "--threads", "5", "--subs",
             "--providers", "wayback,commoncrawl,otx,urlscan",
             "--retries", "2", "--timeout", "50", domain
-        ], logger, timeout=600)
+        ], logger, timeout=900)
         all_urls.update(lines)
         logger.info("[gau] %d URLs", len(lines))
     else:
@@ -527,7 +527,7 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
         lines = run_cmd(
             ["waybackurls", domain],
             logger,
-            timeout=600,
+            timeout=900,
         )
         all_urls.update(lines)
         logger.info("[waybackurls] %d URLs", len(lines))
@@ -561,7 +561,7 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
             "-kf", "-jc",
             "-ef", "woff,css,png,svg,jpg,woff2,jpeg,gif,ico,ttf",
             "-silent",
-        ], logger, timeout=600)
+        ], logger, timeout=900)
         all_urls.update(lines)
         logger.info("[katana] %d URLs", len(lines))
     else:
@@ -574,7 +574,7 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
             ["hakrawler", "-d", "3", "-u", "-subs", "-t", "8", "-insecure"],
             logger,
             stdin=f"https://{domain}\n",
-            timeout=600,
+            timeout=900,
         )
         all_urls.update(lines)
         logger.info("[hakrawler] %d URLs", len(lines))
