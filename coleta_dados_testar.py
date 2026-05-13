@@ -643,7 +643,7 @@ def _fetch_wayback_api(domain: str, logger: logging.Logger) -> set[str]:
         "filter":   "statuscode:200",
     }
     try:
-        resp = requests.get(base_url, params=params, timeout=120,
+        resp = requests.get(base_url, params=params, timeout=900,
                             headers={"User-Agent": "Mozilla/5.0 recon"})
         if resp.status_code == 200:
             for line in resp.text.splitlines():
@@ -664,7 +664,7 @@ def _fetch_commoncrawl_api(domain: str, logger: logging.Logger) -> set[str]:
     try:
         idx_resp = requests.get(
             "https://index.commoncrawl.org/collinfo.json",
-            timeout=30, headers={"User-Agent": "Mozilla/5.0 recon"},
+            timeout=90, headers={"User-Agent": "Mozilla/5.0 recon"},
         )
         if idx_resp.status_code != 200:
             return urls
@@ -680,7 +680,7 @@ def _fetch_commoncrawl_api(domain: str, logger: logging.Logger) -> set[str]:
                 api_url,
                 params={"url": f"*.{domain}", "output": "text",
                         "fl": "url", "collapse": "urlkey", "limit": "50000"},
-                timeout=60, headers={"User-Agent": "Mozilla/5.0 recon"},
+                timeout=90, headers={"User-Agent": "Mozilla/5.0 recon"},
             )
             if resp.status_code == 200:
                 for line in resp.text.splitlines():
@@ -706,8 +706,8 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
         lines = run_cmd([
             "gau", "--threads", "5", "--subs",
             "--providers", "wayback,commoncrawl,otx,urlscan",
-            "--retries", "2", "--timeout", "50", domain
-        ], logger, timeout=600)
+            "--retries", "2", "--timeout", "90", domain
+        ], logger, timeout=900)
         all_urls.update(lines)
         logger.info("[gau] %d URLs", len(lines))
     else:
@@ -716,7 +716,7 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
     # ── waybackurls ───────────────────────────────────────────
     if tool_available("waybackurls"):
         logger.info("[waybackurls] coletando… (domínio: %s)", domain)
-        lines = run_cmd(["waybackurls", domain], logger, timeout=300)
+        lines = run_cmd(["waybackurls", domain], logger, timeout=900)
         all_urls.update(lines)
         logger.info("[waybackurls] %d URLs", len(lines))
     else:
@@ -749,7 +749,7 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
             "-kf", "-jc",
             "-ef", "woff,css,png,svg,jpg,woff2,jpeg,gif,ico,ttf",
             "-silent",
-        ], logger, timeout=600)
+        ], logger, timeout=900)
         all_urls.update(lines)
         logger.info("[katana] %d URLs", len(lines))
     else:
@@ -762,7 +762,7 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
             ["hakrawler", "-d", "3", "-u", "-subs", "-t", "8", "-insecure"],
             logger,
             stdin=f"https://{domain}\n",
-            timeout=300,
+            timeout=600,
         )
         all_urls.update(lines)
         logger.info("[hakrawler] %d URLs", len(lines))
