@@ -8,8 +8,8 @@
 
 | Script | Foco | Entrada |
 |---|---|---|
-| `recon.py` | Coleta de URLs, análise de JS e busca de segredos | domínio interativo ou argumento |
-| `takeover.py` | Enumeração de subdomínios, takeover e port scan | domínio ou lista `-l` |
+| `Recon.py` | Coleta de URLs, análise de JS e busca de segredos | domínio interativo ou argumento |
+| `Scan.py` | Enumeração de subdomínios, takeover, nuclei, Port Scan | domínio ou lista `-l` |
 
 ---
 
