@@ -509,30 +509,30 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
     all_urls: set[str] = set()
 
     # ── gau ──────────────────────────────────────────────────
-if tool_available("gau"):
-    logger.info("[gau] coletando… (domínio: %s)", domain)
-    lines = run_cmd([
-        "gau", "--threads", "5", "--subs",
-        "--providers", "wayback,commoncrawl,otx,urlscan",
-        "--retries", "2", "--timeout", "50", domain
-    ], logger, timeout=600)
-    all_urls.update(lines)
-    logger.info("[gau] %d URLs", len(lines))
-else:
-    logger.warning("gau não encontrado — pulando.")
+    if tool_available("gau"):
+        logger.info("[gau] coletando… (domínio: %s)", domain)
+        lines = run_cmd([
+            "gau", "--threads", "5", "--subs",
+            "--providers", "wayback,commoncrawl,otx,urlscan",
+            "--retries", "2", "--timeout", "50", domain
+        ], logger, timeout=600)
+        all_urls.update(lines)
+        logger.info("[gau] %d URLs", len(lines))
+    else:
+        logger.warning("gau não encontrado — pulando.")
 
     # ── waybackurls ───────────────────────────────────────────
-if tool_available("waybackurls"):
-    logger.info("[waybackurls] coletando… (domínio: %s)", domain)
-    lines = run_cmd(
-        ["waybackurls", domain],
-        logger,
-        timeout=300
-    )
-    all_urls.update(lines)
-    logger.info("[waybackurls] %d URLs", len(lines))
-else:
-    logger.warning("waybackurls não encontrado — pulando.")
+    if tool_available("waybackurls"):
+        logger.info("[waybackurls] coletando… (domínio: %s)", domain)
+        lines = run_cmd(
+            ["waybackurls", domain],
+            logger,
+            timeout=300,
+        )
+        all_urls.update(lines)
+        logger.info("[waybackurls] %d URLs", len(lines))
+    else:
+        logger.warning("waybackurls não encontrado — pulando.")
 
     # ── Wayback Machine API direta ────────────────────────────
     logger.info("[wayback-api] consultando CDX API…")
@@ -605,7 +605,6 @@ else:
                     gospider_lines.append(line)
             finally:
                 proc.wait()
-
             logger.info("[gospider] %d linhas processadas", len(gospider_lines))
         except Exception as exc:
             logger.error("[gospider] erro: %s", exc)
