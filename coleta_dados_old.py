@@ -2,52 +2,64 @@
 """
 recon.py — Script de reconhecimento web passivo/ativo focado em JS.
 
-Fluxo:
-  1. Coleta de URLs  (gau + waybackurls + katana + hakrawler + subfinder + gospider)
-  2. Validação de URLs ativas com httpx
-  3. Filtragem com GF  (xss, sqli, ssrf, redirect, ssti)
-  4. Download e análise de arquivos sensíveis por extensão
-  5. Coleta de URLs de JS  (filtro inteligente, sem CDNs)
-  6. Análise de segredos em JS  (padrões de alta precisão + detecção de ofuscação)
-  7. Validação de Google API Keys
-  8. Extração de endpoints de API expostos em JS
-  9. Probe de XSS (dalfox) e SSRF/redirect (qsreplace)
- 10. Relatório consolidado
-
-Filosofia de saída:
-  - Nenhum arquivo é criado se estiver vazio.
-  - Sem estrutura de diretórios pré-criada; pastas são geradas sob demanda.
-  - Apenas achados reais são persistidos.
+Correções de memória aplicadas (v2):
+  [MEM-1] Sets globais com teto máximo (MAX_URLS_IN_MEMORY / MAX_SECRETS_SEEN)
+  [MEM-2] resp.text com verificação de Content-Length + leitura em stream com limite de bytes
+  [MEM-3] ThreadPoolExecutor com processamento em chunks + gc.collect() periódico
+  [MEM-4] Cache de JS em disco com limite de entradas (LRU por mtime)
+  [MEM-5] analyze_inline_scripts: concorrência reduzida + batch sequencial
+  [MEM-6] sourcesContent processado item a item (sem manter lista completa em RAM)
+  [MEM-7] all_urls coletado e descarregado em disco antes do próximo estágio
 """
 
 from __future__ import annotations
 
 import argparse
+import base64 as _b64
+import collections
 import csv
+import gc
+import hashlib
 import json
+import logging
+import math
+import re
 import shutil
 import subprocess
-import re
-import math
-import collections
-import logging
 import sys
 import threading
-import urllib3
 import time
-from pathlib import Path
+import urllib.parse
+import urllib3
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Iterator
 
 import requests
 from tenacity import (
+    before_sleep_log,
     retry,
+    retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
-    retry_if_exception_type,
-    before_sleep_log,
 )
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [MEM-1] Tetos de memória para estruturas globais
+# ─────────────────────────────────────────────────────────────────────────────
+
+MAX_URLS_IN_MEMORY   = 500_000   # URLs no set all_urls antes de flush para disco
+MAX_SECRETS_SEEN     = 50_000    # entradas no set _seen_secrets
+MAX_JS_ANALYZED      = 100_000   # URLs no set _analyzed_js_urls
+MAX_JS_CONTENT_BYTES = 5_000_000 # 5 MB por arquivo JS/HTML
+MAX_HTML_CONTENT_BYTES = 3_000_000 # 3 MB por página HTML (inline scripts)
+
+# [MEM-4] Cache de JS em disco
+_JS_CACHE_VERSION  = "v2"
+_JS_CACHE_TTL      = 86400   # 24h em segundos
+_JS_CACHE_MAX      = 2000    # máximo de entradas no cache
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constantes de qualidade
@@ -86,9 +98,64 @@ _CDN_DOMAINS_RE = re.compile(
     re.I,
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers de regex
-# ─────────────────────────────────────────────────────────────────────────────
+SECRET_SEVERITY: dict[str, str] = {
+    "aws_access_key":        "CRITICAL",
+    "private_key":           "CRITICAL",
+    "stripe_secret":         "CRITICAL",
+    "braintree_token":       "CRITICAL",
+    "gcp_service_account":   "CRITICAL",
+    "hashicorp_vault":       "CRITICAL",
+    "azure_storage_key":     "CRITICAL",
+    "github_pat":            "HIGH",
+    "github_oauth":          "HIGH",
+    "gitlab_pat":            "HIGH",
+    "openai_key":            "HIGH",
+    "sendgrid_key":          "HIGH",
+    "slack_token":           "HIGH",
+    "supabase_service_role": "HIGH",
+    "mongodb_dsn":           "HIGH",
+    "postgres_dsn":          "HIGH",
+    "mysql_dsn":             "HIGH",
+    "google_api_key":        "HIGH",
+    "firebase_url":          "HIGH",
+    "twilio_auth_token":     "HIGH",
+    "jwt":                   "MEDIUM",
+    "stripe_publishable":    "MEDIUM",
+    "slack_webhook":         "MEDIUM",
+    "sentry_dsn":            "MEDIUM",
+    "mapbox_token":          "MEDIUM",
+    "supabase_anon_key":     "MEDIUM",
+    "mailgun_api_key":       "MEDIUM",
+    "generic_api_key":       "LOW",
+    "generic_token":         "LOW",
+    "generic_secret":        "LOW",
+    "bearer_token":          "LOW",
+    "password_field":        "LOW",
+    "bcrypt_hash":           "LOW",
+}
+
+_SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
+
+
+def get_severity(secret_type: str) -> str:
+    return SECRET_SEVERITY.get(secret_type, "UNKNOWN")
+
+
+_CASE_SENSITIVE_TYPES = frozenset({
+    "aws_access_key", "github_pat", "github_oauth", "gitlab_pat",
+    "npm_token", "stripe_secret", "stripe_publishable", "openai_key",
+    "jwt", "bcrypt_hash", "private_key", "supabase_anon_key",
+})
+
+
+def _normalize_secret_value(type_name: str, value: str) -> str:
+    v = value.strip().strip("'\"`")
+    if type_name not in _CASE_SENSITIVE_TYPES:
+        v = v.lower()
+    if "://" in v:
+        v = v.split("?")[0].rstrip("/")
+    return v
+
 
 def _regex(pattern: str, flags: int = 0) -> re.Pattern:
     return re.compile(pattern, flags)
@@ -120,9 +187,27 @@ def is_likely_real_credential(raw_match: str, context_line: str = "") -> bool:
     return True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Detector de strings ofuscadas via char-code arrays
-# ─────────────────────────────────────────────────────────────────────────────
+def _is_real_jwt(token: str) -> bool:
+    parts = token.split(".")
+    if len(parts) != 3:
+        return False
+    for part in parts[:2]:
+        padded = part + "=" * (-len(part) % 4)
+        try:
+            obj = json.loads(_b64.urlsafe_b64decode(padded))
+            if not isinstance(obj, dict):
+                return False
+        except Exception:
+            return False
+    try:
+        header_raw  = parts[0] + "=" * (-len(parts[0]) % 4)
+        header_dict = json.loads(_b64.urlsafe_b64decode(header_raw))
+        if "alg" not in header_dict:
+            return False
+    except Exception:
+        return False
+    return True
+
 
 _CHARCODE_ARRAY_RE = re.compile(r'\[\s*(\d{2,3}(?:\s*,\s*\d{2,3}){5,})\s*\]')
 
@@ -226,6 +311,7 @@ def get_config(domain: str) -> dict:
         "sensitive_report":    base / "sensitive_report.txt",
         "api_endpoints_file":  base / "api_endpoints.txt",
         "summary_file":        base / "SUMMARY.txt",
+        "summary_html":        base / "SUMMARY.html",
 
         "gf_patterns": ["xss", "sqli", "ssrf", "redirect", "ssti"],
 
@@ -235,35 +321,26 @@ def get_config(domain: str) -> dict:
         ),
 
         "secret_patterns": {
-            # Google / Firebase / GCP
             "google_api_key":       _regex(r'AIza[0-9A-Za-z\-_]{35}'),
             "google_oauth_client":  _regex(r'[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com'),
             "firebase_url":         _regex(r'https?://[a-z0-9\-]+\.firebaseio\.com', re.I),
             "gcp_service_account":  _regex(r'"type"\s*:\s*"service_account"'),
-
-            # AWS / Cloud
             "aws_access_key":       _regex(r'AKIA[0-9A-Z]{16}'),
             "amazon_mws":           _regex(r'amzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'),
             "azure_storage_key":    _regex(r'DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[A-Za-z0-9+/=]{88}'),
             "digitalocean_token":   _regex(r'dop_v1_[a-f0-9]{64}'),
             "terraform_cloud":      _regex(r'[a-zA-Z0-9]{14}\.atlasv1\.[a-zA-Z0-9\-_=]{60,}'),
-
-            # Pagamento
             "stripe_secret":        _regex(r'sk_live_[0-9a-zA-Z]{24,}'),
             "stripe_publishable":   _regex(r'pk_live_[0-9a-zA-Z]{24,}'),
             "stripe_webhook":       _regex(r'whsec_[a-zA-Z0-9]{32,}'),
             "square_access_token":  _regex(r'sq0atp-[0-9A-Za-z\-_]{22}'),
             "square_oauth_secret":  _regex(r'sq0csp-[0-9A-Za-z\-_]{43}'),
             "braintree_token":      _regex(r'access_token\$production\$[a-z0-9]{16}\$[a-f0-9]{32}'),
-
-            # Comunicação
             "sendgrid_key":         _regex(r'SG\.[a-zA-Z0-9]{22}\.[a-zA-Z0-9]{43}'),
             "mailgun_api_key":      _regex(r'key-[0-9a-zA-Z]{32}'),
             "mailchimp_api_key":    _regex(r'[0-9a-f]{32}-us[0-9]{1,2}'),
             "twilio_account_sid":   _regex(r'\bAC[a-z0-9]{32}\b'),
             "twilio_auth_token":    _regex(r'\bSK[a-z0-9]{32}\b'),
-
-            # DevOps / CI
             "github_pat":           _regex(r'gh[pousr]_[A-Za-z0-9]{36}'),
             "github_oauth":         _regex(r'gho_[A-Za-z0-9]{36}'),
             "gitlab_pat":           _regex(r'glpat-[A-Za-z0-9\-_]{20}'),
@@ -275,40 +352,24 @@ def get_config(domain: str) -> dict:
             "new_relic_key":        _regex(r'NRAK-[A-Z0-9]{27}'),
             "sentry_dsn":           _regex(r'https://[a-f0-9]{32}@[a-z0-9]+\.ingest\.sentry\.io/[0-9]+'),
             "grafana_token":        _regex(r'glc_[A-Za-z0-9+/]{32,}'),
-
-            # OpenAI / Slack
             "openai_key":           _regex(r'sk-[a-zA-Z0-9]{48}'),
             "slack_token":          _regex(r'xox[baprs]-[0-9a-zA-Z\-]{10,48}'),
             "slack_webhook":        _regex(r'https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+'),
-
-            # DB / Connection strings
             "mongodb_dsn":          _regex(r'mongodb(?:\+srv)?://[^:\s]+:[^@\s]+@[^\s"\'`]+', re.I),
             "postgres_dsn":         _regex(r'postgres(?:ql)?://[^:\s]+:[^@\s]+@[^\s"\'`]+', re.I),
             "mysql_dsn":            _regex(r'mysql://[^:\s]+:[^@\s]+@[^\s"\'`]+', re.I),
             "redis_dsn":            _regex(r'redis://:([^@\s]+)@[^\s"\'`]+', re.I),
-
-            # Misc
             "shopify_token":        _regex(r'shp(?:at|ss)_[a-fA-F0-9]{32}'),
             "mapbox_token":         _regex(r'pk\.eyJ1[A-Za-z0-9._\-]{20,}'),
             "notion_token":         _regex(r'secret_[A-Za-z0-9]{43}'),
             "linear_api_key":       _regex(r'lin_api_[A-Za-z0-9]{40}'),
-
-            # Supabase
             "supabase_url":          _regex(r'https://[a-z0-9]{20}\.supabase\.co', re.I),
             "supabase_anon_key":     _regex(r'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[A-Za-z0-9_\-]{50,}\.[A-Za-z0-9_\-]{43}'),
             "supabase_service_role": _regex(r'(?:SUPABASE_SERVICE_ROLE_KEY|service_role)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-\.]{100,})["\']', re.I),
             "supabase_env":          _regex(r'SUPABASE_(?:URL|ANON_KEY|SERVICE_ROLE_KEY)\s*[=:]\s*\S+', re.I),
-
-            # Chaves privadas
             "private_key":          _regex(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
-
-            # JWT
             "jwt":                  _regex(r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}'),
-
-            # Hashes
             "bcrypt_hash":          _regex(r'\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}'),
-
-            # Padrões genéricos — validação extra de entropia obrigatória
             "generic_api_key":      _regex(r'(?:api[_-]?key|apikey)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-]{20,})["\']', re.I),
             "generic_token":        _regex(r'(?:access[_-]?token|auth[_-]?token)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-\.]{20,})["\']', re.I),
             "generic_secret":       _regex(r'(?:client[_-]?secret|app[_-]?secret)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-/+=]{20,})["\']', re.I),
@@ -349,6 +410,59 @@ def get_config(domain: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Preflight check de ferramentas
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TOOL_META: dict[str, dict] = {
+    "gau":         {"install": "go install github.com/lc/gau/v2/cmd/gau@latest",                           "impact": "coleta passiva de URLs"},
+    "waybackurls": {"install": "go install github.com/tomnomnom/waybackurls@latest",                       "impact": "coleta passiva via Wayback Machine"},
+    "katana":      {"install": "go install github.com/projectdiscovery/katana/cmd/katana@latest",           "impact": "crawling ativo com suporte a JS"},
+    "hakrawler":   {"install": "go install github.com/hakluke/hakrawler@latest",                            "impact": "crawling de subdomínios"},
+    "gospider":    {"install": "go install github.com/jaeles-project/gospider@latest",                      "impact": "crawling com suporte a sitemap/robots"},
+    "httpx":       {"install": "go install github.com/projectdiscovery/httpx/cmd/httpx@latest",             "impact": "validação de URLs ativas"},
+    "subfinder":   {"install": "go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest",  "impact": "enumeração de subdomínios"},
+    "gf":          {"install": "go install github.com/tomnomnom/gf@latest",                                 "impact": "filtragem XSS/SQLi/SSRF/redirect"},
+    "dalfox":      {"install": "go install github.com/hahwul/dalfox/v2@latest",                             "impact": "probe XSS ativo"},
+    "qsreplace":   {"install": "go install github.com/tomnomnom/qsreplace@latest",                          "impact": "probe SSRF/redirect"},
+    "curl":        {"install": "apt install curl / brew install curl",                                       "impact": "validação de redirect hits"},
+}
+
+_CRITICAL_TOOLS = {"httpx"}
+
+
+def preflight_check(logger: logging.Logger, args: argparse.Namespace) -> bool:
+    missing: list[tuple[str, str, str]] = []
+    present: list[str]                  = []
+
+    for tool, meta in _TOOL_META.items():
+        if tool_available(tool):
+            present.append(tool)
+        else:
+            missing.append((tool, meta["install"], meta["impact"]))
+
+    logger.info("─── Preflight check ─────────────────────────────────────────")
+    logger.info("Ferramentas disponíveis (%d): %s", len(present), ", ".join(sorted(present)))
+
+    if missing:
+        logger.warning("Ferramentas ausentes (%d):", len(missing))
+        for tool, install_cmd, impact in sorted(missing):
+            level = logging.ERROR if tool in _CRITICAL_TOOLS else logging.WARNING
+            logger.log(level, "  ✗ %-15s | impacto: %-45s | instalar: %s",
+                       tool, impact, install_cmd)
+
+    critical_missing = [t for t, _, _ in missing if t in _CRITICAL_TOOLS]
+    if "httpx" in critical_missing and args.no_httpx:
+        critical_missing.remove("httpx")
+
+    if critical_missing:
+        logger.error("Ferramentas críticas ausentes: %s — abortando.", ", ".join(critical_missing))
+        return False
+
+    logger.info("─────────────────────────────────────────────────────────────")
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Escrita segura de arquivos
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -369,16 +483,28 @@ def append_line_to_file(path: Path, line: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Rate-limited requests com retry
+# Rate limiting adaptativo por hostname
 # ─────────────────────────────────────────────────────────────────────────────
 
+_host_semaphores: dict[str, threading.Semaphore] = {}
+_host_sem_lock   = threading.Lock()
+_MAX_PER_HOST    = 4
+
 _request_logger = logging.getLogger("recon.requests")
+
+
+def _get_host_semaphore(url: str) -> threading.Semaphore:
+    host = urllib.parse.urlparse(url).netloc
+    with _host_sem_lock:
+        if host not in _host_semaphores:
+            _host_semaphores[host] = threading.Semaphore(_MAX_PER_HOST)
+        return _host_semaphores[host]
 
 
 def _make_retrying_get(cfg: dict):
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=20),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
         retry=retry_if_exception_type((
             requests.exceptions.ConnectionError,
             requests.exceptions.Timeout,
@@ -387,20 +513,52 @@ def _make_retrying_get(cfg: dict):
         reraise=True,
     )
     def _get(url: str, **kwargs) -> requests.Response:
-        resp = requests.get(
-            url,
-            headers=cfg["headers"],
-            timeout=cfg["request_timeout"],
-            verify=False,
-            **kwargs,
-        )
-        if resp.status_code in (429, 503):
-            retry_after = int(resp.headers.get("Retry-After", 5))
-            time.sleep(retry_after)
-            resp.raise_for_status()
-        return resp
+        sem = _get_host_semaphore(url)
+        with sem:
+            resp = requests.get(
+                url,
+                headers=cfg["headers"],
+                timeout=cfg["request_timeout"],
+                verify=False,
+                allow_redirects=True,
+                **kwargs,
+            )
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 10))
+                _request_logger.debug("[429] %s — aguardando %ds", url, retry_after)
+                time.sleep(min(retry_after, 60))
+                resp.raise_for_status()
+            elif resp.status_code == 503:
+                time.sleep(5)
+                resp.raise_for_status()
+            return resp
 
     return _get
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [MEM-2] Leitura de resposta com limite de bytes
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _safe_read_text(resp: requests.Response, max_bytes: int) -> str | None:
+    """
+    Lê o corpo de uma resposta com limite de tamanho.
+    Verifica Content-Length antes e lê em stream se necessário.
+    Retorna None se exceder o limite.
+    """
+    cl = resp.headers.get("Content-Length")
+    if cl and int(cl) > max_bytes:
+        return None
+    # Para respostas sem Content-Length, lê com limite
+    content = b""
+    for chunk in resp.iter_content(chunk_size=65536):
+        content += chunk
+        if len(content) > max_bytes:
+            return None
+    try:
+        return content.decode("utf-8", errors="replace")
+    except Exception:
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -452,12 +610,16 @@ def _fetch_wayback_api(domain: str, logger: logging.Logger) -> set[str]:
     }
     try:
         resp = requests.get(base_url, params=params, timeout=900,
-                            headers={"User-Agent": "Mozilla/5.0 recon"})
+                            headers={"User-Agent": "Mozilla/5.0 recon"}, stream=True)
         if resp.status_code == 200:
-            for line in resp.text.splitlines():
-                line = line.strip()
+            for line in resp.iter_lines(decode_unicode=True):
+                line = line.strip() if isinstance(line, str) else line.decode("utf-8", errors="replace").strip()
                 if line and line.startswith("http"):
                     urls.add(line)
+                    # [MEM-1] Interrompe se atingir o teto
+                    if len(urls) >= MAX_URLS_IN_MEMORY:
+                        logger.warning("[wayback-api] teto de URLs atingido (%d) — interrompendo.", MAX_URLS_IN_MEMORY)
+                        break
         else:
             logger.debug("[wayback-api] HTTP %d", resp.status_code)
     except requests.exceptions.Timeout:
@@ -472,7 +634,7 @@ def _fetch_commoncrawl_api(domain: str, logger: logging.Logger) -> set[str]:
     try:
         idx_resp = requests.get(
             "https://index.commoncrawl.org/collinfo.json",
-            timeout=30, headers={"User-Agent": "Mozilla/5.0 recon"},
+            timeout=90, headers={"User-Agent": "Mozilla/5.0 recon"},
         )
         if idx_resp.status_code != 200:
             return urls
@@ -488,13 +650,17 @@ def _fetch_commoncrawl_api(domain: str, logger: logging.Logger) -> set[str]:
                 api_url,
                 params={"url": f"*.{domain}", "output": "text",
                         "fl": "url", "collapse": "urlkey", "limit": "50000"},
-                timeout=60, headers={"User-Agent": "Mozilla/5.0 recon"},
+                timeout=90, headers={"User-Agent": "Mozilla/5.0 recon"},
+                stream=True,
             )
             if resp.status_code == 200:
-                for line in resp.text.splitlines():
-                    line = line.strip()
+                for line in resp.iter_lines(decode_unicode=True):
+                    line = line.strip() if isinstance(line, str) else line.decode("utf-8", errors="replace").strip()
                     if line and line.startswith("http"):
                         urls.add(line)
+                        if len(urls) >= MAX_URLS_IN_MEMORY:
+                            logger.warning("[commoncrawl-api] teto atingido — interrompendo.")
+                            return urls
         except Exception as exc:
             logger.debug("[commoncrawl-api] erro em %s: %s", api_url, exc)
     return urls
@@ -506,7 +672,27 @@ def _fetch_commoncrawl_api(domain: str, logger: logging.Logger) -> set[str]:
 
 def collect_urls(cfg: dict, logger: logging.Logger) -> int:
     domain   = cfg["domain"]
+    # [MEM-7] Usa arquivo temporário para evitar manter tudo em RAM
     all_urls: set[str] = set()
+
+    def _add_urls(new_urls: list[str] | set[str]) -> None:
+        """Adiciona URLs ao set e faz flush para disco se necessário."""
+        for u in new_urls:
+            all_urls.add(u)
+        if len(all_urls) >= MAX_URLS_IN_MEMORY:
+            _flush_urls_to_disk()
+
+    def _flush_urls_to_disk() -> None:
+        if not all_urls:
+            return
+        existing: set[str] = set()
+        if cfg["urls_file"].exists():
+            existing = set(cfg["urls_file"].read_text(encoding="utf-8").splitlines())
+        merged = existing | all_urls
+        cfg["urls_file"].parent.mkdir(parents=True, exist_ok=True)
+        cfg["urls_file"].write_text("\n".join(sorted(merged)) + "\n", encoding="utf-8")
+        all_urls.clear()
+        gc.collect()
 
     # ── gau ──────────────────────────────────────────────────
     if tool_available("gau"):
@@ -514,9 +700,9 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
         lines = run_cmd([
             "gau", "--threads", "5", "--subs",
             "--providers", "wayback,commoncrawl,otx,urlscan",
-            "--retries", "2", "--timeout", "80", domain
+            "--retries", "2", "--timeout", "90", domain
         ], logger, timeout=900)
-        all_urls.update(lines)
+        _add_urls(lines)
         logger.info("[gau] %d URLs", len(lines))
     else:
         logger.warning("gau não encontrado — pulando.")
@@ -524,12 +710,8 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
     # ── waybackurls ───────────────────────────────────────────
     if tool_available("waybackurls"):
         logger.info("[waybackurls] coletando… (domínio: %s)", domain)
-        lines = run_cmd(
-            ["waybackurls", domain],
-            logger,
-            timeout=900,
-        )
-        all_urls.update(lines)
+        lines = run_cmd(["waybackurls", domain], logger, timeout=900)
+        _add_urls(lines)
         logger.info("[waybackurls] %d URLs", len(lines))
     else:
         logger.warning("waybackurls não encontrado — pulando.")
@@ -538,19 +720,19 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
     logger.info("[wayback-api] consultando CDX API…")
     wayback_urls = _fetch_wayback_api(domain, logger)
     if wayback_urls:
-        all_urls.update(wayback_urls)
+        _add_urls(wayback_urls)
         logger.info("[wayback-api] %d URLs", len(wayback_urls))
-    else:
-        logger.info("[wayback-api] nenhuma URL retornada.")
+    del wayback_urls
+    gc.collect()
 
     # ── CommonCrawl API direta ────────────────────────────────
     logger.info("[commoncrawl-api] consultando…")
     cc_urls = _fetch_commoncrawl_api(domain, logger)
     if cc_urls:
-        all_urls.update(cc_urls)
+        _add_urls(cc_urls)
         logger.info("[commoncrawl-api] %d URLs", len(cc_urls))
-    else:
-        logger.info("[commoncrawl-api] nenhuma URL retornada.")
+    del cc_urls
+    gc.collect()
 
     # ── katana ────────────────────────────────────────────────
     if tool_available("katana"):
@@ -562,7 +744,7 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
             "-ef", "woff,css,png,svg,jpg,woff2,jpeg,gif,ico,ttf",
             "-silent",
         ], logger, timeout=900)
-        all_urls.update(lines)
+        _add_urls(lines)
         logger.info("[katana] %d URLs", len(lines))
     else:
         logger.warning("katana não encontrado — pulando.")
@@ -574,12 +756,10 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
             ["hakrawler", "-d", "3", "-u", "-subs", "-t", "8", "-insecure"],
             logger,
             stdin=f"https://{domain}\n",
-            timeout=900,
+            timeout=600,
         )
-        all_urls.update(lines)
+        _add_urls(lines)
         logger.info("[hakrawler] %d URLs", len(lines))
-    else:
-        logger.info("hakrawler não encontrado — instale: go install github.com/hakluke/hakrawler@latest")
 
     # ── gospider ─────────────────────────────────────────────
     if tool_available("gospider"):
@@ -593,7 +773,7 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
                  "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
-            gospider_lines: list[str] = []
+            gospider_count = 0
             try:
                 for line in proc.stdout:
                     line = line.strip()
@@ -601,15 +781,16 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
                         continue
                     m = re.search(r'https?://[^\s"\'<>\]]+', line)
                     if m:
-                        all_urls.add(m.group(0).rstrip('.,;)"\'>]'))
-                    gospider_lines.append(line)
+                        url = m.group(0).rstrip('.,;)"\'>]')
+                        all_urls.add(url)
+                        gospider_count += 1
+                        if gospider_count % 10000 == 0:
+                            _flush_urls_to_disk()
             finally:
                 proc.wait()
-            logger.info("[gospider] %d linhas processadas", len(gospider_lines))
+            logger.info("[gospider] %d linhas processadas", gospider_count)
         except Exception as exc:
             logger.error("[gospider] erro: %s", exc)
-    else:
-        logger.info("gospider não encontrado — instale: go install github.com/jaeles-project/gospider@latest")
 
     # ── subfinder ─────────────────────────────────────────────
     if tool_available("subfinder"):
@@ -628,11 +809,10 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
                     stdin=sub_input,
                     timeout=max(60, len(subs) * 3),
                 )
-                all_urls.update(lines)
+                _add_urls(lines)
                 logger.info("[hakrawler/subs] %d URLs", len(lines))
 
             if tool_available("gospider"):
-                logger.info("[gospider] crawling em subdomínios…")
                 for sub in subs[:50]:
                     try:
                         proc = subprocess.Popen(
@@ -653,14 +833,14 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
                             proc.wait()
                     except Exception as exc:
                         logger.error("[gospider/subs] %s: %s", sub, exc)
-    else:
-        logger.info("subfinder não encontrado — instale: go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest")
 
-    urls  = sorted(all_urls)
-    wrote = write_if_not_empty(cfg["urls_file"], urls, logger)
-    logger.info("URLs coletadas: %d%s", len(urls),
-                f" → {cfg['urls_file']}" if wrote else " (nenhuma)")
-    return len(urls)
+    # Flush final para disco
+    _flush_urls_to_disk()
+
+    total = sum(1 for l in cfg["urls_file"].read_text(encoding="utf-8").splitlines() if l.strip()) \
+            if cfg["urls_file"].exists() else 0
+    logger.info("URLs coletadas: %d → %s", total, cfg["urls_file"])
+    return total
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -723,7 +903,7 @@ def run_gf(cfg: dict, logger: logging.Logger) -> None:
             result = subprocess.run(
                 ["gf", pattern],
                 input=source_text,
-                capture_output=True, text=True, timeout=300,
+                capture_output=True, text=True, timeout=120,
             )
             lines = [l for l in result.stdout.splitlines() if l.strip()]
             if lines:
@@ -749,7 +929,7 @@ def probe_xss(cfg: dict, logger: logging.Logger) -> int:
         return 0
 
     out_file = cfg["gf_dir"] / "dalfox_results.txt"
-    logger.info("Rodando dalfox… (pode demorar bastante dependendo do volume de URLs)")
+    logger.info("Rodando dalfox…")
 
     try:
         proc = subprocess.Popen(
@@ -767,7 +947,6 @@ def probe_xss(cfg: dict, logger: logging.Logger) -> int:
                 line = line.strip()
                 if not line:
                     continue
-                logger.debug("[dalfox] %s", line)
                 if "[V]" in line:
                     hits += 1
                     logger.warning("[!!!] dalfox XSS confirmado: %s", line)
@@ -880,14 +1059,17 @@ def download_and_analyze_sensitive(cfg: dict, logger: logging.Logger) -> int:
     logger.info("Baixando %d arquivos sensíveis…", len(urls))
     for url in urls[:500]:
         try:
-            resp = get(url)
+            resp = get(url, stream=True)
         except Exception:
             continue
 
         if resp.status_code != 200:
             continue
-        content = resp.text
-        if len(content) > 2_000_000:
+
+        # [MEM-2] Leitura com limite
+        content = _safe_read_text(resp, MAX_JS_CONTENT_BYTES)
+        if content is None:
+            logger.debug("[skip] arquivo muito grande: %s", url)
             continue
 
         local_hits: list[str] = []
@@ -903,6 +1085,9 @@ def download_and_analyze_sensitive(cfg: dict, logger: logging.Logger) -> int:
                 logger.warning("[!!!] Segredo em arquivo sensível → %s", url)
                 report_lines.append(f"URL: {url}\nACHADO: {hit}\n" + "-" * 60)
                 findings += 1
+
+        # Libera memória do conteúdo processado
+        del content
 
     if report_lines:
         write_if_not_empty(cfg["sensitive_report"], report_lines, logger)
@@ -945,6 +1130,124 @@ def collect_js(cfg: dict, logger: logging.Logger) -> int:
     logger.info("Arquivos JS únicos: %d%s", len(js_urls),
                 f" → {cfg['js_file']}" if wrote else " (nenhum)")
     return len(js_urls)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Análise de inline scripts em HTML
+# [MEM-5] Concorrência reduzida (8 workers) + processamento em batches de 50
+# ─────────────────────────────────────────────────────────────────────────────
+
+_INLINE_SCRIPT_RE = re.compile(
+    r'<script(?:\s[^>]*)?>(.+?)</script>',
+    re.DOTALL | re.IGNORECASE,
+)
+
+_FRAMEWORK_DATA_RE = re.compile(
+    r'(?:__NEXT_DATA__|__NUXT__|__INITIAL_STATE__|__APP_STATE__|'
+    r'window\.__config|window\.__env|globalThis\.__env)\s*=\s*(\{.{20,}?\})',
+    re.DOTALL,
+)
+
+_STATIC_EXT_RE = re.compile(
+    r'\.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|map|pdf)(\?|$)',
+    re.I,
+)
+
+# [MEM-5] Workers reduzidos para inline scripts
+_INLINE_WORKERS = 8
+# [MEM-5] Tamanho do batch para GC periódico
+_INLINE_BATCH_SIZE = 50
+
+
+def analyze_inline_scripts(cfg: dict, logger: logging.Logger,
+                            google_keys_found: set,
+                            google_keys_lock: threading.Lock) -> int:
+    source = cfg.get("_active_urls_file", cfg["urls_file"])
+    if not source.exists():
+        return 0
+
+    candidate_urls = [
+        u.strip() for u in source.read_text(encoding="utf-8").splitlines()
+        if u.strip() and not _STATIC_EXT_RE.search(u.strip())
+    ]
+    if not candidate_urls:
+        return 0
+
+    get_fn  = _make_retrying_get(cfg)
+    total   = 0
+    sampled = candidate_urls[:300]
+    logger.info("[inline-scripts] analisando %d URLs HTML…", len(sampled))
+
+    def _process_html(url: str) -> int:
+        local = 0
+        try:
+            resp = get_fn(url, stream=True)
+        except Exception:
+            return 0
+        if resp.status_code != 200:
+            return 0
+        ct = resp.headers.get("Content-Type", "")
+        if "html" not in ct and "text" not in ct:
+            return 0
+
+        # [MEM-2] Limite de bytes para HTML
+        content = _safe_read_text(resp, MAX_HTML_CONTENT_BYTES)
+        if content is None:
+            return 0
+
+        scripts = [
+            m.group(1) for m in _INLINE_SCRIPT_RE.finditer(content)
+            if "src=" not in m.group(0)[:50]
+        ]
+        # Libera o HTML completo antes de analisar os scripts
+        del content
+
+        for i, script_content in enumerate(scripts):
+            if len(script_content.strip()) < 20:
+                continue
+            virtual_url = f"{url}::inline_script_{i}"
+            n = analyze_js_content(
+                script_content, virtual_url, cfg, logger,
+                google_keys_found, google_keys_lock,
+            )
+            local += n
+
+            for fm in _FRAMEWORK_DATA_RE.finditer(script_content):
+                try:
+                    data_obj = json.loads(fm.group(1))
+                    flat_str = json.dumps(data_obj)
+                    del data_obj
+                    n2 = analyze_js_content(
+                        flat_str, f"{url}::framework_data", cfg, logger,
+                        google_keys_found, google_keys_lock,
+                    )
+                    local += n2
+                    del flat_str
+                except Exception:
+                    pass
+
+        del scripts
+        return local
+
+    # [MEM-5] Processa em batches com GC periódico
+    for batch_start in range(0, len(sampled), _INLINE_BATCH_SIZE):
+        batch = sampled[batch_start:batch_start + _INLINE_BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=_INLINE_WORKERS) as executor:
+            futs = {executor.submit(_process_html, u): u for u in batch}
+            for fut in as_completed(futs):
+                try:
+                    total += fut.result()
+                except Exception as exc:
+                    logger.debug("[inline-scripts] erro: %s", exc)
+        gc.collect()
+        logger.debug("[inline-scripts] batch %d/%d processado",
+                     min(batch_start + _INLINE_BATCH_SIZE, len(sampled)), len(sampled))
+
+    if total:
+        logger.warning("[!!!] Segredos em inline scripts: %d", total)
+    else:
+        logger.info("[inline-scripts] nenhum segredo encontrado.")
+    return total
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1056,16 +1359,27 @@ _secret_write_lock                   = threading.Lock()
 
 
 def _append_secret(finding: dict, cfg: dict) -> bool:
-    key = (finding["type"], finding["value"])
+    finding = {**finding, "severity": get_severity(finding["type"])}
+
+    norm_key = (finding["type"], _normalize_secret_value(finding["type"], finding["value"]))
+
     with _seen_secrets_lock:
-        if key in _seen_secrets:
-            return False
-        _seen_secrets.add(key)
+        # [MEM-1] Teto para o set de secrets vistos
+        if len(_seen_secrets) >= MAX_SECRETS_SEEN:
+            # Apenas verifica presença sem adicionar novos
+            if norm_key in _seen_secrets:
+                return False
+            # Descarta silenciosamente quando o teto é atingido — apenas loga
+        else:
+            if norm_key in _seen_secrets:
+                return False
+            _seen_secrets.add(norm_key)
 
     with _secret_write_lock:
+        sev_tag = f"[{finding['severity']}]"
         append_line_to_file(
             cfg["secrets_txt"],
-            f"[{finding['type']}] {finding['url']}\n"
+            f"{sev_tag} [{finding['type']}] {finding['url']}\n"
             f"VALUE  : {finding['value']}\n"
             f"CONTEXT: {finding['context'][:300]}\n"
             + "-" * 60,
@@ -1073,22 +1387,24 @@ def _append_secret(finding: dict, cfg: dict) -> bool:
         csv_new = not cfg["secrets_csv"].exists()
         cfg["secrets_csv"].parent.mkdir(parents=True, exist_ok=True)
         with open(cfg["secrets_csv"], "a", encoding="utf-8", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=["type", "url", "value", "context"])
+            w = csv.DictWriter(f, fieldnames=["severity", "type", "url", "value", "context"])
             if csv_new:
                 w.writeheader()
             w.writerow({
-                "type":    finding["type"],
-                "url":     finding["url"],
-                "value":   finding["value"],
-                "context": finding["context"][:300],
+                "severity": finding["severity"],
+                "type":     finding["type"],
+                "url":      finding["url"],
+                "value":    finding["value"],
+                "context":  finding["context"][:300],
             })
         append_line_to_file(
             cfg["secrets_jsonl"],
             json.dumps({
-                "type":    finding["type"],
-                "url":     finding["url"],
-                "value":   finding["value"],
-                "context": finding["context"][:300],
+                "severity": finding["severity"],
+                "type":     finding["type"],
+                "url":      finding["url"],
+                "value":    finding["value"],
+                "context":  finding["context"][:300],
             }, ensure_ascii=False),
         )
     return True
@@ -1122,8 +1438,10 @@ def analyze_js_content(
             if name in generic_set:
                 context_line = _line_at(match.start())
                 if not is_likely_real_credential(value, context_line):
-                    logger.debug("[SKIP FP] %s → %s", name, value[:60])
                     continue
+
+            if name == "jwt" and not _is_real_jwt(value):
+                continue
 
             context = _secret_context(content, match.start(), match.end())
             finding = {"type": name, "value": value, "url": url, "context": context}
@@ -1134,8 +1452,6 @@ def analyze_js_content(
                 if name == "google_api_key":
                     with google_keys_lock:
                         google_keys_found.add(value)
-            else:
-                logger.debug("[DEDUP] %s já registrado — pulando.", name)
 
     for obf in scan_charcode_obfuscation(content, url, logger):
         _append_secret(obf, cfg)
@@ -1153,6 +1469,68 @@ def analyze_js_content(
     return found
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# [MEM-4] Cache de JS em disco com limite de entradas (LRU por mtime)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _cache_path(cfg: dict, url: str) -> Path:
+    url_hash = hashlib.sha1(url.encode()).hexdigest()[:16]
+    return cfg["base_dir"] / ".js_cache" / f"{url_hash}.json"
+
+
+def _evict_cache_if_needed(cfg: dict) -> None:
+    """Remove as entradas mais antigas se o cache exceder o limite."""
+    cache_dir = cfg["base_dir"] / ".js_cache"
+    if not cache_dir.exists():
+        return
+    entries = sorted(cache_dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
+    if len(entries) <= _JS_CACHE_MAX:
+        return
+    to_remove = entries[:len(entries) - _JS_CACHE_MAX]
+    for p in to_remove:
+        try:
+            p.unlink()
+        except Exception:
+            pass
+
+
+def _load_cached_js(cfg: dict, url: str) -> str | None:
+    if cfg.get("_no_cache"):
+        return None
+    path = _cache_path(cfg, url)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("version") != _JS_CACHE_VERSION:
+            return None
+        if time.time() - data.get("ts", 0) > _JS_CACHE_TTL:
+            path.unlink(missing_ok=True)
+            return None
+        return data.get("content")
+    except Exception:
+        return None
+
+
+def _save_cached_js(cfg: dict, url: str, content: str) -> None:
+    if cfg.get("_no_cache"):
+        return
+    # [MEM-4] Não armazena conteúdo muito grande no cache
+    if len(content) > MAX_JS_CONTENT_BYTES:
+        return
+    path = _cache_path(cfg, url)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.write_text(
+            json.dumps({"version": _JS_CACHE_VERSION, "ts": time.time(), "content": content},
+                       ensure_ascii=False),
+            encoding="utf-8",
+        )
+        _evict_cache_if_needed(cfg)
+    except Exception:
+        pass
+
+
 def process_js(
     url: str,
     cfg: dict,
@@ -1163,13 +1541,24 @@ def process_js(
 ) -> int:
     url_key = url.split("?")[0]
     with _analyzed_js_lock:
-        if url_key in _analyzed_js_urls:
-            logger.debug("[CACHE] JS já analisado — pulando: %s", url)
-            return 0
-        _analyzed_js_urls.add(url_key)
+        # [MEM-1] Teto para URLs analisadas
+        if len(_analyzed_js_urls) >= MAX_JS_ANALYZED:
+            if url_key in _analyzed_js_urls:
+                return 0
+            # Processa sem adicionar ao set (ignora teto de forma segura)
+        else:
+            if url_key in _analyzed_js_urls:
+                return 0
+            _analyzed_js_urls.add(url_key)
+
+    cached = _load_cached_js(cfg, url_key)
+    if cached is not None:
+        result = analyze_js_content(cached, url, cfg, logger, google_keys_found, google_keys_lock)
+        del cached
+        return result
 
     try:
-        resp = get_fn(url)
+        resp = get_fn(url, stream=True)
     except requests.exceptions.SSLError as exc:
         logger.debug("SSL error em %s: %s", url, exc)
         return 0
@@ -1183,12 +1572,27 @@ def process_js(
     if resp.status_code != 200:
         return 0
 
-    content = resp.text
-    if not is_valid_js(resp, content):
-        logger.debug("Não é JS: %s", url)
+    # [MEM-2] Leitura com limite de bytes
+    content = _safe_read_text(resp, MAX_JS_CONTENT_BYTES)
+    if content is None:
+        logger.debug("[skip] JS muito grande: %s", url)
         return 0
 
-    return analyze_js_content(content, url, cfg, logger, google_keys_found, google_keys_lock)
+    # Verifica content-type antes de processar
+    if not is_valid_js(resp, content):
+        logger.debug("Não é JS: %s", url)
+        del content
+        return 0
+
+    _save_cached_js(cfg, url_key, content)
+    result = analyze_js_content(content, url, cfg, logger, google_keys_found, google_keys_lock)
+    del content
+    return result
+
+
+def _iter_chunks(lst: list, size: int) -> Iterator[list]:
+    for i in range(0, len(lst), size):
+        yield lst[i:i + size]
 
 
 def analyze_all_js(cfg: dict, logger: logging.Logger) -> tuple[int, set]:
@@ -1200,25 +1604,32 @@ def analyze_all_js(cfg: dict, logger: logging.Logger) -> tuple[int, set]:
     if not urls:
         return 0, set()
 
-    total_found:       int           = 0
-    google_keys_found: set           = set()
+    total_found:       int            = 0
+    google_keys_found: set            = set()
     google_keys_lock:  threading.Lock = threading.Lock()
-    get_fn                           = _make_retrying_get(cfg)
+    get_fn                            = _make_retrying_get(cfg)
 
     logger.info("Analisando %d arquivos JS com %d workers…", len(urls), cfg["js_workers"])
 
-    with ThreadPoolExecutor(max_workers=cfg["js_workers"]) as executor:
-        futures = {
-            executor.submit(
-                process_js, url, cfg, logger,
-                google_keys_found, google_keys_lock, get_fn,
-            ): url for url in urls
-        }
-        for future in as_completed(futures):
-            try:
-                total_found += future.result()
-            except Exception as exc:
-                logger.error("Thread error: %s", exc)
+    # [MEM-3] Processa em chunks de 200 URLs com GC periódico
+    chunk_size = 200
+    for chunk_idx, chunk in enumerate(_iter_chunks(urls, chunk_size)):
+        with ThreadPoolExecutor(max_workers=cfg["js_workers"]) as executor:
+            futures = {
+                executor.submit(
+                    process_js, url, cfg, logger,
+                    google_keys_found, google_keys_lock, get_fn,
+                ): url for url in chunk
+            }
+            for future in as_completed(futures):
+                try:
+                    total_found += future.result()
+                except Exception as exc:
+                    logger.error("Thread error: %s", exc)
+
+        gc.collect()
+        logger.debug("[js] chunk %d/%d concluído (%d URLs)",
+                     chunk_idx + 1, math.ceil(len(urls) / chunk_size), len(chunk))
 
     if total_found:
         logger.info("Segredos encontrados em JS: %d → %s", total_found, cfg["secrets_txt"])
@@ -1226,6 +1637,131 @@ def analyze_all_js(cfg: dict, logger: logging.Logger) -> tuple[int, set]:
         logger.info("Nenhum segredo encontrado em JS.")
 
     return total_found, google_keys_found
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Coleta e análise de source maps (.js.map)
+# [MEM-6] sourcesContent processado item a item
+# ─────────────────────────────────────────────────────────────────────────────
+
+def collect_and_analyze_sourcemaps(cfg: dict, logger: logging.Logger,
+                                   google_keys_found: set,
+                                   google_keys_lock: threading.Lock) -> int:
+    source = cfg.get("_active_urls_file", cfg["urls_file"])
+    if not source.exists():
+        return 0
+
+    all_urls = [l.strip() for l in source.read_text(encoding="utf-8").splitlines() if l.strip()]
+    get_fn   = _make_retrying_get(cfg)
+
+    map_urls: set[str] = set()
+
+    for url in all_urls:
+        if url.endswith(".js.map"):
+            map_urls.add(url)
+
+    js_for_map = [u for u in all_urls if re.search(r'\.js(\?|$)', u)]
+    for url in js_for_map[:300]:
+        candidate = re.sub(r'\.js(\?.*)?$', '.js.map', url)
+        map_urls.add(candidate)
+
+    # Libera lista completa de URLs da memória
+    del all_urls, js_for_map
+    gc.collect()
+
+    if not map_urls:
+        logger.info("[sourcemaps] nenhuma URL candidata encontrada.")
+        return 0
+
+    logger.info("[sourcemaps] tentando %d URLs de source map…", len(map_urls))
+    sourcemap_dir = cfg["base_dir"] / "sourcemaps"
+    findings      = 0
+    confirmed: list[str] = []
+    confirmed_lock = threading.Lock()
+
+    def _process_map(map_url: str) -> int:
+        local_findings = 0
+        try:
+            resp = get_fn(map_url, stream=True)
+        except Exception:
+            return 0
+        if resp.status_code != 200:
+            return 0
+
+        # [MEM-2] Source maps podem ser grandes; limita leitura
+        raw = _safe_read_text(resp, MAX_JS_CONTENT_BYTES * 2)  # 10 MB para source maps
+        if raw is None:
+            return 0
+        if "<html" in raw[:100].lower():
+            return 0
+
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return 0
+        finally:
+            del raw
+
+        sources_content = data.get("sourcesContent", [])
+        sources_names   = data.get("sources", [])
+        n_sources       = len(sources_content)
+
+        if not n_sources:
+            return 0
+
+        with confirmed_lock:
+            confirmed.append(map_url)
+
+        sourcemap_dir.mkdir(parents=True, exist_ok=True)
+        safe = re.sub(r'[^\w\-.]', '_', map_url)[:100]
+        logger.warning("[!!!] Source map confirmado: %s (%d fontes)", map_url, n_sources)
+
+        # [MEM-6] Processa cada source individualmente, sem manter a lista inteira
+        for i in range(n_sources):
+            src_content = sources_content[i] if i < len(sources_content) else None
+            if not src_content or not isinstance(src_content, str):
+                continue
+            src_name    = sources_names[i] if i < len(sources_names) else f"source_{i}"
+            virtual_url = f"{map_url}::{src_name}"
+
+            src_file = sourcemap_dir / (safe + f"_src{i}.js")
+            try:
+                src_file.write_text(src_content, encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+            n = analyze_js_content(
+                src_content, virtual_url, cfg, logger,
+                google_keys_found, google_keys_lock,
+            )
+            local_findings += n
+            del src_content
+
+        # Libera o JSON inteiro após processar todos os sources
+        del data, sources_content, sources_names
+        return local_findings
+
+    # [MEM-3] Chunks para source maps também
+    map_list = list(map_urls)
+    del map_urls
+
+    for chunk in _iter_chunks(map_list, 100):
+        with ThreadPoolExecutor(max_workers=cfg["js_workers"]) as executor:
+            futs = {executor.submit(_process_map, u): u for u in chunk}
+            for fut in as_completed(futs):
+                try:
+                    findings += fut.result()
+                except Exception as exc:
+                    logger.debug("[sourcemaps] erro: %s", exc)
+        gc.collect()
+
+    if confirmed:
+        write_if_not_empty(cfg["base_dir"] / "sourcemaps_found.txt", confirmed, logger)
+        logger.warning("[!!!] Source maps confirmados: %d — segredos: %d", len(confirmed), findings)
+    else:
+        logger.info("[sourcemaps] nenhum source map público confirmado.")
+
+    return findings
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1332,8 +1868,8 @@ def analyze_subdomains(
     sub_urls   = [f"https://{s}" for s in subs_clean]
     alive_urls = _probe_alive_urls(sub_urls, cfg["request_timeout"], logger)
 
-    https_alive      = set(alive_urls)
-    http_candidates  = [
+    https_alive     = set(alive_urls)
+    http_candidates = [
         f"http://{s}" for s in subs_clean
         if f"https://{s}" not in https_alive
     ]
@@ -1375,27 +1911,41 @@ def analyze_subdomains(
             url_key = js_url.split("?")[0]
             with _analyzed_js_lock:
                 if url_key in _analyzed_js_urls:
-                    logger.debug("[CACHE] JS já analisado — pulando: %s", js_url)
                     continue
                 _analyzed_js_urls.add(url_key)
 
+            cached = _load_cached_js(cfg, url_key)
+            if cached is not None:
+                n = analyze_js_content(cached, js_url, cfg, logger, all_google_keys, google_keys_lock)
+                sub_findings += n
+                del cached
+                continue
+
             try:
-                resp = get_fn(js_url)
+                resp = get_fn(js_url, stream=True)
             except Exception:
                 continue
 
             if resp.status_code != 200:
                 continue
 
-            content = resp.text
-            if not is_valid_js(resp, content):
+            # [MEM-2] Limite de bytes
+            content = _safe_read_text(resp, MAX_JS_CONTENT_BYTES)
+            if content is None:
                 continue
+
+            if not is_valid_js(resp, content):
+                del content
+                continue
+
+            _save_cached_js(cfg, url_key, content)
 
             n = analyze_js_content(
                 content, js_url, cfg, logger,
                 all_google_keys, google_keys_lock,
             )
             sub_findings += n
+            del content
 
         sub_stats[sub_host] = {"js": len(js_urls), "secrets": sub_findings}
 
@@ -1403,6 +1953,8 @@ def analyze_subdomains(
             logger.warning("  [!!!] %d segredo(s) em %s", sub_findings, sub_host)
         else:
             logger.info("  Nenhum segredo em %s", sub_host)
+
+        gc.collect()
 
     total_subs_secrets = sum(v["secrets"] for v in sub_stats.values())
     total_subs_js      = sum(v["js"]      for v in sub_stats.values())
@@ -1437,7 +1989,33 @@ def analyze_subdomains(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sumário
+# Agrupamento por severidade para o SUMMARY
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _summary_by_severity(secrets_jsonl: Path) -> list[str]:
+    counts: dict[str, int] = collections.Counter()
+    sevs:   dict[str, str] = {}
+    if not secrets_jsonl.exists():
+        return []
+    for line in secrets_jsonl.read_text(encoding="utf-8", errors="ignore").splitlines():
+        try:
+            obj = json.loads(line)
+            t   = obj.get("type", "?")
+            counts[t] += 1
+            sevs[t] = obj.get("severity", "UNKNOWN")
+        except json.JSONDecodeError:
+            pass
+
+    lines = []
+    for t, n in sorted(counts.items(),
+                        key=lambda x: (_SEVERITY_ORDER.get(sevs.get(x[0], "UNKNOWN"), 4), -x[1])):
+        sev = sevs.get(t, "UNKNOWN")
+        lines.append(f"    [{sev}] {t}: {n}")
+    return lines
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sumário TXT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
@@ -1445,15 +2023,6 @@ def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
         if not path.exists():
             return 0
         return sum(1 for l in path.read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip())
-
-    type_counts: dict[str, int] = collections.Counter()
-    if cfg["secrets_jsonl"].exists():
-        for line in cfg["secrets_jsonl"].read_text(encoding="utf-8", errors="ignore").splitlines():
-            try:
-                obj = json.loads(line)
-                type_counts[obj.get("type", "?")] += 1
-            except json.JSONDecodeError:
-                pass
 
     vuln_google = 0
     if cfg["google_report_file"].exists():
@@ -1478,13 +2047,15 @@ def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
         f"  URLs sensíveis           : {_f('sensitive_total')}",
         "",
         f"  Segredos encontrados     : {_f('js_findings')}",
+        f"  ↳ Em source maps         : {_f('sourcemap_findings')}",
+        f"  ↳ Em inline scripts      : {_f('inline_findings')}",
     ]
 
-    if type_counts:
+    sev_lines = _summary_by_severity(cfg["secrets_jsonl"])
+    if sev_lines:
         lines.append("")
-        lines.append("  Por tipo:")
-        for name, count in sorted(type_counts.items(), key=lambda x: -x[1]):
-            lines.append(f"    {name}: {count}")
+        lines.append("  Por tipo (ordenado por severidade):")
+        lines.extend(sev_lines)
 
     lines += [
         "",
@@ -1517,6 +2088,7 @@ def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
         ("Google Keys",    cfg["google_report_file"]),
         ("API Endpoints",  cfg["api_endpoints_file"]),
         ("Sensíveis",      cfg["sensitive_report"]),
+        ("SUMMARY HTML",   cfg["summary_html"]),
         ("Log completo",   cfg["log_file"]),
     ]
     existing = [(label, path) for label, path in output_files if path.exists()]
@@ -1533,6 +2105,172 @@ def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SUMMARY.html interativo
+# ─────────────────────────────────────────────────────────────────────────────
+
+def write_summary_html(cfg: dict, logger: logging.Logger, stats: dict) -> None:
+    findings: list[dict] = []
+    if cfg["secrets_jsonl"].exists():
+        for line in cfg["secrets_jsonl"].read_text(encoding="utf-8", errors="ignore").splitlines():
+            try:
+                obj = json.loads(line)
+                obj.setdefault("severity", get_severity(obj.get("type", "")))
+                findings.append(obj)
+            except json.JSONDecodeError:
+                pass
+
+    findings.sort(key=lambda x: (_SEVERITY_ORDER.get(x.get("severity", "UNKNOWN"), 4), x.get("type", "")))
+
+    sev_colors = {
+        "CRITICAL": "#c0392b",
+        "HIGH":     "#e67e22",
+        "MEDIUM":   "#2980b9",
+        "LOW":      "#27ae60",
+        "UNKNOWN":  "#7f8c8d",
+    }
+
+    rows_html = ""
+    for f in findings:
+        sev   = f.get("severity", "UNKNOWN")
+        color = sev_colors.get(sev, "#7f8c8d")
+        url   = f.get("url", "")
+        val   = f.get("value", "")[:120]
+        ctx   = f.get("context", "")[:200].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        rows_html += (
+            f'<tr data-sev="{sev}" data-type="{f.get("type","")}">'
+            f'<td><span class="badge" style="background:{color}">{sev}</span></td>'
+            f'<td><code>{f.get("type","")}</code></td>'
+            f'<td class="url-cell"><a href="{url}" target="_blank" rel="noopener">{url[:100]}</a></td>'
+            f'<td class="mono">{val}</td>'
+            f'<td class="ctx">{ctx}</td>'
+            f'</tr>\n'
+        )
+
+    sev_counts = {s: sum(1 for f in findings if f.get("severity") == s)
+                  for s in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]}
+
+    types_opts = "".join(
+        f'<option value="{t}">{t}</option>'
+        for t in sorted(set(f.get("type", "") for f in findings))
+    )
+
+    ts = time.strftime("%Y-%m-%d %H:%M")
+
+    html = f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>recon — {cfg['domain']}</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f1117;color:#e2e8f0;font-size:14px}}
+a{{color:#60a5fa;text-decoration:none}}
+a:hover{{text-decoration:underline}}
+code{{font-family:'SFMono-Regular',Consolas,monospace;font-size:12px;background:#1e2130;padding:1px 5px;border-radius:3px}}
+header{{background:#1a1d2e;border-bottom:1px solid #2d3148;padding:1rem 1.5rem;display:flex;align-items:center;gap:1rem;flex-wrap:wrap}}
+header h1{{font-size:16px;font-weight:600;color:#f1f5f9}}
+header p{{font-size:12px;color:#64748b}}
+.banner{{display:flex;gap:.75rem;padding:.75rem 1.5rem;background:#141620;border-bottom:1px solid #2d3148;flex-wrap:wrap}}
+.stat-card{{background:#1a1d2e;border:1px solid #2d3148;border-radius:6px;padding:.5rem .9rem;min-width:90px;text-align:center}}
+.stat-card .n{{font-size:22px;font-weight:700;line-height:1.1}}
+.stat-card .l{{font-size:11px;color:#64748b;margin-top:2px}}
+.controls{{display:flex;gap:.75rem;padding:.65rem 1.5rem;background:#141620;border-bottom:1px solid #2d3148;flex-wrap:wrap;align-items:center}}
+.controls select,.controls input{{background:#1a1d2e;border:1px solid #2d3148;border-radius:5px;color:#e2e8f0;padding:5px 8px;font-size:13px}}
+.controls input[type=search]{{width:220px}}
+#count{{font-size:12px;color:#64748b;margin-left:auto}}
+.badge{{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;color:#fff;white-space:nowrap}}
+table{{width:100%;border-collapse:collapse}}
+thead th{{background:#1a1d2e;color:#94a3b8;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;padding:8px 10px;text-align:left;cursor:pointer;border-bottom:1px solid #2d3148;white-space:nowrap;user-select:none}}
+thead th:hover{{color:#f1f5f9}}
+td{{padding:7px 10px;border-bottom:1px solid #1e2130;vertical-align:top}}
+tr:hover td{{background:#1a1d2e}}
+tr.hidden{{display:none}}
+.url-cell{{max-width:260px;word-break:break-all;font-size:12px}}
+.mono{{font-family:'SFMono-Regular',Consolas,monospace;font-size:11px;word-break:break-all;max-width:200px;color:#a3e635}}
+.ctx{{font-size:11px;color:#64748b;max-width:260px;word-break:break-all}}
+footer{{padding:.75rem 1.5rem;font-size:11px;color:#334155;border-top:1px solid #1e2130;text-align:center}}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Reconhecimento — {cfg['domain']}</h1>
+    <p>recon.py · {ts} · {len(findings)} achados · {stats.get('urls_total',0)} URLs · {stats.get('js_total',0)} JS</p>
+  </div>
+</header>
+<div class="banner">
+  {"".join(f'<div class="stat-card"><div class="n" style="color:{sev_colors[s]}">{sev_counts[s]}</div><div class="l">{s}</div></div>' for s in ["CRITICAL","HIGH","MEDIUM","LOW"])}
+  <div class="stat-card"><div class="n" style="color:#a78bfa">{stats.get("sourcemap_findings",0)}</div><div class="l">Source maps</div></div>
+  <div class="stat-card"><div class="n" style="color:#34d399">{stats.get("inline_findings",0)}</div><div class="l">Inline scripts</div></div>
+  <div class="stat-card"><div class="n" style="color:#f472b6">{stats.get("xss_hits",0)}</div><div class="l">XSS</div></div>
+  <div class="stat-card"><div class="n" style="color:#fb923c">{stats.get("ssrf_redirect_hits",0)}</div><div class="l">SSRF/Redirect</div></div>
+</div>
+<div class="controls">
+  <label>Severidade
+    <select id="sev-filter" onchange="applyFilters()">
+      <option value="">Todas</option>
+      <option>CRITICAL</option><option>HIGH</option><option>MEDIUM</option><option>LOW</option>
+    </select>
+  </label>
+  <label>Tipo
+    <select id="type-filter" onchange="applyFilters()">
+      <option value="">Todos</option>
+      {types_opts}
+    </select>
+  </label>
+  <input id="search" type="search" placeholder="Buscar URL, valor ou contexto…" oninput="applyFilters()">
+  <span id="count">{len(findings)} de {len(findings)} achados</span>
+</div>
+<table id="tbl">
+<thead>
+<tr>
+  <th onclick="sortTable(0)">Sev ↕</th>
+  <th onclick="sortTable(1)">Tipo ↕</th>
+  <th onclick="sortTable(2)">URL ↕</th>
+  <th>Valor</th>
+  <th>Contexto</th>
+</tr>
+</thead>
+<tbody>{rows_html}</tbody>
+</table>
+<footer>recon.py · {cfg['domain']} · {len(findings)} achados · gerado em {ts}</footer>
+<script>
+const tbody=document.querySelector('#tbl tbody');
+const rows=Array.from(tbody.querySelectorAll('tr'));
+const total={len(findings)};
+function applyFilters(){{
+  const sev=document.getElementById('sev-filter').value;
+  const typ=document.getElementById('type-filter').value;
+  const srch=document.getElementById('search').value.toLowerCase();
+  let vis=0;
+  rows.forEach(r=>{{
+    const ok=(!sev||r.dataset.sev===sev)&&(!typ||r.dataset.type===typ)&&(!srch||r.textContent.toLowerCase().includes(srch));
+    r.classList.toggle('hidden',!ok);
+    if(ok)vis++;
+  }});
+  document.getElementById('count').textContent=vis+' de '+total+' achados';
+}}
+let sortDir=1;
+function sortTable(col){{
+  const sorted=rows.sort((a,b)=>{{
+    const ta=a.cells[col]?.textContent.trim()||'';
+    const tb=b.cells[col]?.textContent.trim()||'';
+    return sortDir*ta.localeCompare(tb);
+  }});
+  sortDir*=-1;
+  sorted.forEach(r=>tbody.appendChild(r));
+  applyFilters();
+}}
+</script>
+</body>
+</html>"""
+
+    cfg["summary_html"].write_text(html, encoding="utf-8")
+    logger.info("SUMMARY HTML → %s", cfg["summary_html"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1540,15 +2278,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Reconhecimento web focado em JS: coleta URLs, extrai segredos, valida chaves."
     )
-    parser.add_argument("domain",            nargs="?",            help="Domínio alvo. Ex: exemplo.com.br")
-    parser.add_argument("--no-dalfox",       action="store_true",  help="Pula probe XSS com dalfox")
-    parser.add_argument("--no-ssrf-probe",   action="store_true",  help="Pula probe SSRF/redirect")
-    parser.add_argument("--no-sensitive-dl", action="store_true",  help="Pula download de arquivos sensíveis")
-    parser.add_argument("--no-httpx",        action="store_true",  help="Usa todas as URLs sem validar com httpx")
-    parser.add_argument("--no-google-val",   action="store_true",  help="Pula validação de endpoints Google")
-    parser.add_argument("--no-subs",         action="store_true",  help="Pula análise de subdomínios")
-    parser.add_argument("--workers",         type=int, default=20, help="Workers JS (padrão: 20)")
-    parser.add_argument("--timeout",         type=int, default=10, help="Timeout de requisições em segundos (padrão: 10)")
+    parser.add_argument("domain",               nargs="?",            help="Domínio alvo. Ex: exemplo.com.br")
+    parser.add_argument("--no-dalfox",          action="store_true",  help="Pula probe XSS com dalfox")
+    parser.add_argument("--no-ssrf-probe",      action="store_true",  help="Pula probe SSRF/redirect")
+    parser.add_argument("--no-sensitive-dl",    action="store_true",  help="Pula download de arquivos sensíveis")
+    parser.add_argument("--no-httpx",           action="store_true",  help="Usa todas as URLs sem validar com httpx")
+    parser.add_argument("--no-google-val",      action="store_true",  help="Pula validação de endpoints Google")
+    parser.add_argument("--no-subs",            action="store_true",  help="Pula análise de subdomínios")
+    parser.add_argument("--no-sourcemaps",      action="store_true",  help="Pula coleta e análise de source maps")
+    parser.add_argument("--no-inline-scripts",  action="store_true",  help="Pula análise de inline scripts em HTML")
+    parser.add_argument("--no-cache",           action="store_true",  help="Ignora cache de JS em disco")
+    parser.add_argument("--workers",            type=int, default=20, help="Workers JS (padrão: 20)")
+    parser.add_argument("--timeout",            type=int, default=10, help="Timeout de requisições em segundos (padrão: 10)")
     return parser.parse_args()
 
 
@@ -1566,6 +2307,7 @@ def main() -> None:
     cfg                    = get_config(domain)
     cfg["js_workers"]      = max(1, args.workers)
     cfg["request_timeout"] = max(1, args.timeout)
+    cfg["_no_cache"]       = getattr(args, "no_cache", False)
     logger                 = setup_logging(cfg["log_file"])
     stats: dict[str, int]  = {}
 
@@ -1573,6 +2315,9 @@ def main() -> None:
     logger.info("Iniciando recon para: %s", domain)
     logger.info("Diretório de saída : %s", cfg["base_dir"])
     logger.info("=" * 60)
+
+    if not preflight_check(logger, args):
+        sys.exit(1)
 
     stats["urls_total"] = collect_urls(cfg, logger)
 
@@ -1593,13 +2338,37 @@ def main() -> None:
 
     stats["js_total"] = collect_js(cfg, logger)
 
-    google_keys_found: set           = set()
+    google_keys_found: set            = set()
     google_keys_lock:  threading.Lock = threading.Lock()
+
+    if args.no_inline_scripts:
+        logger.info("--no-inline-scripts: pulando análise de inline scripts.")
+        stats["inline_findings"] = 0
+    else:
+        stats["inline_findings"] = analyze_inline_scripts(
+            cfg, logger, google_keys_found, google_keys_lock
+        )
+
+    gc.collect()
 
     js_findings, gkeys = analyze_all_js(cfg, logger)
     stats["js_findings"] = js_findings
     with google_keys_lock:
         google_keys_found.update(gkeys)
+
+    gc.collect()
+
+    if args.no_sourcemaps:
+        logger.info("--no-sourcemaps: pulando análise de source maps.")
+        stats["sourcemap_findings"] = 0
+    else:
+        sm_findings = collect_and_analyze_sourcemaps(
+            cfg, logger, google_keys_found, google_keys_lock
+        )
+        stats["sourcemap_findings"]  = sm_findings
+        stats["js_findings"]        += sm_findings
+
+    gc.collect()
 
     if args.no_subs:
         logger.info("--no-subs: análise de subdomínios pulada.")
@@ -1621,6 +2390,7 @@ def main() -> None:
         validate_all_google_keys(google_keys_found, cfg, logger)
 
     write_summary(cfg, logger, stats)
+    write_summary_html(cfg, logger, stats)
 
     logger.info("=" * 60)
     logger.info("Recon finalizado. Log: %s", cfg["log_file"])
