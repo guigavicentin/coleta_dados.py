@@ -2,14 +2,34 @@
 """
 recon.py — Script de reconhecimento web passivo/ativo focado em JS.
 
-Correções de memória aplicadas (v2):
-  [MEM-1] Sets globais com teto máximo (MAX_URLS_IN_MEMORY / MAX_SECRETS_SEEN)
-  [MEM-2] resp.text com verificação de Content-Length + leitura em stream com limite de bytes
-  [MEM-3] ThreadPoolExecutor com processamento em chunks + gc.collect() periódico
-  [MEM-4] Cache de JS em disco com limite de entradas (LRU por mtime)
-  [MEM-5] analyze_inline_scripts: concorrência reduzida + batch sequencial
-  [MEM-6] sourcesContent processado item a item (sem manter lista completa em RAM)
-  [MEM-7] all_urls coletado e descarregado em disco antes do próximo estágio
+Fluxo:
+  1. Coleta de URLs  (gau + waybackurls + katana + hakrawler + subfinder + gospider)
+  2. Validação de URLs ativas com httpx
+  3. Filtragem com GF  (xss, sqli, ssrf, redirect, ssti)
+  4. Download e análise de arquivos sensíveis por extensão
+  5. Coleta de URLs de JS  (filtro inteligente, sem CDNs)
+  5b. Análise de inline scripts em HTML
+  5c. [NOVO] js_live_crawler: coleta JS ao vivo via browser real (domínio + subdomínios)
+  6. Análise de segredos em JS  (padrões de alta precisão + detecção de ofuscação)
+  6b. Extração e análise de source maps (.js.map)
+  7. Validação de Google API Keys
+  8. Extração e enriquecimento de endpoints expostos em JS
+  9. Probe de XSS (dalfox) e SSRF/redirect (qsreplace)
+ 10. Relatório consolidado (TXT + HTML interativo)
+
+Melhorias integradas:
+  1. Coleta e análise de source maps (.js.map)          — cobertura
+  2. Deduplicação de segredos por valor normalizado      — precisão
+  3. Rate limiting adaptativo por hostname               — performance
+  5. Validação estrutural de JWT                         — precisão
+  6. Extração de inline scripts em HTML                  — cobertura
+  7. Cache de JS em disco por hash de URL                — performance
+  8. Severidade automática por tipo de segredo           — relatório
+  9. Preflight check de ferramentas                      — resiliência
+ 10. SUMMARY.html interativo e filtrável                 — relatório
+ 11. [NOVO] js_live_crawler integrado                    — cobertura real
+ 12. [NOVO] Dedup global de JS entre domínio/subs        — precisão
+ 13. [NOVO] Extração rica de endpoints (path, query GET/POST, JS de origem) — cobertura
 """
 
 from __future__ import annotations
@@ -18,7 +38,6 @@ import argparse
 import base64 as _b64
 import collections
 import csv
-import gc
 import hashlib
 import json
 import logging
@@ -33,7 +52,6 @@ import urllib.parse
 import urllib3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Iterator
 
 import requests
 from tenacity import (
@@ -45,21 +63,6 @@ from tenacity import (
 )
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# [MEM-1] Tetos de memória para estruturas globais
-# ─────────────────────────────────────────────────────────────────────────────
-
-MAX_URLS_IN_MEMORY   = 500_000   # URLs no set all_urls antes de flush para disco
-MAX_SECRETS_SEEN     = 50_000    # entradas no set _seen_secrets
-MAX_JS_ANALYZED      = 100_000   # URLs no set _analyzed_js_urls
-MAX_JS_CONTENT_BYTES = 5_000_000 # 5 MB por arquivo JS/HTML
-MAX_HTML_CONTENT_BYTES = 3_000_000 # 3 MB por página HTML (inline scripts)
-
-# [MEM-4] Cache de JS em disco
-_JS_CACHE_VERSION  = "v2"
-_JS_CACHE_TTL      = 86400   # 24h em segundos
-_JS_CACHE_MAX      = 2000    # máximo de entradas no cache
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constantes de qualidade
@@ -97,6 +100,10 @@ _CDN_DOMAINS_RE = re.compile(
     r'static\.cloudflareinsights\.com)',
     re.I,
 )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Severidade
+# ─────────────────────────────────────────────────────────────────────────────
 
 SECRET_SEVERITY: dict[str, str] = {
     "aws_access_key":        "CRITICAL",
@@ -141,6 +148,10 @@ def get_severity(secret_type: str) -> str:
     return SECRET_SEVERITY.get(secret_type, "UNKNOWN")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Deduplicação de segredos
+# ─────────────────────────────────────────────────────────────────────────────
+
 _CASE_SENSITIVE_TYPES = frozenset({
     "aws_access_key", "github_pat", "github_oauth", "gitlab_pat",
     "npm_token", "stripe_secret", "stripe_publishable", "openai_key",
@@ -156,6 +167,10 @@ def _normalize_secret_value(type_name: str, value: str) -> str:
         v = v.split("?")[0].rstrip("/")
     return v
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers de regex / entropia
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _regex(pattern: str, flags: int = 0) -> re.Pattern:
     return re.compile(pattern, flags)
@@ -187,6 +202,10 @@ def is_likely_real_credential(raw_match: str, context_line: str = "") -> bool:
     return True
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Validação estrutural de JWT
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _is_real_jwt(token: str) -> bool:
     parts = token.split(".")
     if len(parts) != 3:
@@ -208,6 +227,10 @@ def _is_real_jwt(token: str) -> bool:
         return False
     return True
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Detector de strings ofuscadas via char-code arrays
+# ─────────────────────────────────────────────────────────────────────────────
 
 _CHARCODE_ARRAY_RE = re.compile(r'\[\s*(\d{2,3}(?:\s*,\s*\d{2,3}){5,})\s*\]')
 
@@ -236,7 +259,6 @@ def scan_charcode_obfuscation(content: str, url: str, logger: logging.Logger) ->
         decoded = _decode_charcode_array(m.group(1))
         if not decoded or len(decoded) < 8:
             continue
-
         matched_label = None
         for label, pattern in _DECODED_SECRET_CHECKS:
             if pattern is None:
@@ -246,18 +268,12 @@ def scan_charcode_obfuscation(content: str, url: str, logger: logging.Logger) ->
             if pattern.search(decoded):
                 matched_label = label
                 break
-
         if matched_label:
             start   = max(0, m.start() - 60)
             end     = min(len(content), m.end() + 60)
             context = content[start:end].replace("\n", " ")
             logger.warning("[!!!] %s (ofuscado) → %s | decoded: %s", matched_label, url, decoded[:80])
-            results.append({
-                "type":    matched_label,
-                "value":   decoded,
-                "context": context,
-                "url":     url,
-            })
+            results.append({"type": matched_label, "value": decoded, "context": context, "url": url})
     return results
 
 
@@ -269,18 +285,15 @@ def setup_logging(log_file: Path) -> logging.Logger:
     logger = logging.getLogger("recon")
     logger.setLevel(logging.DEBUG)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
-
-    ch = logging.StreamHandler(sys.stdout)
+    ch  = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
     ch.setFormatter(fmt)
     logger.addHandler(ch)
-
     log_file.parent.mkdir(parents=True, exist_ok=True)
     fh = logging.FileHandler(log_file, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
     logger.addHandler(fh)
-
     return logger
 
 
@@ -296,22 +309,25 @@ def get_config(domain: str) -> dict:
         "domain":   domain,
         "base_dir": base,
 
-        "urls_file":           base / "urls_raw.txt",
-        "urls_alive_file":     base / "urls_alive.txt",
-        "js_file":             base / "js_urls.txt",
-        "secrets_txt":         base / "secrets.txt",
-        "secrets_csv":         base / "secrets.csv",
-        "secrets_jsonl":       base / "secrets.jsonl",
-        "google_keys_file":    base / "google_keys.txt",
-        "google_report_file":  base / "google_keys_report.txt",
-        "log_file":            base / "recon.log",
-        "gf_dir":              base / "gf",
-        "sensitive_urls_file": base / "sensitive_urls.txt",
-        "sensitive_dir":       base / "sensitive_downloads",
-        "sensitive_report":    base / "sensitive_report.txt",
-        "api_endpoints_file":  base / "api_endpoints.txt",
-        "summary_file":        base / "SUMMARY.txt",
-        "summary_html":        base / "SUMMARY.html",
+        "urls_file":              base / "urls_raw.txt",
+        "urls_alive_file":        base / "urls_alive.txt",
+        "js_file":                base / "js_urls.txt",
+        "secrets_txt":            base / "secrets.txt",
+        "secrets_csv":            base / "secrets.csv",
+        "secrets_jsonl":          base / "secrets.jsonl",
+        "google_keys_file":       base / "google_keys.txt",
+        "google_report_file":     base / "google_keys_report.txt",
+        "log_file":               base / "recon.log",
+        "gf_dir":                 base / "gf",
+        "sensitive_urls_file":    base / "sensitive_urls.txt",
+        "sensitive_dir":          base / "sensitive_downloads",
+        "sensitive_report":       base / "sensitive_report.txt",
+        "api_endpoints_file":     base / "api_endpoints.txt",
+        "api_endpoints_jsonl":    base / "api_endpoints.jsonl",   # [NOVO] enriquecido
+        "live_js_file":           base / "live_js_urls.txt",      # [NOVO] js_live_crawler
+        "live_js_report":         base / "live_js_report.json",   # [NOVO] relatório live
+        "summary_file":           base / "SUMMARY.txt",
+        "summary_html":           base / "SUMMARY.html",
 
         "gf_patterns": ["xss", "sqli", "ssrf", "redirect", "ssti"],
 
@@ -363,10 +379,10 @@ def get_config(domain: str) -> dict:
             "mapbox_token":         _regex(r'pk\.eyJ1[A-Za-z0-9._\-]{20,}'),
             "notion_token":         _regex(r'secret_[A-Za-z0-9]{43}'),
             "linear_api_key":       _regex(r'lin_api_[A-Za-z0-9]{40}'),
-            "supabase_url":          _regex(r'https://[a-z0-9]{20}\.supabase\.co', re.I),
-            "supabase_anon_key":     _regex(r'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[A-Za-z0-9_\-]{50,}\.[A-Za-z0-9_\-]{43}'),
-            "supabase_service_role": _regex(r'(?:SUPABASE_SERVICE_ROLE_KEY|service_role)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-\.]{100,})["\']', re.I),
-            "supabase_env":          _regex(r'SUPABASE_(?:URL|ANON_KEY|SERVICE_ROLE_KEY)\s*[=:]\s*\S+', re.I),
+            "supabase_url":         _regex(r'https://[a-z0-9]{20}\.supabase\.co', re.I),
+            "supabase_anon_key":    _regex(r'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[A-Za-z0-9_\-]{50,}\.[A-Za-z0-9_\-]{43}'),
+            "supabase_service_role":_regex(r'(?:SUPABASE_SERVICE_ROLE_KEY|service_role)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-\.]{100,})["\']', re.I),
+            "supabase_env":         _regex(r'SUPABASE_(?:URL|ANON_KEY|SERVICE_ROLE_KEY)\s*[=:]\s*\S+', re.I),
             "private_key":          _regex(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
             "jwt":                  _regex(r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}'),
             "bcrypt_hash":          _regex(r'\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}'),
@@ -382,13 +398,9 @@ def get_config(domain: str) -> dict:
             "bearer_token", "password_field",
         },
 
-        "api_endpoint_patterns": [
-            re.compile(r'["\`](/api/v\d[a-zA-Z0-9/_\-]*)["\`]'),
-            re.compile(r'["\`](/graphql)["\`\s/]', re.I),
-            re.compile(r'["\`](/gql)["\`\s/]', re.I),
-            re.compile(r'https?://(?:internal|admin|dev|staging|api)\.[a-z0-9\-]+\.[a-z]+[^\s"\'`]*'),
-            re.compile(r'["\`](/v\d+/[a-zA-Z0-9/_\-]{4,})["\`]'),
-        ],
+        # ── [NOVO] Padrões ricos de endpoint ─────────────────────────────────
+        # Cada tupla: (label, regex, metodo_hint)
+        "endpoint_patterns": _build_endpoint_patterns(),
 
         "google_key_regex":  re.compile(r'AIza[0-9A-Za-z\-_]{35}'),
         "headers":           {"User-Agent": "Mozilla/5.0 recon"},
@@ -410,21 +422,142 @@ def get_config(domain: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Preflight check de ferramentas
+# [NOVO] Padrões ricos de endpoint — paths, APIs, queries GET/POST
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_endpoint_patterns() -> list[tuple[str, re.Pattern, str]]:
+    """
+    Retorna lista de (label, regex, method_hint).
+    method_hint pode ser: GET, POST, PUT, DELETE, PATCH, ANY, UNKNOWN
+    """
+    return [
+        # /api/vN/...
+        ("api_versioned",
+         re.compile(r'["\`](/api/v\d+[a-zA-Z0-9/_\-]*(?:\?[^\s"\'`]*)?)["\`]'),
+         "ANY"),
+        # /graphql /gql
+        ("graphql",
+         re.compile(r'["\`]((?:/graphql|/gql)(?:\?[^\s"\'`]*)?)["\`\s/]', re.I),
+         "POST"),
+        # /vN/path (sem /api)
+        ("versioned_path",
+         re.compile(r'["\`](/v\d+/[a-zA-Z0-9/_\-]{4,}(?:\?[^\s"\'`]*)?)["\`]'),
+         "ANY"),
+        # URL absoluta de subdomínios internos
+        ("internal_subdomain",
+         re.compile(r'(https?://(?:internal|admin|dev|staging|api)\.[a-z0-9\-]+\.[a-z]+[^\s"\'`]*)'),
+         "ANY"),
+        # fetch / axios GET explícito
+        ("fetch_get",
+         re.compile(
+             r'(?:fetch|axios\.get|http\.get|request\.get|this\.\$http\.get)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]',
+             re.I,
+         ),
+         "GET"),
+        # fetch / axios POST explícito
+        ("fetch_post",
+         re.compile(
+             r'(?:fetch|axios\.post|http\.post|request\.post|this\.\$http\.post)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]',
+             re.I,
+         ),
+         "POST"),
+        # método: 'PUT' / 'DELETE' / 'PATCH' em fetch genérico
+        ("fetch_put",
+         re.compile(
+             r'(?:axios\.put|http\.put|request\.put)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]',
+             re.I,
+         ),
+         "PUT"),
+        ("fetch_delete",
+         re.compile(
+             r'(?:axios\.delete|http\.delete|request\.delete)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]',
+             re.I,
+         ),
+         "DELETE"),
+        ("fetch_patch",
+         re.compile(
+             r'(?:axios\.patch|http\.patch|request\.patch)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]',
+             re.I,
+         ),
+         "PATCH"),
+        # fetch genérico com method explícito no options object
+        ("fetch_generic_with_method",
+         re.compile(
+             r'fetch\s*\(\s*["\`]([^"\'`\s]{4,})["\`]\s*,\s*\{[^}]*method\s*:\s*["\'](\w+)["\']',
+             re.I,
+         ),
+         "DYNAMIC"),  # método capturado do grupo 2
+        # URLSearchParams / QueryString — GET com query
+        ("query_string_get",
+         re.compile(
+             r'(?:new\s+URLSearchParams|qs\.stringify|querystring\.stringify)\s*\([^)]*\)\s*[;\n].*?'
+             r'["\`](/[a-zA-Z0-9/_\-]{2,})["\`]',
+             re.I | re.DOTALL,
+         ),
+         "GET"),
+        # body JSON POST
+        ("json_body_post",
+         re.compile(
+             r'body\s*:\s*JSON\.stringify\s*\([^)]*\).*?'
+             r'["\`](/[a-zA-Z0-9/_\-]{2,})["\`]',
+             re.I | re.DOTALL,
+         ),
+         "POST"),
+        # FormData POST
+        ("formdata_post",
+         re.compile(
+             r'new\s+FormData\s*\([^)]*\).*?'
+             r'(?:fetch|axios\.post)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]',
+             re.I | re.DOTALL,
+         ),
+         "POST"),
+        # Rota de router (Vue/React/Express)
+        ("router_path",
+         re.compile(
+             r'(?:path|route|to)\s*:\s*["\`](/[a-zA-Z0-9/_\-:]{3,}(?:\?[^\s"\'`]*)?)["\`]',
+             re.I,
+         ),
+         "GET"),
+        # href / src com path
+        ("href_path",
+         re.compile(
+             r'(?:href|src|action)\s*[=:]\s*["\`](/[a-zA-Z0-9/_\-\.]{4,}(?:\?[^\s"\'`]*)?)["\`]',
+             re.I,
+         ),
+         "GET"),
+        # query param pattern em URLs absolutas: ?key=value&key2=value2
+        ("url_with_query",
+         re.compile(
+             r'["\`]((?:https?://[^\s"\'`]+)?/[a-zA-Z0-9/_\-]{2,}\?(?:[a-zA-Z0-9_\-]+=\w+&?)+)["\`]',
+             re.I,
+         ),
+         "GET"),
+        # WebSocket endpoints
+        ("websocket",
+         re.compile(
+             r'new\s+WebSocket\s*\(\s*["\`](wss?://[^\s"\'`]+)["\`]',
+             re.I,
+         ),
+         "WS"),
+    ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Preflight check
 # ─────────────────────────────────────────────────────────────────────────────
 
 _TOOL_META: dict[str, dict] = {
-    "gau":         {"install": "go install github.com/lc/gau/v2/cmd/gau@latest",                           "impact": "coleta passiva de URLs"},
-    "waybackurls": {"install": "go install github.com/tomnomnom/waybackurls@latest",                       "impact": "coleta passiva via Wayback Machine"},
-    "katana":      {"install": "go install github.com/projectdiscovery/katana/cmd/katana@latest",           "impact": "crawling ativo com suporte a JS"},
-    "hakrawler":   {"install": "go install github.com/hakluke/hakrawler@latest",                            "impact": "crawling de subdomínios"},
-    "gospider":    {"install": "go install github.com/jaeles-project/gospider@latest",                      "impact": "crawling com suporte a sitemap/robots"},
-    "httpx":       {"install": "go install github.com/projectdiscovery/httpx/cmd/httpx@latest",             "impact": "validação de URLs ativas"},
-    "subfinder":   {"install": "go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest",  "impact": "enumeração de subdomínios"},
-    "gf":          {"install": "go install github.com/tomnomnom/gf@latest",                                 "impact": "filtragem XSS/SQLi/SSRF/redirect"},
-    "dalfox":      {"install": "go install github.com/hahwul/dalfox/v2@latest",                             "impact": "probe XSS ativo"},
-    "qsreplace":   {"install": "go install github.com/tomnomnom/qsreplace@latest",                          "impact": "probe SSRF/redirect"},
-    "curl":        {"install": "apt install curl / brew install curl",                                       "impact": "validação de redirect hits"},
+    "gau":         {"install": "go install github.com/lc/gau/v2/cmd/gau@latest",                                   "impact": "coleta passiva de URLs"},
+    "waybackurls": {"install": "go install github.com/tomnomnom/waybackurls@latest",                               "impact": "coleta passiva via Wayback Machine"},
+    "katana":      {"install": "go install github.com/projectdiscovery/katana/cmd/katana@latest",                  "impact": "crawling ativo com suporte a JS"},
+    "hakrawler":   {"install": "go install github.com/hakluke/hakrawler@latest",                                   "impact": "crawling de subdomínios"},
+    "gospider":    {"install": "go install github.com/jaeles-project/gospider@latest",                             "impact": "crawling com suporte a sitemap/robots"},
+    "httpx":       {"install": "go install github.com/projectdiscovery/httpx/cmd/httpx@latest",                    "impact": "validação de URLs ativas"},
+    "subfinder":   {"install": "go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest",         "impact": "enumeração de subdomínios"},
+    "gf":          {"install": "go install github.com/tomnomnom/gf@latest",                                        "impact": "filtragem XSS/SQLi/SSRF/redirect"},
+    "dalfox":      {"install": "go install github.com/hahwul/dalfox/v2@latest",                                    "impact": "probe XSS ativo"},
+    "qsreplace":   {"install": "go install github.com/tomnomnom/qsreplace@latest",                                 "impact": "probe SSRF/redirect"},
+    "curl":        {"install": "apt install curl / brew install curl",                                              "impact": "validação de redirect hits"},
 }
 
 _CRITICAL_TOOLS = {"httpx"}
@@ -434,6 +567,11 @@ def preflight_check(logger: logging.Logger, args: argparse.Namespace) -> bool:
     missing: list[tuple[str, str, str]] = []
     present: list[str]                  = []
 
+    # Verifica js_live_crawler.py separadamente
+    live_crawler_ok = Path("js_live_crawler.py").exists()
+    if not live_crawler_ok:
+        logger.warning("js_live_crawler.py não encontrado no diretório atual — etapa live JS será pulada.")
+
     for tool, meta in _TOOL_META.items():
         if tool_available(tool):
             present.append(tool)
@@ -442,13 +580,13 @@ def preflight_check(logger: logging.Logger, args: argparse.Namespace) -> bool:
 
     logger.info("─── Preflight check ─────────────────────────────────────────")
     logger.info("Ferramentas disponíveis (%d): %s", len(present), ", ".join(sorted(present)))
+    logger.info("js_live_crawler.py: %s", "OK" if live_crawler_ok else "AUSENTE")
 
     if missing:
         logger.warning("Ferramentas ausentes (%d):", len(missing))
         for tool, install_cmd, impact in sorted(missing):
             level = logging.ERROR if tool in _CRITICAL_TOOLS else logging.WARNING
-            logger.log(level, "  ✗ %-15s | impacto: %-45s | instalar: %s",
-                       tool, impact, install_cmd)
+            logger.log(level, "  ✗ %-15s | impacto: %-45s | instalar: %s", tool, impact, install_cmd)
 
     critical_missing = [t for t, _, _ in missing if t in _CRITICAL_TOOLS]
     if "httpx" in critical_missing and args.no_httpx:
@@ -483,7 +621,7 @@ def append_line_to_file(path: Path, line: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Rate limiting adaptativo por hostname
+# Rate limiting adaptativo
 # ─────────────────────────────────────────────────────────────────────────────
 
 _host_semaphores: dict[str, threading.Semaphore] = {}
@@ -532,33 +670,7 @@ def _make_retrying_get(cfg: dict):
                 time.sleep(5)
                 resp.raise_for_status()
             return resp
-
     return _get
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# [MEM-2] Leitura de resposta com limite de bytes
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _safe_read_text(resp: requests.Response, max_bytes: int) -> str | None:
-    """
-    Lê o corpo de uma resposta com limite de tamanho.
-    Verifica Content-Length antes e lê em stream se necessário.
-    Retorna None se exceder o limite.
-    """
-    cl = resp.headers.get("Content-Length")
-    if cl and int(cl) > max_bytes:
-        return None
-    # Para respostas sem Content-Length, lê com limite
-    content = b""
-    for chunk in resp.iter_content(chunk_size=65536):
-        content += chunk
-        if len(content) > max_bytes:
-            return None
-    try:
-        return content.decode("utf-8", errors="replace")
-    except Exception:
-        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -569,11 +681,7 @@ def run_cmd(cmd: list[str], logger: logging.Logger,
             stdin: str | None = None, timeout: int = 300) -> list[str]:
     try:
         result = subprocess.run(
-            cmd,
-            input=stdin,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+            cmd, input=stdin, capture_output=True, text=True, timeout=timeout,
         )
         if result.stderr:
             logger.debug("[stderr] %s: %s", cmd[0], result.stderr.strip()[:300])
@@ -599,29 +707,21 @@ def tool_available(name: str) -> bool:
 
 def _fetch_wayback_api(domain: str, logger: logging.Logger) -> set[str]:
     urls: set[str] = set()
-    base_url = "https://web.archive.org/cdx/search/cdx"
     params = {
-        "url":      f"*.{domain}/*",
-        "output":   "text",
-        "fl":       "original",
-        "collapse": "urlkey",
-        "limit":    "100000",
-        "filter":   "statuscode:200",
+        "url": f"*.{domain}/*", "output": "text", "fl": "original",
+        "collapse": "urlkey", "limit": "100000", "filter": "statuscode:200",
     }
     try:
-        resp = requests.get(base_url, params=params, timeout=900,
-                            headers={"User-Agent": "Mozilla/5.0 recon"}, stream=True)
+        resp = requests.get(
+            "https://web.archive.org/cdx/search/cdx",
+            params=params, timeout=900,
+            headers={"User-Agent": "Mozilla/5.0 recon"},
+        )
         if resp.status_code == 200:
-            for line in resp.iter_lines(decode_unicode=True):
-                line = line.strip() if isinstance(line, str) else line.decode("utf-8", errors="replace").strip()
+            for line in resp.text.splitlines():
+                line = line.strip()
                 if line and line.startswith("http"):
                     urls.add(line)
-                    # [MEM-1] Interrompe se atingir o teto
-                    if len(urls) >= MAX_URLS_IN_MEMORY:
-                        logger.warning("[wayback-api] teto de URLs atingido (%d) — interrompendo.", MAX_URLS_IN_MEMORY)
-                        break
-        else:
-            logger.debug("[wayback-api] HTTP %d", resp.status_code)
     except requests.exceptions.Timeout:
         logger.warning("[wayback-api] timeout na requisição.")
     except Exception as exc:
@@ -638,8 +738,7 @@ def _fetch_commoncrawl_api(domain: str, logger: logging.Logger) -> set[str]:
         )
         if idx_resp.status_code != 200:
             return urls
-        indexes = idx_resp.json()
-        recent  = [i["cdx-api"] for i in indexes[:3]]
+        recent = [i["cdx-api"] for i in idx_resp.json()[:3]]
     except Exception as exc:
         logger.debug("[commoncrawl-api] erro ao buscar índices: %s", exc)
         return urls
@@ -651,16 +750,12 @@ def _fetch_commoncrawl_api(domain: str, logger: logging.Logger) -> set[str]:
                 params={"url": f"*.{domain}", "output": "text",
                         "fl": "url", "collapse": "urlkey", "limit": "50000"},
                 timeout=90, headers={"User-Agent": "Mozilla/5.0 recon"},
-                stream=True,
             )
             if resp.status_code == 200:
-                for line in resp.iter_lines(decode_unicode=True):
-                    line = line.strip() if isinstance(line, str) else line.decode("utf-8", errors="replace").strip()
+                for line in resp.text.splitlines():
+                    line = line.strip()
                     if line and line.startswith("http"):
                         urls.add(line)
-                        if len(urls) >= MAX_URLS_IN_MEMORY:
-                            logger.warning("[commoncrawl-api] teto atingido — interrompendo.")
-                            return urls
         except Exception as exc:
             logger.debug("[commoncrawl-api] erro em %s: %s", api_url, exc)
     return urls
@@ -671,70 +766,39 @@ def _fetch_commoncrawl_api(domain: str, logger: logging.Logger) -> set[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def collect_urls(cfg: dict, logger: logging.Logger) -> int:
-    domain   = cfg["domain"]
-    # [MEM-7] Usa arquivo temporário para evitar manter tudo em RAM
+    domain    = cfg["domain"]
     all_urls: set[str] = set()
 
-    def _add_urls(new_urls: list[str] | set[str]) -> None:
-        """Adiciona URLs ao set e faz flush para disco se necessário."""
-        for u in new_urls:
-            all_urls.add(u)
-        if len(all_urls) >= MAX_URLS_IN_MEMORY:
-            _flush_urls_to_disk()
-
-    def _flush_urls_to_disk() -> None:
-        if not all_urls:
-            return
-        existing: set[str] = set()
-        if cfg["urls_file"].exists():
-            existing = set(cfg["urls_file"].read_text(encoding="utf-8").splitlines())
-        merged = existing | all_urls
-        cfg["urls_file"].parent.mkdir(parents=True, exist_ok=True)
-        cfg["urls_file"].write_text("\n".join(sorted(merged)) + "\n", encoding="utf-8")
-        all_urls.clear()
-        gc.collect()
-
-    # ── gau ──────────────────────────────────────────────────
     if tool_available("gau"):
         logger.info("[gau] coletando… (domínio: %s)", domain)
         lines = run_cmd([
             "gau", "--threads", "5", "--subs",
             "--providers", "wayback,commoncrawl,otx,urlscan",
-            "--retries", "2", "--timeout", "90", domain
+            "--retries", "2", "--timeout", "90", domain,
         ], logger, timeout=900)
-        _add_urls(lines)
+        all_urls.update(lines)
         logger.info("[gau] %d URLs", len(lines))
     else:
         logger.warning("gau não encontrado — pulando.")
 
-    # ── waybackurls ───────────────────────────────────────────
     if tool_available("waybackurls"):
         logger.info("[waybackurls] coletando… (domínio: %s)", domain)
         lines = run_cmd(["waybackurls", domain], logger, timeout=900)
-        _add_urls(lines)
+        all_urls.update(lines)
         logger.info("[waybackurls] %d URLs", len(lines))
     else:
         logger.warning("waybackurls não encontrado — pulando.")
 
-    # ── Wayback Machine API direta ────────────────────────────
     logger.info("[wayback-api] consultando CDX API…")
-    wayback_urls = _fetch_wayback_api(domain, logger)
-    if wayback_urls:
-        _add_urls(wayback_urls)
-        logger.info("[wayback-api] %d URLs", len(wayback_urls))
-    del wayback_urls
-    gc.collect()
+    wb = _fetch_wayback_api(domain, logger)
+    all_urls.update(wb)
+    logger.info("[wayback-api] %d URLs", len(wb))
 
-    # ── CommonCrawl API direta ────────────────────────────────
     logger.info("[commoncrawl-api] consultando…")
-    cc_urls = _fetch_commoncrawl_api(domain, logger)
-    if cc_urls:
-        _add_urls(cc_urls)
-        logger.info("[commoncrawl-api] %d URLs", len(cc_urls))
-    del cc_urls
-    gc.collect()
+    cc = _fetch_commoncrawl_api(domain, logger)
+    all_urls.update(cc)
+    logger.info("[commoncrawl-api] %d URLs", len(cc))
 
-    # ── katana ────────────────────────────────────────────────
     if tool_available("katana"):
         logger.info("[katana] coletando…")
         lines = run_cmd([
@@ -744,36 +808,31 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
             "-ef", "woff,css,png,svg,jpg,woff2,jpeg,gif,ico,ttf",
             "-silent",
         ], logger, timeout=900)
-        _add_urls(lines)
+        all_urls.update(lines)
         logger.info("[katana] %d URLs", len(lines))
     else:
         logger.warning("katana não encontrado — pulando.")
 
-    # ── hakrawler ─────────────────────────────────────────────
     if tool_available("hakrawler"):
         logger.info("[hakrawler] coletando…")
         lines = run_cmd(
             ["hakrawler", "-d", "3", "-u", "-subs", "-t", "8", "-insecure"],
-            logger,
-            stdin=f"https://{domain}\n",
-            timeout=600,
+            logger, stdin=f"https://{domain}\n", timeout=600,
         )
-        _add_urls(lines)
+        all_urls.update(lines)
         logger.info("[hakrawler] %d URLs", len(lines))
 
-    # ── gospider ─────────────────────────────────────────────
     if tool_available("gospider"):
         logger.info("[gospider] coletando…")
         try:
             proc = subprocess.Popen(
                 ["gospider", "-s", f"https://{domain}",
-                 "-c", "10", "-d", "3",
-                 "--js", "--sitemap", "--robots",
+                 "-c", "10", "-d", "3", "--js", "--sitemap", "--robots",
                  "-a", "-w", "--subs", "-q",
                  "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
-            gospider_count = 0
+            gospider_lines: list[str] = []
             try:
                 for line in proc.stdout:
                     line = line.strip()
@@ -781,44 +840,34 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
                         continue
                     m = re.search(r'https?://[^\s"\'<>\]]+', line)
                     if m:
-                        url = m.group(0).rstrip('.,;)"\'>]')
-                        all_urls.add(url)
-                        gospider_count += 1
-                        if gospider_count % 10000 == 0:
-                            _flush_urls_to_disk()
+                        all_urls.add(m.group(0).rstrip('.,;)"\'>]'))
+                    gospider_lines.append(line)
             finally:
                 proc.wait()
-            logger.info("[gospider] %d linhas processadas", gospider_count)
+            logger.info("[gospider] %d linhas processadas", len(gospider_lines))
         except Exception as exc:
             logger.error("[gospider] erro: %s", exc)
 
-    # ── subfinder ─────────────────────────────────────────────
     if tool_available("subfinder"):
         logger.info("[subfinder] enumerando subdomínios…")
         subs = run_cmd(["subfinder", "-d", domain, "-silent"], logger, timeout=300)
         logger.info("[subfinder] %d subdomínios encontrados", len(subs))
-
         if subs:
             if tool_available("hakrawler"):
-                logger.info("[hakrawler] crawling em %d subdomínios…", len(subs))
                 sub_input = "\n".join(f"https://{s}" for s in subs) + "\n"
                 lines = run_cmd(
-                    ["hakrawler", "-d", "2", "-u", "-t", "8",
-                     "-timeout", "10", "-insecure"],
-                    logger,
-                    stdin=sub_input,
+                    ["hakrawler", "-d", "2", "-u", "-t", "8", "-timeout", "10", "-insecure"],
+                    logger, stdin=sub_input,
                     timeout=max(60, len(subs) * 3),
                 )
-                _add_urls(lines)
-                logger.info("[hakrawler/subs] %d URLs", len(lines))
-
+                all_urls.update(lines)
             if tool_available("gospider"):
                 for sub in subs[:50]:
                     try:
                         proc = subprocess.Popen(
                             ["gospider", "-s", f"https://{sub}",
                              "-c", "5", "-d", "2", "--js", "-q",
-                             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"],
+                             "--user-agent", "Mozilla/5.0"],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                         )
                         try:
@@ -834,13 +883,11 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
                     except Exception as exc:
                         logger.error("[gospider/subs] %s: %s", sub, exc)
 
-    # Flush final para disco
-    _flush_urls_to_disk()
-
-    total = sum(1 for l in cfg["urls_file"].read_text(encoding="utf-8").splitlines() if l.strip()) \
-            if cfg["urls_file"].exists() else 0
-    logger.info("URLs coletadas: %d → %s", total, cfg["urls_file"])
-    return total
+    urls  = sorted(all_urls)
+    wrote = write_if_not_empty(cfg["urls_file"], urls, logger)
+    logger.info("URLs coletadas: %d%s", len(urls),
+                f" → {cfg['urls_file']}" if wrote else " (nenhuma)")
+    return len(urls)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -889,20 +936,16 @@ def run_gf(cfg: dict, logger: logging.Logger) -> None:
     if not tool_available("gf"):
         logger.warning("gf não encontrado — pulando filtragem de padrões.")
         return
-
     source = cfg.get("_active_urls_file", cfg["urls_file"])
     if not source.exists():
         return
-
     source_text = source.read_text(encoding="utf-8")
     cfg["gf_dir"].mkdir(parents=True, exist_ok=True)
-
     for pattern in cfg["gf_patterns"]:
         output = cfg["gf_dir"] / f"gf_{pattern}.txt"
         try:
             result = subprocess.run(
-                ["gf", pattern],
-                input=source_text,
+                ["gf", pattern], input=source_text,
                 capture_output=True, text=True, timeout=120,
             )
             lines = [l for l in result.stdout.splitlines() if l.strip()]
@@ -930,13 +973,12 @@ def probe_xss(cfg: dict, logger: logging.Logger) -> int:
 
     out_file = cfg["gf_dir"] / "dalfox_results.txt"
     logger.info("Rodando dalfox…")
-
     try:
         proc = subprocess.Popen(
             ["dalfox", "file", str(xss_file),
              "--silence", "--output", str(out_file),
              "--worker", "10", "--timeout", "10",
-             "--header", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"],
+             "--header", "User-Agent: Mozilla/5.0"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         hits   = 0
@@ -953,19 +995,15 @@ def probe_xss(cfg: dict, logger: logging.Logger) -> int:
         finally:
             killer.cancel()
             proc.wait(timeout=15)
-
         if hits == 0 and out_file.exists():
             hits = out_file.read_text(encoding="utf-8").count("[V]")
-
         if hits:
             logger.warning("[!!!] dalfox: %d XSS confirmados → %s", hits, out_file)
         else:
             if out_file.exists():
                 out_file.unlink()
             logger.info("dalfox: nenhum XSS confirmado.")
-
         return hits
-
     except Exception as exc:
         logger.error("Erro no dalfox: %s", exc)
         return 0
@@ -977,7 +1015,6 @@ def probe_ssrf_redirect(cfg: dict, logger: logging.Logger) -> int:
         "ssrf":     (cfg["gf_dir"] / "gf_ssrf.txt",     "http://169.254.169.254/latest/meta-data/"),
         "redirect": (cfg["gf_dir"] / "gf_redirect.txt", "https://evil.com"),
     }
-
     if not tool_available("qsreplace"):
         logger.warning("qsreplace não encontrado — pulando probes SSRF/redirect.")
         return 0
@@ -985,7 +1022,6 @@ def probe_ssrf_redirect(cfg: dict, logger: logging.Logger) -> int:
     for kind, (gf_file, payload) in probes.items():
         if not gf_file.exists() or gf_file.stat().st_size == 0:
             continue
-
         logger.info("Probe %s…", kind.upper())
         try:
             qsr = subprocess.run(
@@ -1021,7 +1057,6 @@ def probe_ssrf_redirect(cfg: dict, logger: logging.Logger) -> int:
             found += len(hits)
         else:
             logger.info("%s probe: nenhum hit.", kind.upper())
-
     return found
 
 
@@ -1033,11 +1068,9 @@ def extract_sensitive_urls(cfg: dict, logger: logging.Logger) -> int:
     source = cfg.get("_active_urls_file", cfg["urls_file"])
     if not source.exists():
         return 0
-
     regex   = cfg["sensitive_regex"]
     matches = [l.strip() for l in source.read_text(encoding="utf-8").splitlines()
                if l.strip() and regex.search(l.strip())]
-
     wrote = write_if_not_empty(cfg["sensitive_urls_file"], matches, logger)
     logger.info("URLs de arquivos sensíveis: %d%s", len(matches),
                 f" → {cfg['sensitive_urls_file']}" if wrote else "")
@@ -1047,7 +1080,6 @@ def extract_sensitive_urls(cfg: dict, logger: logging.Logger) -> int:
 def download_and_analyze_sensitive(cfg: dict, logger: logging.Logger) -> int:
     if not cfg["sensitive_urls_file"].exists():
         return 0
-
     urls = [u.strip() for u in cfg["sensitive_urls_file"].read_text(encoding="utf-8").splitlines() if u.strip()]
     if not urls:
         return 0
@@ -1059,24 +1091,18 @@ def download_and_analyze_sensitive(cfg: dict, logger: logging.Logger) -> int:
     logger.info("Baixando %d arquivos sensíveis…", len(urls))
     for url in urls[:500]:
         try:
-            resp = get(url, stream=True)
+            resp = get(url)
         except Exception:
             continue
-
         if resp.status_code != 200:
             continue
-
-        # [MEM-2] Leitura com limite
-        content = _safe_read_text(resp, MAX_JS_CONTENT_BYTES)
-        if content is None:
-            logger.debug("[skip] arquivo muito grande: %s", url)
+        content = resp.text
+        if len(content) > 2_000_000:
             continue
-
         local_hits: list[str] = []
         for pattern in cfg["sensitive_content_patterns"]:
             for m in pattern.finditer(content):
                 local_hits.append(m.group(0))
-
         if local_hits:
             cfg["sensitive_dir"].mkdir(parents=True, exist_ok=True)
             safe_name = re.sub(r'[^\w\-.]', '_', url)[:120]
@@ -1086,18 +1112,14 @@ def download_and_analyze_sensitive(cfg: dict, logger: logging.Logger) -> int:
                 report_lines.append(f"URL: {url}\nACHADO: {hit}\n" + "-" * 60)
                 findings += 1
 
-        # Libera memória do conteúdo processado
-        del content
-
     if report_lines:
         write_if_not_empty(cfg["sensitive_report"], report_lines, logger)
-
     logger.info("Achados em arquivos sensíveis: %d", findings)
     return findings
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Etapa 5: Coleta de JS
+# Etapa 5: Coleta de JS (passiva)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def collect_js(cfg: dict, logger: logging.Logger) -> int:
@@ -1107,13 +1129,9 @@ def collect_js(cfg: dict, logger: logging.Logger) -> int:
         return 0
 
     js_re = re.compile(
-        r'(?:'
-        r'\.js(?:\?[^\s]*)?$'
-        r'|/(?:static|assets|dist|build|chunks|bundles)/[^\s]*\.js'
-        r')',
+        r'(?:\.js(?:\?[^\s]*)?$|/(?:static|assets|dist|build|chunks|bundles)/[^\s]*\.js)',
         re.I,
     )
-
     js_urls: set[str] = set()
     for line in source.read_text(encoding="utf-8").splitlines():
         url = line.strip()
@@ -1127,36 +1145,24 @@ def collect_js(cfg: dict, logger: logging.Logger) -> int:
             js_urls.add(url)
 
     wrote = write_if_not_empty(cfg["js_file"], sorted(js_urls), logger)
-    logger.info("Arquivos JS únicos: %d%s", len(js_urls),
+    logger.info("Arquivos JS únicos (passivo): %d%s", len(js_urls),
                 f" → {cfg['js_file']}" if wrote else " (nenhum)")
     return len(js_urls)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Análise de inline scripts em HTML
-# [MEM-5] Concorrência reduzida (8 workers) + processamento em batches de 50
+# Etapa 5b: Inline scripts em HTML
 # ─────────────────────────────────────────────────────────────────────────────
 
-_INLINE_SCRIPT_RE = re.compile(
-    r'<script(?:\s[^>]*)?>(.+?)</script>',
-    re.DOTALL | re.IGNORECASE,
-)
-
+_INLINE_SCRIPT_RE = re.compile(r'<script(?:\s[^>]*)?>(.+?)</script>', re.DOTALL | re.IGNORECASE)
 _FRAMEWORK_DATA_RE = re.compile(
     r'(?:__NEXT_DATA__|__NUXT__|__INITIAL_STATE__|__APP_STATE__|'
     r'window\.__config|window\.__env|globalThis\.__env)\s*=\s*(\{.{20,}?\})',
     re.DOTALL,
 )
-
 _STATIC_EXT_RE = re.compile(
-    r'\.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|map|pdf)(\?|$)',
-    re.I,
+    r'\.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|map|pdf)(\?|$)', re.I,
 )
-
-# [MEM-5] Workers reduzidos para inline scripts
-_INLINE_WORKERS = 8
-# [MEM-5] Tamanho do batch para GC periódico
-_INLINE_BATCH_SIZE = 50
 
 
 def analyze_inline_scripts(cfg: dict, logger: logging.Logger,
@@ -1181,7 +1187,7 @@ def analyze_inline_scripts(cfg: dict, logger: logging.Logger,
     def _process_html(url: str) -> int:
         local = 0
         try:
-            resp = get_fn(url, stream=True)
+            resp = get_fn(url)
         except Exception:
             return 0
         if resp.status_code != 200:
@@ -1189,65 +1195,159 @@ def analyze_inline_scripts(cfg: dict, logger: logging.Logger,
         ct = resp.headers.get("Content-Type", "")
         if "html" not in ct and "text" not in ct:
             return 0
-
-        # [MEM-2] Limite de bytes para HTML
-        content = _safe_read_text(resp, MAX_HTML_CONTENT_BYTES)
-        if content is None:
+        content = resp.text
+        if len(content) > 5_000_000:
             return 0
-
-        scripts = [
-            m.group(1) for m in _INLINE_SCRIPT_RE.finditer(content)
-            if "src=" not in m.group(0)[:50]
-        ]
-        # Libera o HTML completo antes de analisar os scripts
-        del content
-
+        scripts = [m.group(1) for m in _INLINE_SCRIPT_RE.finditer(content) if "src=" not in m.group(0)[:50]]
         for i, script_content in enumerate(scripts):
             if len(script_content.strip()) < 20:
                 continue
             virtual_url = f"{url}::inline_script_{i}"
-            n = analyze_js_content(
-                script_content, virtual_url, cfg, logger,
-                google_keys_found, google_keys_lock,
-            )
+            n = analyze_js_content(script_content, virtual_url, cfg, logger, google_keys_found, google_keys_lock)
             local += n
-
             for fm in _FRAMEWORK_DATA_RE.finditer(script_content):
                 try:
                     data_obj = json.loads(fm.group(1))
-                    flat_str = json.dumps(data_obj)
-                    del data_obj
-                    n2 = analyze_js_content(
-                        flat_str, f"{url}::framework_data", cfg, logger,
-                        google_keys_found, google_keys_lock,
-                    )
+                    n2 = analyze_js_content(json.dumps(data_obj), f"{url}::framework_data", cfg, logger, google_keys_found, google_keys_lock)
                     local += n2
-                    del flat_str
                 except Exception:
                     pass
-
-        del scripts
         return local
 
-    # [MEM-5] Processa em batches com GC periódico
-    for batch_start in range(0, len(sampled), _INLINE_BATCH_SIZE):
-        batch = sampled[batch_start:batch_start + _INLINE_BATCH_SIZE]
-        with ThreadPoolExecutor(max_workers=_INLINE_WORKERS) as executor:
-            futs = {executor.submit(_process_html, u): u for u in batch}
-            for fut in as_completed(futs):
-                try:
-                    total += fut.result()
-                except Exception as exc:
-                    logger.debug("[inline-scripts] erro: %s", exc)
-        gc.collect()
-        logger.debug("[inline-scripts] batch %d/%d processado",
-                     min(batch_start + _INLINE_BATCH_SIZE, len(sampled)), len(sampled))
+    with ThreadPoolExecutor(max_workers=cfg["js_workers"]) as executor:
+        futs = {executor.submit(_process_html, u): u for u in sampled}
+        for fut in as_completed(futs):
+            try:
+                total += fut.result()
+            except Exception as exc:
+                logger.debug("[inline-scripts] erro: %s", exc)
 
-    if total:
-        logger.warning("[!!!] Segredos em inline scripts: %d", total)
-    else:
-        logger.info("[inline-scripts] nenhum segredo encontrado.")
+    logger.info("[inline-scripts] segredos: %d", total)
     return total
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [NOVO] Etapa 5c: js_live_crawler — coleta JS ao vivo via browser real
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_live_crawler(
+    cfg: dict,
+    logger: logging.Logger,
+    args: argparse.Namespace,
+    alive_subdomains: list[str],
+) -> set[str]:
+    """
+    Chama js_live_crawler.py para o domínio principal e todos os subdomínios
+    vivos, coleta os .js retornados, deduplica globalmente e salva.
+
+    Retorna: set de URLs de JS novas (não vistas nas etapas passivas).
+    """
+    live_crawler = Path("js_live_crawler.py")
+    if not live_crawler.exists():
+        logger.warning("[live-crawler] js_live_crawler.py não encontrado — etapa pulada.")
+        return set()
+
+    domain = cfg["domain"]
+    timeout = getattr(args, "live_timeout", 30)
+    wait    = getattr(args, "live_wait",    2)
+
+    # Monta lista de alvos: domínio principal + subdomínios vivos
+    targets: list[str] = [f"https://{domain}"]
+    for sub in alive_subdomains:
+        if not sub.startswith("http"):
+            sub = f"https://{sub}"
+        targets.append(sub)
+
+    logger.info("[live-crawler] iniciando coleta ao vivo em %d alvo(s)…", len(targets))
+
+    # Arquivo temporário de domínios para o -f
+    domains_file = cfg["base_dir"] / "_live_crawler_targets.txt"
+    domains_file.write_text("\n".join(targets) + "\n", encoding="utf-8")
+
+    # Arquivo de saída JSON do live crawler
+    live_json = cfg["live_js_report"]
+
+    cmd = [
+        sys.executable, str(live_crawler),
+        "-f", str(domains_file),
+        "-t", str(timeout),
+        "-w", str(wait),
+        "-o", str(live_json),
+    ]
+
+    logger.info("[live-crawler] executando: %s", " ".join(cmd))
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True, text=True,
+            timeout=max(300, len(targets) * (timeout + wait + 10)),
+        )
+        if result.returncode != 0:
+            logger.warning("[live-crawler] saiu com código %d", result.returncode)
+            if result.stderr:
+                logger.debug("[live-crawler] stderr: %s", result.stderr[:500])
+    except subprocess.TimeoutExpired:
+        logger.warning("[live-crawler] timeout global — resultados parciais podem ter sido salvos.")
+    except Exception as exc:
+        logger.error("[live-crawler] erro ao executar: %s", exc)
+        return set()
+
+    # Lê o JSON gerado e extrai URLs de JS
+    if not live_json.exists():
+        logger.warning("[live-crawler] nenhum arquivo de resultado gerado.")
+        return set()
+
+    live_js_urls: set[str] = set()
+    try:
+        raw = json.loads(live_json.read_text(encoding="utf-8"))
+        # O live_crawler acumula em lista; cada item é um crawl
+        if isinstance(raw, list):
+            crawls = raw
+        else:
+            crawls = [raw]
+
+        for crawl in crawls:
+            for section in ("own_domain", "third_party"):
+                for entry in crawl.get(section, []):
+                    url = entry.get("url", "").strip()
+                    if url and not _CDN_DOMAINS_RE.search(url):
+                        live_js_urls.add(url)
+    except Exception as exc:
+        logger.error("[live-crawler] erro ao ler resultado JSON: %s", exc)
+        return set()
+
+    logger.info("[live-crawler] %d JS coletados ao vivo (bruto)", len(live_js_urls))
+
+    # ── Deduplicação global contra JS já conhecidos ──────────────────────────
+    known_js: set[str] = set()
+    if cfg["js_file"].exists():
+        for line in cfg["js_file"].read_text(encoding="utf-8").splitlines():
+            known_js.add(line.strip().split("?")[0])
+
+    new_js = {
+        url for url in live_js_urls
+        if url.split("?")[0] not in known_js
+    }
+    duplicate_count = len(live_js_urls) - len(new_js)
+
+    logger.info("[live-crawler] JS novos (não vistos passivamente): %d  |  duplicados removidos: %d",
+                len(new_js), duplicate_count)
+
+    # Salva lista de JS novos para análise
+    if new_js:
+        write_if_not_empty(cfg["live_js_file"], sorted(new_js), logger)
+
+    # Atualiza js_file unificado: passivos + live
+    all_js = known_js | {url.split("?")[0] for url in live_js_urls}
+    write_if_not_empty(cfg["js_file"], sorted(all_js), logger)
+
+    # Limpa arquivo temporário de targets
+    try:
+        domains_file.unlink()
+    except Exception:
+        pass
+
+    return new_js
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1309,10 +1409,8 @@ def validate_google_key(key: str, cfg: dict, logger: logging.Logger) -> dict:
 def validate_all_google_keys(google_keys: set, cfg: dict, logger: logging.Logger) -> None:
     if not google_keys:
         return
-
     write_if_not_empty(cfg["google_keys_file"], sorted(google_keys), logger)
     logger.info("Validando %d Google API Key(s)…", len(google_keys))
-
     report_lines: list[str] = []
     for key in sorted(google_keys):
         results = validate_google_key(key, cfg, logger)
@@ -1322,14 +1420,13 @@ def validate_all_google_keys(google_keys: set, cfg: dict, logger: logging.Logger
         for name, status in sorted(results.items()):
             report_lines.append(f"  [{status}] {name}")
         report_lines.append("-" * 60)
-
     if report_lines:
         write_if_not_empty(cfg["google_report_file"], report_lines, logger)
         logger.info("Relatório Google Keys → %s", cfg["google_report_file"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Etapa 6: Análise de JS
+# Etapa 6: Análise de JS (segredos + endpoints ricos)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def is_valid_js(resp: requests.Response, content: str) -> bool:
@@ -1357,23 +1454,18 @@ _seen_secrets: set[tuple[str, str]]  = set()
 _seen_secrets_lock: threading.Lock   = threading.Lock()
 _secret_write_lock                   = threading.Lock()
 
+# [NOVO] Dedup global de endpoints
+_seen_endpoints: set[tuple[str, str]]  = set()   # (method, path_normalized)
+_endpoint_write_lock                   = threading.Lock()
+
 
 def _append_secret(finding: dict, cfg: dict) -> bool:
     finding = {**finding, "severity": get_severity(finding["type"])}
-
     norm_key = (finding["type"], _normalize_secret_value(finding["type"], finding["value"]))
-
     with _seen_secrets_lock:
-        # [MEM-1] Teto para o set de secrets vistos
-        if len(_seen_secrets) >= MAX_SECRETS_SEEN:
-            # Apenas verifica presença sem adicionar novos
-            if norm_key in _seen_secrets:
-                return False
-            # Descarta silenciosamente quando o teto é atingido — apenas loga
-        else:
-            if norm_key in _seen_secrets:
-                return False
-            _seen_secrets.add(norm_key)
+        if norm_key in _seen_secrets:
+            return False
+        _seen_secrets.add(norm_key)
 
     with _secret_write_lock:
         sev_tag = f"[{finding['severity']}]"
@@ -1410,6 +1502,77 @@ def _append_secret(finding: dict, cfg: dict) -> bool:
     return True
 
 
+def _build_absolute_url(endpoint: str, js_url: str, domain: str) -> str:
+    """Transforma path relativo em URL absoluta usando o domínio do alvo."""
+    if endpoint.startswith(("http://", "https://", "ws://", "wss://")):
+        return endpoint
+    base = f"https://{domain}"
+    if endpoint.startswith("/"):
+        return base + endpoint
+    return base + "/" + endpoint
+
+
+def _append_endpoint(ep: dict, cfg: dict, domain: str) -> bool:
+    """
+    Registra um endpoint deduplicado.
+    ep: {method, path, js_url, query_params, absolute_url}
+    """
+    method = ep.get("method", "UNKNOWN").upper()
+    path   = ep.get("path", "").strip()
+
+    # Normaliza para dedup: remove query string do path base
+    path_base = path.split("?")[0].rstrip("/") or "/"
+    dedup_key = (method if method != "ANY" else "_", path_base)
+
+    with _endpoint_write_lock:
+        if dedup_key in _seen_endpoints:
+            return False
+        _seen_endpoints.add(dedup_key)
+
+        abs_url = ep.get("absolute_url") or _build_absolute_url(path, ep.get("js_url", ""), domain)
+
+        # ── TXT legível ──────────────────────────────────────────────────────
+        line_txt = (
+            f"[{method}] {path}\n"
+            f"  → Absoluta : {abs_url}\n"
+            f"  → Fonte JS : {ep.get('js_url', '?')}\n"
+        )
+        if ep.get("query_params"):
+            line_txt += f"  → Query    : {ep['query_params']}\n"
+        line_txt += "-" * 60
+
+        append_line_to_file(cfg["api_endpoints_file"], line_txt)
+
+        # ── JSONL enriquecido ────────────────────────────────────────────────
+        append_line_to_file(
+            cfg["api_endpoints_jsonl"],
+            json.dumps({
+                "method":       method,
+                "path":         path,
+                "absolute_url": abs_url,
+                "query_params": ep.get("query_params", ""),
+                "js_source":    ep.get("js_url", ""),
+            }, ensure_ascii=False),
+        )
+    return True
+
+
+def _extract_query_params(url_or_path: str) -> str:
+    """Extrai e formata query string de uma URL."""
+    if "?" not in url_or_path:
+        return ""
+    qs = url_or_path.split("?", 1)[1].split("#")[0]
+    try:
+        parsed = urllib.parse.parse_qs(qs, keep_blank_values=True)
+        parts  = []
+        for k, vs in parsed.items():
+            for v in vs:
+                parts.append(f"{k}={v}")
+        return "&".join(parts)
+    except Exception:
+        return qs
+
+
 def analyze_js_content(
     content: str,
     url: str,
@@ -1421,6 +1584,7 @@ def analyze_js_content(
     found       = 0
     lines       = content.splitlines()
     generic_set = cfg["_generic_patterns"]
+    domain      = cfg["domain"]
 
     def _line_at(pos: int) -> str:
         char_count = 0
@@ -1430,6 +1594,7 @@ def analyze_js_content(
                 return line
         return ""
 
+    # ── Segredos ─────────────────────────────────────────────────────────────
     for name, pattern in cfg["secret_patterns"].items():
         for match in pattern.finditer(content):
             raw_value = match.group(0)
@@ -1438,9 +1603,11 @@ def analyze_js_content(
             if name in generic_set:
                 context_line = _line_at(match.start())
                 if not is_likely_real_credential(value, context_line):
+                    logger.debug("[SKIP FP] %s → %s", name, value[:60])
                     continue
 
             if name == "jwt" and not _is_real_jwt(value):
+                logger.debug("[SKIP FP] jwt inválido estruturalmente → %s", value[:60])
                 continue
 
             context = _secret_context(content, match.start(), match.end())
@@ -1457,41 +1624,51 @@ def analyze_js_content(
         _append_secret(obf, cfg)
         found += 1
 
-    endpoints: set[str] = set()
-    for pattern in cfg["api_endpoint_patterns"]:
+    # ── [NOVO] Endpoints ricos ───────────────────────────────────────────────
+    for label, pattern, method_hint in cfg["endpoint_patterns"]:
         for m in pattern.finditer(content):
-            endpoints.add(m.group(0).strip('"\'`'))
-    if endpoints:
-        with _secret_write_lock:
-            for ep in sorted(endpoints):
-                append_line_to_file(cfg["api_endpoints_file"], f"{ep}  ←  {url}")
+            # Grupo 1 = path/url, grupo 2 = method dinâmico (se existir)
+            path = (m.group(1) or "").strip().strip("\"'`")
+            if not path or len(path) < 2:
+                continue
+
+            # Filtra paths que claramente não são rotas (assets estáticos, etc.)
+            if re.search(r'\.(png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|css)$', path, re.I):
+                continue
+
+            # Método dinâmico capturado do JS
+            if method_hint == "DYNAMIC" and m.lastindex and m.lastindex >= 2:
+                method = (m.group(2) or "UNKNOWN").upper()
+            else:
+                method = method_hint
+
+            query_params = _extract_query_params(path)
+            abs_url      = _build_absolute_url(path, url, domain)
+
+            ep = {
+                "method":       method,
+                "path":         path,
+                "absolute_url": abs_url,
+                "query_params": query_params,
+                "js_url":       url,
+            }
+            if _append_endpoint(ep, cfg, domain):
+                logger.debug("[ENDPOINT][%s] %s → %s", method, path, url)
 
     return found
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# [MEM-4] Cache de JS em disco com limite de entradas (LRU por mtime)
+# Cache de JS em disco
 # ─────────────────────────────────────────────────────────────────────────────
+
+_JS_CACHE_VERSION = "v1"
+_JS_CACHE_TTL     = 86400
+
 
 def _cache_path(cfg: dict, url: str) -> Path:
     url_hash = hashlib.sha1(url.encode()).hexdigest()[:16]
     return cfg["base_dir"] / ".js_cache" / f"{url_hash}.json"
-
-
-def _evict_cache_if_needed(cfg: dict) -> None:
-    """Remove as entradas mais antigas se o cache exceder o limite."""
-    cache_dir = cfg["base_dir"] / ".js_cache"
-    if not cache_dir.exists():
-        return
-    entries = sorted(cache_dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
-    if len(entries) <= _JS_CACHE_MAX:
-        return
-    to_remove = entries[:len(entries) - _JS_CACHE_MAX]
-    for p in to_remove:
-        try:
-            p.unlink()
-        except Exception:
-            pass
 
 
 def _load_cached_js(cfg: dict, url: str) -> str | None:
@@ -1505,7 +1682,6 @@ def _load_cached_js(cfg: dict, url: str) -> str | None:
         if data.get("version") != _JS_CACHE_VERSION:
             return None
         if time.time() - data.get("ts", 0) > _JS_CACHE_TTL:
-            path.unlink(missing_ok=True)
             return None
         return data.get("content")
     except Exception:
@@ -1515,18 +1691,13 @@ def _load_cached_js(cfg: dict, url: str) -> str | None:
 def _save_cached_js(cfg: dict, url: str, content: str) -> None:
     if cfg.get("_no_cache"):
         return
-    # [MEM-4] Não armazena conteúdo muito grande no cache
-    if len(content) > MAX_JS_CONTENT_BYTES:
-        return
     path = _cache_path(cfg, url)
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         path.write_text(
-            json.dumps({"version": _JS_CACHE_VERSION, "ts": time.time(), "content": content},
-                       ensure_ascii=False),
+            json.dumps({"version": _JS_CACHE_VERSION, "ts": time.time(), "content": content}, ensure_ascii=False),
             encoding="utf-8",
         )
-        _evict_cache_if_needed(cfg)
     except Exception:
         pass
 
@@ -1541,24 +1712,18 @@ def process_js(
 ) -> int:
     url_key = url.split("?")[0]
     with _analyzed_js_lock:
-        # [MEM-1] Teto para URLs analisadas
-        if len(_analyzed_js_urls) >= MAX_JS_ANALYZED:
-            if url_key in _analyzed_js_urls:
-                return 0
-            # Processa sem adicionar ao set (ignora teto de forma segura)
-        else:
-            if url_key in _analyzed_js_urls:
-                return 0
-            _analyzed_js_urls.add(url_key)
+        if url_key in _analyzed_js_urls:
+            logger.debug("[CACHE] JS já analisado — pulando: %s", url)
+            return 0
+        _analyzed_js_urls.add(url_key)
 
     cached = _load_cached_js(cfg, url_key)
     if cached is not None:
-        result = analyze_js_content(cached, url, cfg, logger, google_keys_found, google_keys_lock)
-        del cached
-        return result
+        logger.debug("[disk-cache-hit] %s", url)
+        return analyze_js_content(cached, url, cfg, logger, google_keys_found, google_keys_lock)
 
     try:
-        resp = get_fn(url, stream=True)
+        resp = get_fn(url)
     except requests.exceptions.SSLError as exc:
         logger.debug("SSL error em %s: %s", url, exc)
         return 0
@@ -1572,27 +1737,13 @@ def process_js(
     if resp.status_code != 200:
         return 0
 
-    # [MEM-2] Leitura com limite de bytes
-    content = _safe_read_text(resp, MAX_JS_CONTENT_BYTES)
-    if content is None:
-        logger.debug("[skip] JS muito grande: %s", url)
-        return 0
-
-    # Verifica content-type antes de processar
+    content = resp.text
     if not is_valid_js(resp, content):
         logger.debug("Não é JS: %s", url)
-        del content
         return 0
 
     _save_cached_js(cfg, url_key, content)
-    result = analyze_js_content(content, url, cfg, logger, google_keys_found, google_keys_lock)
-    del content
-    return result
-
-
-def _iter_chunks(lst: list, size: int) -> Iterator[list]:
-    for i in range(0, len(lst), size):
-        yield lst[i:i + size]
+    return analyze_js_content(content, url, cfg, logger, google_keys_found, google_keys_lock)
 
 
 def analyze_all_js(cfg: dict, logger: logging.Logger) -> tuple[int, set]:
@@ -1611,25 +1762,16 @@ def analyze_all_js(cfg: dict, logger: logging.Logger) -> tuple[int, set]:
 
     logger.info("Analisando %d arquivos JS com %d workers…", len(urls), cfg["js_workers"])
 
-    # [MEM-3] Processa em chunks de 200 URLs com GC periódico
-    chunk_size = 200
-    for chunk_idx, chunk in enumerate(_iter_chunks(urls, chunk_size)):
-        with ThreadPoolExecutor(max_workers=cfg["js_workers"]) as executor:
-            futures = {
-                executor.submit(
-                    process_js, url, cfg, logger,
-                    google_keys_found, google_keys_lock, get_fn,
-                ): url for url in chunk
-            }
-            for future in as_completed(futures):
-                try:
-                    total_found += future.result()
-                except Exception as exc:
-                    logger.error("Thread error: %s", exc)
-
-        gc.collect()
-        logger.debug("[js] chunk %d/%d concluído (%d URLs)",
-                     chunk_idx + 1, math.ceil(len(urls) / chunk_size), len(chunk))
+    with ThreadPoolExecutor(max_workers=cfg["js_workers"]) as executor:
+        futures = {
+            executor.submit(process_js, url, cfg, logger, google_keys_found, google_keys_lock, get_fn): url
+            for url in urls
+        }
+        for future in as_completed(futures):
+            try:
+                total_found += future.result()
+            except Exception as exc:
+                logger.error("Thread error: %s", exc)
 
     if total_found:
         logger.info("Segredos encontrados em JS: %d → %s", total_found, cfg["secrets_txt"])
@@ -1640,8 +1782,7 @@ def analyze_all_js(cfg: dict, logger: logging.Logger) -> tuple[int, set]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Coleta e análise de source maps (.js.map)
-# [MEM-6] sourcesContent processado item a item
+# Source maps
 # ─────────────────────────────────────────────────────────────────────────────
 
 def collect_and_analyze_sourcemaps(cfg: dict, logger: logging.Logger,
@@ -1655,105 +1796,66 @@ def collect_and_analyze_sourcemaps(cfg: dict, logger: logging.Logger,
     get_fn   = _make_retrying_get(cfg)
 
     map_urls: set[str] = set()
-
     for url in all_urls:
         if url.endswith(".js.map"):
             map_urls.add(url)
-
-    js_for_map = [u for u in all_urls if re.search(r'\.js(\?|$)', u)]
-    for url in js_for_map[:300]:
-        candidate = re.sub(r'\.js(\?.*)?$', '.js.map', url)
-        map_urls.add(candidate)
-
-    # Libera lista completa de URLs da memória
-    del all_urls, js_for_map
-    gc.collect()
+    for url in all_urls[:300]:
+        if re.search(r'\.js(\?|$)', url):
+            map_urls.add(re.sub(r'\.js(\?.*)?$', '.js.map', url))
 
     if not map_urls:
         logger.info("[sourcemaps] nenhuma URL candidata encontrada.")
         return 0
 
     logger.info("[sourcemaps] tentando %d URLs de source map…", len(map_urls))
-    sourcemap_dir = cfg["base_dir"] / "sourcemaps"
-    findings      = 0
+    sourcemap_dir  = cfg["base_dir"] / "sourcemaps"
+    findings       = 0
     confirmed: list[str] = []
     confirmed_lock = threading.Lock()
 
     def _process_map(map_url: str) -> int:
         local_findings = 0
         try:
-            resp = get_fn(map_url, stream=True)
+            resp = get_fn(map_url)
         except Exception:
             return 0
         if resp.status_code != 200:
             return 0
-
-        # [MEM-2] Source maps podem ser grandes; limita leitura
-        raw = _safe_read_text(resp, MAX_JS_CONTENT_BYTES * 2)  # 10 MB para source maps
-        if raw is None:
+        if "<html" in resp.text[:100].lower():
             return 0
-        if "<html" in raw[:100].lower():
-            return 0
-
         try:
-            data = json.loads(raw)
+            data = resp.json()
         except Exception:
             return 0
-        finally:
-            del raw
-
         sources_content = data.get("sourcesContent", [])
         sources_names   = data.get("sources", [])
-        n_sources       = len(sources_content)
-
-        if not n_sources:
+        if not sources_content:
             return 0
-
         with confirmed_lock:
             confirmed.append(map_url)
-
         sourcemap_dir.mkdir(parents=True, exist_ok=True)
         safe = re.sub(r'[^\w\-.]', '_', map_url)[:100]
-        logger.warning("[!!!] Source map confirmado: %s (%d fontes)", map_url, n_sources)
-
-        # [MEM-6] Processa cada source individualmente, sem manter a lista inteira
-        for i in range(n_sources):
-            src_content = sources_content[i] if i < len(sources_content) else None
+        logger.warning("[!!!] Source map confirmado: %s (%d fontes)", map_url, len(sources_content))
+        for i, src_content in enumerate(sources_content):
             if not src_content or not isinstance(src_content, str):
                 continue
             src_name    = sources_names[i] if i < len(sources_names) else f"source_{i}"
             virtual_url = f"{map_url}::{src_name}"
-
-            src_file = sourcemap_dir / (safe + f"_src{i}.js")
             try:
-                src_file.write_text(src_content, encoding="utf-8", errors="replace")
+                (sourcemap_dir / (safe + f"_src{i}.js")).write_text(src_content, encoding="utf-8", errors="replace")
             except Exception:
                 pass
-
-            n = analyze_js_content(
-                src_content, virtual_url, cfg, logger,
-                google_keys_found, google_keys_lock,
-            )
+            n = analyze_js_content(src_content, virtual_url, cfg, logger, google_keys_found, google_keys_lock)
             local_findings += n
-            del src_content
-
-        # Libera o JSON inteiro após processar todos os sources
-        del data, sources_content, sources_names
         return local_findings
 
-    # [MEM-3] Chunks para source maps também
-    map_list = list(map_urls)
-    del map_urls
-
-    for chunk in _iter_chunks(map_list, 100):
-        with ThreadPoolExecutor(max_workers=cfg["js_workers"]) as executor:
-            futs = {executor.submit(_process_map, u): u for u in chunk}
-            for fut in as_completed(futs):
-                try:
-                    findings += fut.result()
-                except Exception as exc:
-                    logger.debug("[sourcemaps] erro: %s", exc)
-        gc.collect()
+    with ThreadPoolExecutor(max_workers=cfg["js_workers"]) as executor:
+        futs = {executor.submit(_process_map, u): u for u in map_urls}
+        for fut in as_completed(futs):
+            try:
+                findings += fut.result()
+            except Exception as exc:
+                logger.debug("[sourcemaps] erro: %s", exc)
 
     if confirmed:
         write_if_not_empty(cfg["base_dir"] / "sourcemaps_found.txt", confirmed, logger)
@@ -1765,7 +1867,7 @@ def collect_and_analyze_sourcemaps(cfg: dict, logger: logging.Logger,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Etapa extra: Análise por subdomínio
+# Análise de subdomínios (com integração live crawler)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _probe_alive_urls(urls: list[str], timeout: int, logger: logging.Logger) -> list[str]:
@@ -1774,14 +1876,11 @@ def _probe_alive_urls(urls: list[str], timeout: int, logger: logging.Logger) -> 
     if not tool_available("httpx"):
         logger.warning("httpx não encontrado — usando todos os subdomínios sem validação.")
         return urls
-
-    input_text = "\n".join(urls) + "\n"
     try:
         result = subprocess.run(
-            ["httpx", "-silent",
-             "-mc", "200,201,204,301,302,307,308,403",
+            ["httpx", "-silent", "-mc", "200,201,204,301,302,307,308,403",
              "-threads", "50", "-timeout", str(timeout)],
-            input=input_text,
+            input="\n".join(urls) + "\n",
             capture_output=True, text=True, timeout=300,
         )
         return [u.strip() for u in result.stdout.splitlines() if u.strip()]
@@ -1792,29 +1891,22 @@ def _probe_alive_urls(urls: list[str], timeout: int, logger: logging.Logger) -> 
 
 def _collect_js_from_sub(sub_url: str, cfg: dict, logger: logging.Logger) -> set[str]:
     all_urls: set[str] = set()
-
     js_re = re.compile(
-        r'(?:\.js(?:\?[^\s]*)?$'
-        r'|/(?:static|assets|dist|build|chunks|bundles)/[^\s]*\.js)',
+        r'(?:\.js(?:\?[^\s]*)?$|/(?:static|assets|dist|build|chunks|bundles)/[^\s]*\.js)',
         re.I,
     )
-
     if tool_available("hakrawler"):
         lines = run_cmd(
             ["hakrawler", "-d", "2", "-u", "-t", "8", "-insecure"],
             logger, stdin=sub_url + "\n", timeout=60,
         )
         all_urls.update(lines)
-
     if tool_available("gospider"):
-        raw = run_cmd([
-            "gospider", "-s", sub_url, "-c", "5", "-d", "2", "--js", "-q",
-        ], logger, timeout=60)
+        raw = run_cmd(["gospider", "-s", sub_url, "-c", "5", "-d", "2", "--js", "-q"], logger, timeout=60)
         for line in raw:
             m = re.search(r'https?://[^\s"\'<>\]]+', line)
             if m:
                 all_urls.add(m.group(0).rstrip('.,;)"\'>]'))
-
     js_urls: set[str] = set()
     for url in all_urls:
         if _CDN_DOMAINS_RE.search(url):
@@ -1823,7 +1915,6 @@ def _collect_js_from_sub(sub_url: str, cfg: dict, logger: logging.Logger) -> set
             continue
         if js_re.search(url):
             js_urls.add(url)
-
     return js_urls
 
 
@@ -1841,7 +1932,6 @@ def analyze_subdomains(
     logger.info(banner_sub)
 
     subs: set[str] = set()
-
     if tool_available("subfinder"):
         logger.info("[subfinder] enumerando subdomínios de %s…", root_domain)
         lines = run_cmd(["subfinder", "-d", root_domain, "-silent"], logger, timeout=300)
@@ -1853,8 +1943,7 @@ def analyze_subdomains(
 
     subs_clean = sorted({
         s.strip().lower() for s in subs
-        if s.strip()
-        and "*" not in s
+        if s.strip() and "*" not in s
         and s.strip().lower() != root_domain
         and root_domain in s
     })
@@ -1864,15 +1953,11 @@ def analyze_subdomains(
         return {}
 
     logger.info("Subdomínios únicos: %d", len(subs_clean))
-
     sub_urls   = [f"https://{s}" for s in subs_clean]
     alive_urls = _probe_alive_urls(sub_urls, cfg["request_timeout"], logger)
 
     https_alive     = set(alive_urls)
-    http_candidates = [
-        f"http://{s}" for s in subs_clean
-        if f"https://{s}" not in https_alive
-    ]
+    http_candidates = [f"http://{s}" for s in subs_clean if f"https://{s}" not in https_alive]
     if http_candidates:
         http_alive = _probe_alive_urls(http_candidates, cfg["request_timeout"], logger)
         alive_urls.extend(http_alive)
@@ -1886,20 +1971,39 @@ def analyze_subdomains(
 
     write_if_not_empty(cfg["base_dir"] / "subdomains_alive.txt", alive_urls, logger)
 
+    # ── [NOVO] Chama js_live_crawler para domínio + subdomínios vivos ────────
+    if not getattr(args, "no_live_crawler", False):
+        live_new_js = run_live_crawler(cfg, logger, args, alive_urls)
+        logger.info("[live-crawler] %d JS novos adicionados ao pool de análise", len(live_new_js))
+    else:
+        logger.info("--no-live-crawler: etapa live JS pulada.")
+
+    # ── Análise passiva por subdomínio ────────────────────────────────────────
     sub_stats: dict[str, dict] = {}
     get_fn = _make_retrying_get(cfg)
 
     for sub_url in alive_urls:
         sub_host = re.sub(r'^https?://', '', sub_url).rstrip('/')
         logger.info("─── Analisando subdomínio: %s", sub_host)
-
         safe_sub = re.sub(r'[^\w\-.]', '_', sub_host)
         sub_dir  = cfg["base_dir"] / "subdomains" / safe_sub
         sub_dir.mkdir(parents=True, exist_ok=True)
 
         js_urls = _collect_js_from_sub(sub_url, cfg, logger)
-        logger.info("  JS encontrado: %d arquivos", len(js_urls))
 
+        # [NOVO] Deduplicação: remove JS já analisados globalmente
+        js_urls_new = set()
+        for js_url in js_urls:
+            url_key = js_url.split("?")[0]
+            with _analyzed_js_lock:
+                if url_key not in _analyzed_js_urls:
+                    js_urls_new.add(js_url)
+        dedup_removed = len(js_urls) - len(js_urls_new)
+        if dedup_removed:
+            logger.debug("  [dedup] %d JS já analisados removidos de %s", dedup_removed, sub_host)
+        js_urls = js_urls_new
+
+        logger.info("  JS novos a analisar: %d", len(js_urls))
         if not js_urls:
             sub_stats[sub_host] = {"js": 0, "secrets": 0}
             continue
@@ -1918,43 +2022,25 @@ def analyze_subdomains(
             if cached is not None:
                 n = analyze_js_content(cached, js_url, cfg, logger, all_google_keys, google_keys_lock)
                 sub_findings += n
-                del cached
                 continue
-
             try:
-                resp = get_fn(js_url, stream=True)
+                resp = get_fn(js_url)
             except Exception:
                 continue
-
             if resp.status_code != 200:
                 continue
-
-            # [MEM-2] Limite de bytes
-            content = _safe_read_text(resp, MAX_JS_CONTENT_BYTES)
-            if content is None:
-                continue
-
+            content = resp.text
             if not is_valid_js(resp, content):
-                del content
                 continue
-
             _save_cached_js(cfg, url_key, content)
-
-            n = analyze_js_content(
-                content, js_url, cfg, logger,
-                all_google_keys, google_keys_lock,
-            )
+            n = analyze_js_content(content, js_url, cfg, logger, all_google_keys, google_keys_lock)
             sub_findings += n
-            del content
 
         sub_stats[sub_host] = {"js": len(js_urls), "secrets": sub_findings}
-
         if sub_findings:
             logger.warning("  [!!!] %d segredo(s) em %s", sub_findings, sub_host)
         else:
             logger.info("  Nenhum segredo em %s", sub_host)
-
-        gc.collect()
 
     total_subs_secrets = sum(v["secrets"] for v in sub_stats.values())
     total_subs_js      = sum(v["js"]      for v in sub_stats.values())
@@ -1969,15 +2055,13 @@ def analyze_subdomains(
     report_lines = [
         "ANÁLISE POR SUBDOMÍNIO",
         f"Domínio raiz: {root_domain}",
-        "=" * 60,
-        "",
+        "=" * 60, "",
     ]
     for sub, data in sorted(sub_stats.items(), key=lambda x: -x[1]["secrets"]):
         status = "[!!!]" if data["secrets"] > 0 else "[ ok]"
         report_lines.append(
             f"{status} {sub:<50}  JS: {data['js']:>4}  Segredos: {data['secrets']:>4}"
         )
-
     write_if_not_empty(cfg["base_dir"] / "subdomains_report.txt", report_lines, logger)
 
     return {
@@ -1989,7 +2073,7 @@ def analyze_subdomains(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Agrupamento por severidade para o SUMMARY
+# Resumo por severidade
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _summary_by_severity(secrets_jsonl: Path) -> list[str]:
@@ -2005,7 +2089,6 @@ def _summary_by_severity(secrets_jsonl: Path) -> list[str]:
             sevs[t] = obj.get("severity", "UNKNOWN")
         except json.JSONDecodeError:
             pass
-
     lines = []
     for t, n in sorted(counts.items(),
                         key=lambda x: (_SEVERITY_ORDER.get(sevs.get(x[0], "UNKNOWN"), 4), -x[1])):
@@ -2022,6 +2105,12 @@ def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
     def _count(path: Path) -> int:
         if not path.exists():
             return 0
+        # Para JSONL conta linhas; para TXT conta separadores
+        return sum(1 for l in path.read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip())
+
+    def _count_jsonl(path: Path) -> int:
+        if not path.exists():
+            return 0
         return sum(1 for l in path.read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip())
 
     vuln_google = 0
@@ -2034,6 +2123,9 @@ def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
     def _f(key: str) -> str:
         return str(stats.get(key, 0)).rjust(6)
 
+    ep_count  = _count_jsonl(cfg["api_endpoints_jsonl"])
+    live_count = _count(cfg["live_js_file"]) if cfg["live_js_file"].exists() else 0
+
     lines = [
         "=" * 64,
         "  SUMÁRIO DE RECONHECIMENTO",
@@ -2043,7 +2135,8 @@ def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
         "",
         f"  URLs coletadas           : {_f('urls_total')}",
         f"  URLs ativas (httpx)      : {_f('urls_alive')}",
-        f"  Arquivos JS              : {_f('js_total')}",
+        f"  Arquivos JS (passivo)    : {_f('js_total')}",
+        f"  Arquivos JS (live)       : {str(live_count).rjust(6)}",
         f"  URLs sensíveis           : {_f('sensitive_total')}",
         "",
         f"  Segredos encontrados     : {_f('js_findings')}",
@@ -2065,7 +2158,7 @@ def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
         f"  Segredos em .env/.conf   : {_f('sensitive_findings')}",
         f"  XSS confirmados (dalfox) : {_f('xss_hits')}",
         f"  SSRF/Redirect hits       : {_f('ssrf_redirect_hits')}",
-        f"  Endpoints de API         : {str(_count(cfg['api_endpoints_file'])).rjust(6)}",
+        f"  Endpoints extraídos      : {str(ep_count).rjust(6)}",
     ]
 
     if stats.get("subs_found", 0) > 0:
@@ -2082,14 +2175,17 @@ def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
             lines.append(f"  Relatório subs           : {sub_report}")
 
     output_files = [
-        ("Segredos TXT",   cfg["secrets_txt"]),
-        ("Segredos CSV",   cfg["secrets_csv"]),
-        ("Segredos JSONL", cfg["secrets_jsonl"]),
-        ("Google Keys",    cfg["google_report_file"]),
-        ("API Endpoints",  cfg["api_endpoints_file"]),
-        ("Sensíveis",      cfg["sensitive_report"]),
-        ("SUMMARY HTML",   cfg["summary_html"]),
-        ("Log completo",   cfg["log_file"]),
+        ("Segredos TXT",      cfg["secrets_txt"]),
+        ("Segredos CSV",      cfg["secrets_csv"]),
+        ("Segredos JSONL",    cfg["secrets_jsonl"]),
+        ("Google Keys",       cfg["google_report_file"]),
+        ("Endpoints TXT",     cfg["api_endpoints_file"]),
+        ("Endpoints JSONL",   cfg["api_endpoints_jsonl"]),
+        ("JS Live",           cfg["live_js_file"]),
+        ("Relatório Live JS", cfg["live_js_report"]),
+        ("Sensíveis",         cfg["sensitive_report"]),
+        ("SUMMARY HTML",      cfg["summary_html"]),
+        ("Log completo",      cfg["log_file"]),
     ]
     existing = [(label, path) for label, path in output_files if path.exists()]
     if existing:
@@ -2121,14 +2217,26 @@ def write_summary_html(cfg: dict, logger: logging.Logger, stats: dict) -> None:
 
     findings.sort(key=lambda x: (_SEVERITY_ORDER.get(x.get("severity", "UNKNOWN"), 4), x.get("type", "")))
 
+    # Endpoints enriquecidos
+    endpoints: list[dict] = []
+    if cfg["api_endpoints_jsonl"].exists():
+        for line in cfg["api_endpoints_jsonl"].read_text(encoding="utf-8", errors="ignore").splitlines():
+            try:
+                endpoints.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+
     sev_colors = {
-        "CRITICAL": "#c0392b",
-        "HIGH":     "#e67e22",
-        "MEDIUM":   "#2980b9",
-        "LOW":      "#27ae60",
-        "UNKNOWN":  "#7f8c8d",
+        "CRITICAL": "#c0392b", "HIGH": "#e67e22",
+        "MEDIUM": "#2980b9", "LOW": "#27ae60", "UNKNOWN": "#7f8c8d",
+    }
+    method_colors = {
+        "GET": "#27ae60", "POST": "#e67e22", "PUT": "#2980b9",
+        "DELETE": "#c0392b", "PATCH": "#8e44ad", "WS": "#16a085",
+        "ANY": "#7f8c8d", "UNKNOWN": "#7f8c8d",
     }
 
+    # ── Tabela de segredos ────────────────────────────────────────────────────
     rows_html = ""
     for f in findings:
         sev   = f.get("severity", "UNKNOWN")
@@ -2146,14 +2254,37 @@ def write_summary_html(cfg: dict, logger: logging.Logger, stats: dict) -> None:
             f'</tr>\n'
         )
 
+    # ── Tabela de endpoints ───────────────────────────────────────────────────
+    ep_rows_html = ""
+    for ep in endpoints:
+        method   = ep.get("method", "UNKNOWN")
+        mc       = method_colors.get(method, "#7f8c8d")
+        path     = ep.get("path", "")
+        abs_url  = ep.get("absolute_url", "")
+        js_src   = ep.get("js_source", "")
+        qp       = ep.get("query_params", "")
+        ep_rows_html += (
+            f'<tr>'
+            f'<td><span class="badge" style="background:{mc}">{method}</span></td>'
+            f'<td class="mono">{path[:120]}</td>'
+            f'<td class="url-cell"><a href="{abs_url}" target="_blank" rel="noopener">{abs_url[:80]}</a></td>'
+            f'<td class="ctx">{qp[:80]}</td>'
+            f'<td class="url-cell" style="font-size:10px">{js_src[:80]}</td>'
+            f'</tr>\n'
+        )
+
     sev_counts = {s: sum(1 for f in findings if f.get("severity") == s)
                   for s in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]}
-
     types_opts = "".join(
         f'<option value="{t}">{t}</option>'
         for t in sorted(set(f.get("type", "") for f in findings))
     )
-
+    method_opts = "".join(
+        f'<option value="{m}">{m}</option>'
+        for m in sorted(set(ep.get("method", "") for ep in endpoints))
+    )
+    live_count = sum(1 for _ in (cfg["live_js_file"].read_text(encoding="utf-8").splitlines()
+                                  if cfg["live_js_file"].exists() else []) if _.strip())
     ts = time.strftime("%Y-%m-%d %H:%M")
 
     html = f"""<!DOCTYPE html>
@@ -2165,8 +2296,7 @@ def write_summary_html(cfg: dict, logger: logging.Logger, stats: dict) -> None:
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f1117;color:#e2e8f0;font-size:14px}}
-a{{color:#60a5fa;text-decoration:none}}
-a:hover{{text-decoration:underline}}
+a{{color:#60a5fa;text-decoration:none}}a:hover{{text-decoration:underline}}
 code{{font-family:'SFMono-Regular',Consolas,monospace;font-size:12px;background:#1e2130;padding:1px 5px;border-radius:3px}}
 header{{background:#1a1d2e;border-bottom:1px solid #2d3148;padding:1rem 1.5rem;display:flex;align-items:center;gap:1rem;flex-wrap:wrap}}
 header h1{{font-size:16px;font-weight:600;color:#f1f5f9}}
@@ -2175,10 +2305,14 @@ header p{{font-size:12px;color:#64748b}}
 .stat-card{{background:#1a1d2e;border:1px solid #2d3148;border-radius:6px;padding:.5rem .9rem;min-width:90px;text-align:center}}
 .stat-card .n{{font-size:22px;font-weight:700;line-height:1.1}}
 .stat-card .l{{font-size:11px;color:#64748b;margin-top:2px}}
+.tabs{{display:flex;gap:0;padding:0 1.5rem;background:#141620;border-bottom:1px solid #2d3148}}
+.tab{{padding:.6rem 1.2rem;cursor:pointer;font-size:13px;color:#64748b;border-bottom:2px solid transparent}}
+.tab.active{{color:#f1f5f9;border-bottom-color:#60a5fa}}
+.tab-content{{display:none}}.tab-content.active{{display:block}}
 .controls{{display:flex;gap:.75rem;padding:.65rem 1.5rem;background:#141620;border-bottom:1px solid #2d3148;flex-wrap:wrap;align-items:center}}
 .controls select,.controls input{{background:#1a1d2e;border:1px solid #2d3148;border-radius:5px;color:#e2e8f0;padding:5px 8px;font-size:13px}}
 .controls input[type=search]{{width:220px}}
-#count{{font-size:12px;color:#64748b;margin-left:auto}}
+#count,#ep-count{{font-size:12px;color:#64748b;margin-left:auto}}
 .badge{{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;color:#fff;white-space:nowrap}}
 table{{width:100%;border-collapse:collapse}}
 thead th{{background:#1a1d2e;color:#94a3b8;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;padding:8px 10px;text-align:left;cursor:pointer;border-bottom:1px solid #2d3148;white-space:nowrap;user-select:none}}
@@ -2196,49 +2330,69 @@ footer{{padding:.75rem 1.5rem;font-size:11px;color:#334155;border-top:1px solid 
 <header>
   <div>
     <h1>Reconhecimento — {cfg['domain']}</h1>
-    <p>recon.py · {ts} · {len(findings)} achados · {stats.get('urls_total',0)} URLs · {stats.get('js_total',0)} JS</p>
+    <p>recon.py · {ts} · {len(findings)} segredos · {len(endpoints)} endpoints · {stats.get('urls_total',0)} URLs · {stats.get('js_total',0)} JS passivo · {live_count} JS live</p>
   </div>
 </header>
 <div class="banner">
   {"".join(f'<div class="stat-card"><div class="n" style="color:{sev_colors[s]}">{sev_counts[s]}</div><div class="l">{s}</div></div>' for s in ["CRITICAL","HIGH","MEDIUM","LOW"])}
   <div class="stat-card"><div class="n" style="color:#a78bfa">{stats.get("sourcemap_findings",0)}</div><div class="l">Source maps</div></div>
   <div class="stat-card"><div class="n" style="color:#34d399">{stats.get("inline_findings",0)}</div><div class="l">Inline scripts</div></div>
+  <div class="stat-card"><div class="n" style="color:#60a5fa">{len(endpoints)}</div><div class="l">Endpoints</div></div>
+  <div class="stat-card"><div class="n" style="color:#fb923c">{live_count}</div><div class="l">JS live</div></div>
   <div class="stat-card"><div class="n" style="color:#f472b6">{stats.get("xss_hits",0)}</div><div class="l">XSS</div></div>
-  <div class="stat-card"><div class="n" style="color:#fb923c">{stats.get("ssrf_redirect_hits",0)}</div><div class="l">SSRF/Redirect</div></div>
 </div>
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('secrets',this)">🔑 Segredos ({len(findings)})</div>
+  <div class="tab" onclick="switchTab('endpoints',this)">🔗 Endpoints ({len(endpoints)})</div>
+</div>
+
+<!-- TAB: Segredos -->
+<div id="tab-secrets" class="tab-content active">
 <div class="controls">
-  <label>Severidade
-    <select id="sev-filter" onchange="applyFilters()">
-      <option value="">Todas</option>
-      <option>CRITICAL</option><option>HIGH</option><option>MEDIUM</option><option>LOW</option>
-    </select>
-  </label>
-  <label>Tipo
-    <select id="type-filter" onchange="applyFilters()">
-      <option value="">Todos</option>
-      {types_opts}
-    </select>
-  </label>
+  <label>Severidade<select id="sev-filter" onchange="applyFilters()"><option value="">Todas</option>
+    <option>CRITICAL</option><option>HIGH</option><option>MEDIUM</option><option>LOW</option>
+  </select></label>
+  <label>Tipo<select id="type-filter" onchange="applyFilters()"><option value="">Todos</option>{types_opts}</select></label>
   <input id="search" type="search" placeholder="Buscar URL, valor ou contexto…" oninput="applyFilters()">
   <span id="count">{len(findings)} de {len(findings)} achados</span>
 </div>
 <table id="tbl">
-<thead>
-<tr>
-  <th onclick="sortTable(0)">Sev ↕</th>
-  <th onclick="sortTable(1)">Tipo ↕</th>
-  <th onclick="sortTable(2)">URL ↕</th>
-  <th>Valor</th>
-  <th>Contexto</th>
-</tr>
-</thead>
+<thead><tr>
+  <th onclick="sortTable('tbl',0)">Sev ↕</th><th onclick="sortTable('tbl',1)">Tipo ↕</th>
+  <th onclick="sortTable('tbl',2)">URL ↕</th><th>Valor</th><th>Contexto</th>
+</tr></thead>
 <tbody>{rows_html}</tbody>
 </table>
-<footer>recon.py · {cfg['domain']} · {len(findings)} achados · gerado em {ts}</footer>
+</div>
+
+<!-- TAB: Endpoints -->
+<div id="tab-endpoints" class="tab-content">
+<div class="controls">
+  <label>Método<select id="method-filter" onchange="applyEpFilters()"><option value="">Todos</option>{method_opts}</select></label>
+  <input id="ep-search" type="search" placeholder="Buscar path, URL ou JS fonte…" oninput="applyEpFilters()">
+  <span id="ep-count">{len(endpoints)} de {len(endpoints)} endpoints</span>
+</div>
+<table id="ep-tbl">
+<thead><tr>
+  <th onclick="sortTable('ep-tbl',0)">Método ↕</th>
+  <th onclick="sortTable('ep-tbl',1)">Path ↕</th>
+  <th onclick="sortTable('ep-tbl',2)">URL Absoluta ↕</th>
+  <th>Query Params</th>
+  <th>JS Fonte</th>
+</tr></thead>
+<tbody>{ep_rows_html}</tbody>
+</table>
+</div>
+
+<footer>recon.py · {cfg['domain']} · {len(findings)} segredos · {len(endpoints)} endpoints · {ts}</footer>
 <script>
-const tbody=document.querySelector('#tbl tbody');
-const rows=Array.from(tbody.querySelectorAll('tr'));
-const total={len(findings)};
+function switchTab(name,el){{
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));
+  el.classList.add('active');
+  document.getElementById('tab-'+name).classList.add('active');
+}}
+const rows=Array.from(document.querySelectorAll('#tbl tbody tr'));
 function applyFilters(){{
   const sev=document.getElementById('sev-filter').value;
   const typ=document.getElementById('type-filter').value;
@@ -2246,21 +2400,35 @@ function applyFilters(){{
   let vis=0;
   rows.forEach(r=>{{
     const ok=(!sev||r.dataset.sev===sev)&&(!typ||r.dataset.type===typ)&&(!srch||r.textContent.toLowerCase().includes(srch));
-    r.classList.toggle('hidden',!ok);
-    if(ok)vis++;
+    r.classList.toggle('hidden',!ok);if(ok)vis++;
   }});
-  document.getElementById('count').textContent=vis+' de '+total+' achados';
+  document.getElementById('count').textContent=vis+' de {len(findings)} achados';
 }}
-let sortDir=1;
-function sortTable(col){{
-  const sorted=rows.sort((a,b)=>{{
+const epRows=Array.from(document.querySelectorAll('#ep-tbl tbody tr'));
+function applyEpFilters(){{
+  const meth=document.getElementById('method-filter').value;
+  const srch=document.getElementById('ep-search').value.toLowerCase();
+  let vis=0;
+  epRows.forEach(r=>{{
+    const badge=r.cells[0]?.querySelector('.badge')?.textContent||'';
+    const ok=(!meth||badge===meth)&&(!srch||r.textContent.toLowerCase().includes(srch));
+    r.classList.toggle('hidden',!ok);if(ok)vis++;
+  }});
+  document.getElementById('ep-count').textContent=vis+' de {len(endpoints)} endpoints';
+}}
+let sortDirs={{}};
+function sortTable(tid,col){{
+  const tbody=document.querySelector('#'+tid+' tbody');
+  const rs=Array.from(tbody.querySelectorAll('tr'));
+  const key=tid+col;
+  sortDirs[key]=(sortDirs[key]||1)*-1;
+  rs.sort((a,b)=>{{
     const ta=a.cells[col]?.textContent.trim()||'';
     const tb=b.cells[col]?.textContent.trim()||'';
-    return sortDir*ta.localeCompare(tb);
+    return sortDirs[key]*ta.localeCompare(tb);
   }});
-  sortDir*=-1;
-  sorted.forEach(r=>tbody.appendChild(r));
-  applyFilters();
+  rs.forEach(r=>tbody.appendChild(r));
+  tid==='tbl'?applyFilters():applyEpFilters();
 }}
 </script>
 </body>
@@ -2276,7 +2444,7 @@ function sortTable(col){{
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Reconhecimento web focado em JS: coleta URLs, extrai segredos, valida chaves."
+        description="Reconhecimento web focado em JS: coleta URLs, extrai segredos, endpoints e valida chaves."
     )
     parser.add_argument("domain",               nargs="?",            help="Domínio alvo. Ex: exemplo.com.br")
     parser.add_argument("--no-dalfox",          action="store_true",  help="Pula probe XSS com dalfox")
@@ -2288,8 +2456,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-sourcemaps",      action="store_true",  help="Pula coleta e análise de source maps")
     parser.add_argument("--no-inline-scripts",  action="store_true",  help="Pula análise de inline scripts em HTML")
     parser.add_argument("--no-cache",           action="store_true",  help="Ignora cache de JS em disco")
+    parser.add_argument("--no-live-crawler",    action="store_true",  help="Pula coleta ao vivo via js_live_crawler.py")
     parser.add_argument("--workers",            type=int, default=20, help="Workers JS (padrão: 20)")
     parser.add_argument("--timeout",            type=int, default=10, help="Timeout de requisições em segundos (padrão: 10)")
+    parser.add_argument("--live-timeout",       type=int, default=30, help="Timeout de navegação do live crawler em segundos (padrão: 30)")
+    parser.add_argument("--live-wait",          type=int, default=2,  help="Segundos extras após networkidle no live crawler (padrão: 2)")
     return parser.parse_args()
 
 
@@ -2319,6 +2490,7 @@ def main() -> None:
     if not preflight_check(logger, args):
         sys.exit(1)
 
+    # ── Etapas principais ────────────────────────────────────────────────────
     stats["urls_total"] = collect_urls(cfg, logger)
 
     if args.no_httpx:
@@ -2349,15 +2521,13 @@ def main() -> None:
             cfg, logger, google_keys_found, google_keys_lock
         )
 
-    gc.collect()
-
+    # ── JS externo (passivo) ─────────────────────────────────────────────────
     js_findings, gkeys = analyze_all_js(cfg, logger)
     stats["js_findings"] = js_findings
     with google_keys_lock:
         google_keys_found.update(gkeys)
 
-    gc.collect()
-
+    # ── Source maps ──────────────────────────────────────────────────────────
     if args.no_sourcemaps:
         logger.info("--no-sourcemaps: pulando análise de source maps.")
         stats["sourcemap_findings"] = 0
@@ -2368,10 +2538,18 @@ def main() -> None:
         stats["sourcemap_findings"]  = sm_findings
         stats["js_findings"]        += sm_findings
 
-    gc.collect()
-
+    # ── Subdomínios + live crawler ───────────────────────────────────────────
     if args.no_subs:
         logger.info("--no-subs: análise de subdomínios pulada.")
+        # Ainda roda live crawler no domínio principal se habilitado
+        if not getattr(args, "no_live_crawler", False):
+            live_new = run_live_crawler(cfg, logger, args, [])
+            logger.info("[live-crawler] %d JS novos do domínio principal", len(live_new))
+            if live_new:
+                lf, lg = analyze_all_js(cfg, logger)
+                stats["js_findings"] += lf
+                with google_keys_lock:
+                    google_keys_found.update(lg)
         stats.update({"subs_found": 0, "subs_alive": 0, "subs_js": 0, "subs_secrets": 0})
     else:
         sub_stats = analyze_subdomains(
@@ -2379,6 +2557,12 @@ def main() -> None:
             google_keys_found, google_keys_lock,
         )
         stats.update(sub_stats)
+
+        # Analisa JS novos trazidos pelo live crawler (adicionados ao js_file)
+        lf, lg = analyze_all_js(cfg, logger)
+        stats["js_findings"] += lf
+        with google_keys_lock:
+            google_keys_found.update(lg)
 
     stats["google_keys"] = len(google_keys_found)
 
