@@ -9,27 +9,36 @@ Fluxo:
   4. Download e análise de arquivos sensíveis por extensão
   5. Coleta de URLs de JS  (filtro inteligente, sem CDNs)
   5b. Análise de inline scripts em HTML
-  5c. [NOVO] js_live_crawler: coleta JS ao vivo via browser real (domínio + subdomínios)
   6. Análise de segredos em JS  (padrões de alta precisão + detecção de ofuscação)
   6b. Extração e análise de source maps (.js.map)
   7. Validação de Google API Keys
-  8. Extração e enriquecimento de endpoints expostos em JS
+  8. Extração de endpoints de API expostos em JS
   9. Probe de XSS (dalfox) e SSRF/redirect (qsreplace)
  10. Relatório consolidado (TXT + HTML interativo)
 
-Melhorias integradas:
-  1. Coleta e análise de source maps (.js.map)          — cobertura
-  2. Deduplicação de segredos por valor normalizado      — precisão
-  3. Rate limiting adaptativo por hostname               — performance
-  5. Validação estrutural de JWT                         — precisão
-  6. Extração de inline scripts em HTML                  — cobertura
-  7. Cache de JS em disco por hash de URL                — performance
-  8. Severidade automática por tipo de segredo           — relatório
-  9. Preflight check de ferramentas                      — resiliência
- 10. SUMMARY.html interativo e filtrável                 — relatório
- 11. [NOVO] js_live_crawler integrado                    — cobertura real
- 12. [NOVO] Dedup global de JS entre domínio/subs        — precisão
- 13. [NOVO] Extração rica de endpoints (path, query GET/POST, JS de origem) — cobertura
+Melhorias integradas (herdadas do jsrecon.py):
+  A. Padrões de segredos expandidos:
+       • js_secret_key, firebase_app_id, firebase_sender_id,
+         firebase_measurement_id, firebase_config_block, env_config_key
+       • basic_auth_btoa, btoa_creds, basic_auth_b64_raw,
+         hardcoded_credentials, auth_header_hardcoded
+  B. Análise dedicada de chamadas btoa() com decodificação do valor em claro
+  C. Extração de endpoints muito mais abrangente (17 padrões com método HTTP):
+       fetch_get/post/put/delete/patch, fetch_dynamic, query_string_get,
+       json_body_post, formdata_post, router_path, href_path,
+       url_with_query, websocket, api_versioned, graphql, versioned_path,
+       internal_subdomain
+  D. Persistência de endpoints estruturada (JSONL + TXT com método, URL
+     absoluta, query params e fonte JS)
+  E. Severidade por tipo de segredo (CRITICAL/HIGH/MEDIUM/LOW)
+  F. Deduplicação de segredos por valor normalizado
+  G. Rate limiting adaptativo por hostname
+  H. Validação estrutural de JWT
+  I. Análise de inline scripts em HTML
+  J. Cache de JS em disco por hash de URL
+  K. Preflight check de ferramentas
+  L. SUMMARY.html interativo e filtrável
+  M. Coleta e análise de source maps (.js.map)
 """
 
 from __future__ import annotations
@@ -52,6 +61,7 @@ import urllib.parse
 import urllib3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 from tenacity import (
@@ -65,7 +75,20 @@ from tenacity import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Constantes de qualidade
+# CDN — ignorar JS de terceiros
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CDN_DOMAINS_RE = re.compile(
+    r'(?:cdnjs\.cloudflare\.com|cdn\.jsdelivr\.net|unpkg\.com|'
+    r'ajax\.googleapis\.com|stackpath\.bootstrapcdn\.com|'
+    r'maxcdn\.bootstrapcdn\.com|code\.jquery\.com|'
+    r'cdn\.datatables\.net|cdn\.polyfill\.io|'
+    r'static\.cloudflareinsights\.com)',
+    re.I,
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Constantes de qualidade / anti-falso-positivo
 # ─────────────────────────────────────────────────────────────────────────────
 
 _MIN_VALUE_LEN       = 8
@@ -92,53 +115,59 @@ _UI_CONTEXT_RE = re.compile(
     re.I,
 )
 
-_CDN_DOMAINS_RE = re.compile(
-    r'(?:cdnjs\.cloudflare\.com|cdn\.jsdelivr\.net|unpkg\.com|'
-    r'ajax\.googleapis\.com|stackpath\.bootstrapcdn\.com|'
-    r'maxcdn\.bootstrapcdn\.com|code\.jquery\.com|'
-    r'cdn\.datatables\.net|cdn\.polyfill\.io|'
-    r'static\.cloudflareinsights\.com)',
-    re.I,
-)
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Severidade
+# Mapa de severidade
 # ─────────────────────────────────────────────────────────────────────────────
 
 SECRET_SEVERITY: dict[str, str] = {
-    "aws_access_key":        "CRITICAL",
-    "private_key":           "CRITICAL",
-    "stripe_secret":         "CRITICAL",
-    "braintree_token":       "CRITICAL",
-    "gcp_service_account":   "CRITICAL",
-    "hashicorp_vault":       "CRITICAL",
-    "azure_storage_key":     "CRITICAL",
-    "github_pat":            "HIGH",
-    "github_oauth":          "HIGH",
-    "gitlab_pat":            "HIGH",
-    "openai_key":            "HIGH",
-    "sendgrid_key":          "HIGH",
-    "slack_token":           "HIGH",
-    "supabase_service_role": "HIGH",
-    "mongodb_dsn":           "HIGH",
-    "postgres_dsn":          "HIGH",
-    "mysql_dsn":             "HIGH",
-    "google_api_key":        "HIGH",
-    "firebase_url":          "HIGH",
-    "twilio_auth_token":     "HIGH",
-    "jwt":                   "MEDIUM",
-    "stripe_publishable":    "MEDIUM",
-    "slack_webhook":         "MEDIUM",
-    "sentry_dsn":            "MEDIUM",
-    "mapbox_token":          "MEDIUM",
-    "supabase_anon_key":     "MEDIUM",
-    "mailgun_api_key":       "MEDIUM",
-    "generic_api_key":       "LOW",
-    "generic_token":         "LOW",
-    "generic_secret":        "LOW",
-    "bearer_token":          "LOW",
-    "password_field":        "LOW",
-    "bcrypt_hash":           "LOW",
+    # CRITICAL
+    "aws_access_key":           "CRITICAL",
+    "private_key":              "CRITICAL",
+    "stripe_secret":            "CRITICAL",
+    "braintree_token":          "CRITICAL",
+    "gcp_service_account":      "CRITICAL",
+    "hashicorp_vault":          "CRITICAL",
+    "azure_storage_key":        "CRITICAL",
+    "js_secret_key":            "CRITICAL",
+    # HIGH
+    "github_pat":               "HIGH",
+    "github_oauth":             "HIGH",
+    "gitlab_pat":               "HIGH",
+    "openai_key":               "HIGH",
+    "sendgrid_key":             "HIGH",
+    "slack_token":              "HIGH",
+    "supabase_service_role":    "HIGH",
+    "mongodb_dsn":              "HIGH",
+    "postgres_dsn":             "HIGH",
+    "mysql_dsn":                "HIGH",
+    "google_api_key":           "HIGH",
+    "firebase_url":             "HIGH",
+    "twilio_auth_token":        "HIGH",
+    "firebase_app_id":          "HIGH",
+    "firebase_config_block":    "HIGH",
+    "basic_auth_btoa":          "HIGH",
+    "btoa_creds":               "HIGH",
+    "btoa_decoded":             "HIGH",
+    "basic_auth_b64_raw":       "HIGH",
+    "hardcoded_credentials":    "HIGH",
+    # MEDIUM
+    "jwt":                      "MEDIUM",
+    "stripe_publishable":       "MEDIUM",
+    "slack_webhook":            "MEDIUM",
+    "sentry_dsn":               "MEDIUM",
+    "mapbox_token":             "MEDIUM",
+    "supabase_anon_key":        "MEDIUM",
+    "mailgun_api_key":          "MEDIUM",
+    "firebase_sender_id":       "MEDIUM",
+    "auth_header_hardcoded":    "MEDIUM",
+    "firebase_measurement_id":  "LOW",
+    # LOW
+    "generic_api_key":          "LOW",
+    "generic_token":            "LOW",
+    "generic_secret":           "LOW",
+    "bearer_token":             "LOW",
+    "password_field":           "LOW",
+    "bcrypt_hash":              "LOW",
 }
 
 _SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
@@ -149,7 +178,7 @@ def get_severity(secret_type: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Deduplicação de segredos
+# Normalização de valor para deduplicação
 # ─────────────────────────────────────────────────────────────────────────────
 
 _CASE_SENSITIVE_TYPES = frozenset({
@@ -169,7 +198,7 @@ def _normalize_secret_value(type_name: str, value: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers de regex / entropia
+# Helpers gerais
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _regex(pattern: str, flags: int = 0) -> re.Pattern:
@@ -269,12 +298,167 @@ def scan_charcode_obfuscation(content: str, url: str, logger: logging.Logger) ->
                 matched_label = label
                 break
         if matched_label:
-            start   = max(0, m.start() - 60)
-            end     = min(len(content), m.end() + 60)
-            context = content[start:end].replace("\n", " ")
+            ctx = content[max(0, m.start()-60):min(len(content), m.end()+60)].replace("\n", " ")
             logger.warning("[!!!] %s (ofuscado) → %s | decoded: %s", matched_label, url, decoded[:80])
-            results.append({"type": matched_label, "value": decoded, "context": context, "url": url})
+            results.append({"type": matched_label, "value": decoded, "context": ctx, "url": url})
     return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Padrões de segredos — expandidos com tudo do jsrecon.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_secret_patterns() -> dict[str, re.Pattern]:
+    return {
+        # ── Google / Firebase / GCP ──────────────────────────────────────────
+        "google_api_key":           _regex(r'AIza[0-9A-Za-z\-_]{35}'),
+        "google_oauth_client":      _regex(r'[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com'),
+        "firebase_url":             _regex(r'https?://[a-z0-9\-]+\.firebaseio\.com', re.I),
+        "gcp_service_account":      _regex(r'"type"\s*:\s*"service_account"'),
+        # secretKey / secreteKey hardcoded em objeto de config JS [NOVO - jsrecon]
+        "js_secret_key":            _regex(r'secrete?[Kk]ey\s*[:=]\s*["\']([^"\']{6,})["\']', re.I),
+        # Firebase appId no formato "1:NNNN:web:HEX" [NOVO - jsrecon]
+        "firebase_app_id":          _regex(r'appId\s*[:=]\s*["\'](\d+:\d+:\w+:[a-f0-9]{16,})["\']', re.I),
+        # Firebase messagingSenderId [NOVO - jsrecon]
+        "firebase_sender_id":       _regex(r'messagingSenderId\s*[:=]\s*["\'](\d{8,})["\']', re.I),
+        # Firebase measurementId / Google Analytics [NOVO - jsrecon]
+        "firebase_measurement_id":  _regex(r'measurementId\s*[:=]\s*["\']([A-Z0-9\-]{8,})["\']', re.I),
+        # Bloco completo de config Firebase (apiKey + authDomain juntos) [NOVO - jsrecon]
+        "firebase_config_block":    _regex(r'apiKey\s*:\s*["\']([^"\']{20,})["\'][^}]{0,200}authDomain\s*:\s*["\']([^"\']+)["\']', re.I | re.DOTALL),
+        # environment.ts / config.js: URLs de ambiente genéricas [NOVO - jsrecon]
+        "env_config_key":           _regex(r'(?:apiUrl|baseUrl|endpointUrl|serviceUrl|backendUrl)\s*[:=]\s*["\']([^"\']{8,})["\']', re.I),
+
+        # ── AWS / Cloud ───────────────────────────────────────────────────────
+        "aws_access_key":           _regex(r'AKIA[0-9A-Z]{16}'),
+        "amazon_mws":               _regex(r'amzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'),
+        "azure_storage_key":        _regex(r'DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[A-Za-z0-9+/=]{88}'),
+        "digitalocean_token":       _regex(r'dop_v1_[a-f0-9]{64}'),
+        "terraform_cloud":          _regex(r'[a-zA-Z0-9]{14}\.atlasv1\.[a-zA-Z0-9\-_=]{60,}'),
+
+        # ── Pagamento ─────────────────────────────────────────────────────────
+        "stripe_secret":            _regex(r'sk_live_[0-9a-zA-Z]{24,}'),
+        "stripe_publishable":       _regex(r'pk_live_[0-9a-zA-Z]{24,}'),
+        "stripe_webhook":           _regex(r'whsec_[a-zA-Z0-9]{32,}'),
+        "square_access_token":      _regex(r'sq0atp-[0-9A-Za-z\-_]{22}'),
+        "square_oauth_secret":      _regex(r'sq0csp-[0-9A-Za-z\-_]{43}'),
+        "braintree_token":          _regex(r'access_token\$production\$[a-z0-9]{16}\$[a-f0-9]{32}'),
+
+        # ── Comunicação ───────────────────────────────────────────────────────
+        "sendgrid_key":             _regex(r'SG\.[a-zA-Z0-9]{22}\.[a-zA-Z0-9]{43}'),
+        "mailgun_api_key":          _regex(r'key-[0-9a-zA-Z]{32}'),
+        "mailchimp_api_key":        _regex(r'[0-9a-f]{32}-us[0-9]{1,2}'),
+        "twilio_account_sid":       _regex(r'\bAC[a-z0-9]{32}\b'),
+        "twilio_auth_token":        _regex(r'\bSK[a-z0-9]{32}\b'),
+
+        # ── DevOps / CI ───────────────────────────────────────────────────────
+        "github_pat":               _regex(r'gh[pousr]_[A-Za-z0-9]{36}'),
+        "github_oauth":             _regex(r'gho_[A-Za-z0-9]{36}'),
+        "gitlab_pat":               _regex(r'glpat-[A-Za-z0-9\-_]{20}'),
+        "gitlab_pipeline":          _regex(r'glptt-[a-f0-9]{40}'),
+        "npm_token":                _regex(r'npm_[A-Za-z0-9]{36}'),
+        "pypi_token":               _regex(r'pypi-[A-Za-z0-9_\-]{50,}'),
+        "dockerhub_pat":            _regex(r'dckr_pat_[A-Za-z0-9_\-]{27}'),
+        "hashicorp_vault":          _regex(r'hvs\.[A-Za-z0-9_\-]{90,}'),
+        "new_relic_key":            _regex(r'NRAK-[A-Z0-9]{27}'),
+        "sentry_dsn":               _regex(r'https://[a-f0-9]{32}@[a-z0-9]+\.ingest\.sentry\.io/[0-9]+'),
+        "grafana_token":            _regex(r'glc_[A-Za-z0-9+/]{32,}'),
+
+        # ── OpenAI / Slack ────────────────────────────────────────────────────
+        "openai_key":               _regex(r'sk-[a-zA-Z0-9]{48}'),
+        "slack_token":              _regex(r'xox[baprs]-[0-9a-zA-Z\-]{10,48}'),
+        "slack_webhook":            _regex(r'https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+'),
+
+        # ── DB / Connection strings ───────────────────────────────────────────
+        "mongodb_dsn":              _regex(r'mongodb(?:\+srv)?://[^:\s]+:[^@\s]+@[^\s"\'`]+', re.I),
+        "postgres_dsn":             _regex(r'postgres(?:ql)?://[^:\s]+:[^@\s]+@[^\s"\'`]+', re.I),
+        "mysql_dsn":                _regex(r'mysql://[^:\s]+:[^@\s]+@[^\s"\'`]+', re.I),
+        "redis_dsn":                _regex(r'redis://:([^@\s]+)@[^\s"\'`]+', re.I),
+
+        # ── Misc ──────────────────────────────────────────────────────────────
+        "shopify_token":            _regex(r'shp(?:at|ss)_[a-fA-F0-9]{32}'),
+        "mapbox_token":             _regex(r'pk\.eyJ1[A-Za-z0-9._\-]{20,}'),
+        "notion_token":             _regex(r'secret_[A-Za-z0-9]{43}'),
+        "linear_api_key":           _regex(r'lin_api_[A-Za-z0-9]{40}'),
+
+        # ── Supabase ──────────────────────────────────────────────────────────
+        "supabase_url":             _regex(r'https://[a-z0-9]{20}\.supabase\.co', re.I),
+        "supabase_anon_key":        _regex(r'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[A-Za-z0-9_\-]{50,}\.[A-Za-z0-9_\-]{43}'),
+        "supabase_service_role":    _regex(r'(?:SUPABASE_SERVICE_ROLE_KEY|service_role)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-\.]{100,})["\']', re.I),
+        "supabase_env":             _regex(r'SUPABASE_(?:URL|ANON_KEY|SERVICE_ROLE_KEY)\s*[=:]\s*\S+', re.I),
+
+        # ── Chaves / Hashes ───────────────────────────────────────────────────
+        "private_key":              _regex(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
+        "jwt":                      _regex(r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}'),
+        "bcrypt_hash":              _regex(r'\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}'),
+
+        # ── Basic Auth / credenciais hardcoded [NOVO - jsrecon] ──────────────
+        # Authorization:"Basic "+btoa("admin:123456") — Angular/React/Vue
+        "basic_auth_btoa":          _regex(r'Basic\s*["\']?\s*\+\s*btoa\s*\(\s*["\']([^"\']{3,100})["\']\s*\)', re.I),
+        # btoa("user:pass") standalone — decodificável via base64
+        "btoa_creds":               _regex(r'\bbtoa\s*\(\s*["\']([^"\']{2,100})["\']\s*\)', re.I),
+        # Authorization: "Basic dXNlcjpwYXNz" — base64 literal embutido
+        "basic_auth_b64_raw":       _regex(r'(?:Authorization|authorization)\s*[:\s=]+["\']?\s*Basic\s+([A-Za-z0-9+/]{8,}={0,2})', re.I),
+        # username + password juntos na mesma região do código
+        "hardcoded_credentials":    _regex(r'(?:username|user|login|usr)\s*[:=]\s*["\']([^"\']{2,50})["\']\s{0,5}.{0,80}(?:password|passwd|pass|pwd|senha)\s*[:=]\s*["\']([^"\']{2,})["\']', re.I),
+        # Authorization como chave de objeto JS com valor Basic
+        "auth_header_hardcoded":    _regex(r'["\']Authorization["\']\s*:\s*["\']Basic\s+([A-Za-z0-9+/]{8,}={0,2})["\']', re.I),
+
+        # ── Padrões genéricos — validação extra de entropia obrigatória ───────
+        "generic_api_key":          _regex(r'(?:api[_-]?key|apikey)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-]{20,})["\']', re.I),
+        "generic_token":            _regex(r'(?:access[_-]?token|auth[_-]?token)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-\.]{20,})["\']', re.I),
+        "generic_secret":           _regex(r'(?:client[_-]?secret|app[_-]?secret)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-/+=]{20,})["\']', re.I),
+        "bearer_token":             _regex(r'Authorization:\s*Bearer\s+([A-Za-z0-9_\-\.]{20,})', re.I),
+        "password_field":           _regex(r'(?:password|passwd|senha)["\']?\s*[:=]\s*["\']([^"\']{8,})["\']', re.I),
+    }
+
+
+_GENERIC_PATTERNS = frozenset({
+    "generic_api_key", "generic_token", "generic_secret",
+    "bearer_token", "password_field", "auth_header_hardcoded",
+})
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Padrões de endpoints — expandidos com os 17 padrões do jsrecon.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_endpoint_patterns() -> list[tuple[str, re.Pattern, str]]:
+    """(label, regex, method_hint). DYNAMIC = método capturado do grupo 2."""
+    return [
+        ("api_versioned",
+         _regex(r'["\`](/api/v\d+[a-zA-Z0-9/_\-]*(?:\?[^\s"\'`]*)?)["\`]'), "ANY"),
+        ("graphql",
+         _regex(r'["\`]((?:/graphql|/gql)(?:\?[^\s"\'`]*)?)["\`\s/]', re.I), "POST"),
+        ("versioned_path",
+         _regex(r'["\`](/v\d+/[a-zA-Z0-9/_\-]{4,}(?:\?[^\s"\'`]*)?)["\`]'), "ANY"),
+        ("internal_subdomain",
+         _regex(r'(https?://(?:internal|admin|dev|staging|api)\.[a-z0-9\-]+\.[a-z]+[^\s"\'`]*)'), "ANY"),
+        ("fetch_get",
+         _regex(r'(?:fetch|axios\.get|http\.get|request\.get|this\.\$http\.get)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]', re.I), "GET"),
+        ("fetch_post",
+         _regex(r'(?:fetch|axios\.post|http\.post|request\.post|this\.\$http\.post)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]', re.I), "POST"),
+        ("fetch_put",
+         _regex(r'(?:axios\.put|http\.put|request\.put)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]', re.I), "PUT"),
+        ("fetch_delete",
+         _regex(r'(?:axios\.delete|http\.delete|request\.delete)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]', re.I), "DELETE"),
+        ("fetch_patch",
+         _regex(r'(?:axios\.patch|http\.patch|request\.patch)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]', re.I), "PATCH"),
+        ("fetch_dynamic",
+         _regex(r'fetch\s*\(\s*["\`]([^"\'`\s]{4,})["\`]\s*,\s*\{[^}]*method\s*:\s*["\'](\w+)["\']', re.I), "DYNAMIC"),
+        ("query_string_get",
+         _regex(r'(?:new\s+URLSearchParams|qs\.stringify|querystring\.stringify)\s*\([^)]*\).*?["\`](/[a-zA-Z0-9/_\-]{2,})["\`]', re.I | re.DOTALL), "GET"),
+        ("json_body_post",
+         _regex(r'body\s*:\s*JSON\.stringify\s*\([^)]*\).*?["\`](/[a-zA-Z0-9/_\-]{2,})["\`]', re.I | re.DOTALL), "POST"),
+        ("formdata_post",
+         _regex(r'new\s+FormData\s*\([^)]*\).*?(?:fetch|axios\.post)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]', re.I | re.DOTALL), "POST"),
+        ("router_path",
+         _regex(r'(?:path|route|to)\s*:\s*["\`](/[a-zA-Z0-9/_\-:]{3,}(?:\?[^\s"\'`]*)?)["\`]', re.I), "GET"),
+        ("href_path",
+         _regex(r'(?:href|src|action)\s*[=:]\s*["\`](/[a-zA-Z0-9/_\-\.]{4,}(?:\?[^\s"\'`]*)?)["\`]', re.I), "GET"),
+        ("url_with_query",
+         _regex(r'["\`]((?:https?://[^\s"\'`]+)?/[a-zA-Z0-9/_\-]{2,}\?(?:[a-zA-Z0-9_\-]+=\w+&?)+)["\`]', re.I), "GET"),
+        ("websocket",
+         _regex(r'new\s+WebSocket\s*\(\s*["\`](wss?://[^\s"\'`]+)["\`]', re.I), "WS"),
+    ]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -285,7 +469,7 @@ def setup_logging(log_file: Path) -> logging.Logger:
     logger = logging.getLogger("recon")
     logger.setLevel(logging.DEBUG)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
-    ch  = logging.StreamHandler(sys.stdout)
+    ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
     ch.setFormatter(fmt)
     logger.addHandler(ch)
@@ -309,25 +493,23 @@ def get_config(domain: str) -> dict:
         "domain":   domain,
         "base_dir": base,
 
-        "urls_file":              base / "urls_raw.txt",
-        "urls_alive_file":        base / "urls_alive.txt",
-        "js_file":                base / "js_urls.txt",
-        "secrets_txt":            base / "secrets.txt",
-        "secrets_csv":            base / "secrets.csv",
-        "secrets_jsonl":          base / "secrets.jsonl",
-        "google_keys_file":       base / "google_keys.txt",
-        "google_report_file":     base / "google_keys_report.txt",
-        "log_file":               base / "recon.log",
-        "gf_dir":                 base / "gf",
-        "sensitive_urls_file":    base / "sensitive_urls.txt",
-        "sensitive_dir":          base / "sensitive_downloads",
-        "sensitive_report":       base / "sensitive_report.txt",
-        "api_endpoints_file":     base / "api_endpoints.txt",
-        "api_endpoints_jsonl":    base / "api_endpoints.jsonl",   # [NOVO] enriquecido
-        "live_js_file":           base / "live_js_urls.txt",      # [NOVO] js_live_crawler
-        "live_js_report":         base / "live_js_report.json",   # [NOVO] relatório live
-        "summary_file":           base / "SUMMARY.txt",
-        "summary_html":           base / "SUMMARY.html",
+        "urls_file":            base / "urls_raw.txt",
+        "urls_alive_file":      base / "urls_alive.txt",
+        "js_file":              base / "js_urls.txt",
+        "secrets_txt":          base / "secrets.txt",
+        "secrets_csv":          base / "secrets.csv",
+        "secrets_jsonl":        base / "secrets.jsonl",
+        "endpoints_txt":        base / "endpoints.txt",       # NOVO
+        "endpoints_jsonl":      base / "endpoints.jsonl",     # NOVO
+        "google_keys_file":     base / "google_keys.txt",
+        "google_report_file":   base / "google_keys_report.txt",
+        "log_file":             base / "recon.log",
+        "gf_dir":               base / "gf",
+        "sensitive_urls_file":  base / "sensitive_urls.txt",
+        "sensitive_dir":        base / "sensitive_downloads",
+        "sensitive_report":     base / "sensitive_report.txt",
+        "summary_file":         base / "SUMMARY.txt",
+        "summary_html":         base / "SUMMARY.html",
 
         "gf_patterns": ["xss", "sqli", "ssrf", "redirect", "ssti"],
 
@@ -336,76 +518,9 @@ def get_config(domain: str) -> dict:
             re.IGNORECASE,
         ),
 
-        "secret_patterns": {
-            "google_api_key":       _regex(r'AIza[0-9A-Za-z\-_]{35}'),
-            "google_oauth_client":  _regex(r'[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com'),
-            "firebase_url":         _regex(r'https?://[a-z0-9\-]+\.firebaseio\.com', re.I),
-            "gcp_service_account":  _regex(r'"type"\s*:\s*"service_account"'),
-            "aws_access_key":       _regex(r'AKIA[0-9A-Z]{16}'),
-            "amazon_mws":           _regex(r'amzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'),
-            "azure_storage_key":    _regex(r'DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[A-Za-z0-9+/=]{88}'),
-            "digitalocean_token":   _regex(r'dop_v1_[a-f0-9]{64}'),
-            "terraform_cloud":      _regex(r'[a-zA-Z0-9]{14}\.atlasv1\.[a-zA-Z0-9\-_=]{60,}'),
-            "stripe_secret":        _regex(r'sk_live_[0-9a-zA-Z]{24,}'),
-            "stripe_publishable":   _regex(r'pk_live_[0-9a-zA-Z]{24,}'),
-            "stripe_webhook":       _regex(r'whsec_[a-zA-Z0-9]{32,}'),
-            "square_access_token":  _regex(r'sq0atp-[0-9A-Za-z\-_]{22}'),
-            "square_oauth_secret":  _regex(r'sq0csp-[0-9A-Za-z\-_]{43}'),
-            "braintree_token":      _regex(r'access_token\$production\$[a-z0-9]{16}\$[a-f0-9]{32}'),
-            "sendgrid_key":         _regex(r'SG\.[a-zA-Z0-9]{22}\.[a-zA-Z0-9]{43}'),
-            "mailgun_api_key":      _regex(r'key-[0-9a-zA-Z]{32}'),
-            "mailchimp_api_key":    _regex(r'[0-9a-f]{32}-us[0-9]{1,2}'),
-            "twilio_account_sid":   _regex(r'\bAC[a-z0-9]{32}\b'),
-            "twilio_auth_token":    _regex(r'\bSK[a-z0-9]{32}\b'),
-            "github_pat":           _regex(r'gh[pousr]_[A-Za-z0-9]{36}'),
-            "github_oauth":         _regex(r'gho_[A-Za-z0-9]{36}'),
-            "gitlab_pat":           _regex(r'glpat-[A-Za-z0-9\-_]{20}'),
-            "gitlab_pipeline":      _regex(r'glptt-[a-f0-9]{40}'),
-            "npm_token":            _regex(r'npm_[A-Za-z0-9]{36}'),
-            "pypi_token":           _regex(r'pypi-[A-Za-z0-9_\-]{50,}'),
-            "dockerhub_pat":        _regex(r'dckr_pat_[A-Za-z0-9_\-]{27}'),
-            "hashicorp_vault":      _regex(r'hvs\.[A-Za-z0-9_\-]{90,}'),
-            "new_relic_key":        _regex(r'NRAK-[A-Z0-9]{27}'),
-            "sentry_dsn":           _regex(r'https://[a-f0-9]{32}@[a-z0-9]+\.ingest\.sentry\.io/[0-9]+'),
-            "grafana_token":        _regex(r'glc_[A-Za-z0-9+/]{32,}'),
-            "openai_key":           _regex(r'sk-[a-zA-Z0-9]{48}'),
-            "slack_token":          _regex(r'xox[baprs]-[0-9a-zA-Z\-]{10,48}'),
-            "slack_webhook":        _regex(r'https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+'),
-            "mongodb_dsn":          _regex(r'mongodb(?:\+srv)?://[^:\s]+:[^@\s]+@[^\s"\'`]+', re.I),
-            "postgres_dsn":         _regex(r'postgres(?:ql)?://[^:\s]+:[^@\s]+@[^\s"\'`]+', re.I),
-            "mysql_dsn":            _regex(r'mysql://[^:\s]+:[^@\s]+@[^\s"\'`]+', re.I),
-            "redis_dsn":            _regex(r'redis://:([^@\s]+)@[^\s"\'`]+', re.I),
-            "shopify_token":        _regex(r'shp(?:at|ss)_[a-fA-F0-9]{32}'),
-            "mapbox_token":         _regex(r'pk\.eyJ1[A-Za-z0-9._\-]{20,}'),
-            "notion_token":         _regex(r'secret_[A-Za-z0-9]{43}'),
-            "linear_api_key":       _regex(r'lin_api_[A-Za-z0-9]{40}'),
-            "supabase_url":         _regex(r'https://[a-z0-9]{20}\.supabase\.co', re.I),
-            "supabase_anon_key":    _regex(r'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[A-Za-z0-9_\-]{50,}\.[A-Za-z0-9_\-]{43}'),
-            "supabase_service_role":_regex(r'(?:SUPABASE_SERVICE_ROLE_KEY|service_role)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-\.]{100,})["\']', re.I),
-            "supabase_env":         _regex(r'SUPABASE_(?:URL|ANON_KEY|SERVICE_ROLE_KEY)\s*[=:]\s*\S+', re.I),
-            "private_key":          _regex(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
-            "jwt":                  _regex(r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}'),
-            "bcrypt_hash":          _regex(r'\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}'),
-            "generic_api_key":      _regex(r'(?:api[_-]?key|apikey)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-]{20,})["\']', re.I),
-            "generic_token":        _regex(r'(?:access[_-]?token|auth[_-]?token)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-\.]{20,})["\']', re.I),
-            "generic_secret":       _regex(r'(?:client[_-]?secret|app[_-]?secret)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-/+=]{20,})["\']', re.I),
-            "bearer_token":         _regex(r'Authorization:\s*Bearer\s+([A-Za-z0-9_\-\.]{20,})', re.I),
-            "password_field":       _regex(r'(?:password|passwd|senha)["\']?\s*[:=]\s*["\']([^"\']{8,})["\']', re.I),
-        },
-
-        "_generic_patterns": {
-            "generic_api_key", "generic_token", "generic_secret",
-            "bearer_token", "password_field",
-        },
-
-        # ── [NOVO] Padrões ricos de endpoint ─────────────────────────────────
-        # Cada tupla: (label, regex, metodo_hint)
-        "endpoint_patterns": _build_endpoint_patterns(),
-
-        "google_key_regex":  re.compile(r'AIza[0-9A-Za-z\-_]{35}'),
-        "headers":           {"User-Agent": "Mozilla/5.0 recon"},
-        "js_workers":        20,
-        "request_timeout":   10,
+        "secret_patterns":   _build_secret_patterns(),
+        "_generic_patterns": _GENERIC_PATTERNS,
+        "endpoint_patterns": _build_endpoint_patterns(),    # NOVO
 
         "sensitive_content_patterns": [
             re.compile(r'(?:DB_PASS(?:WORD)?|DATABASE_PASSWORD|MYSQL_ROOT_PASSWORD)\s*=\s*\S+', re.I),
@@ -418,132 +533,16 @@ def get_config(domain: str) -> dict:
             re.compile(r'SUPABASE_(?:URL|ANON_KEY|SERVICE_ROLE_KEY)\s*=\s*\S+', re.I),
             re.compile(r'createClient\s*\(\s*["\']https://[a-z0-9]+\.supabase\.co["\']', re.I),
         ],
+
+        "google_key_regex":  re.compile(r'AIza[0-9A-Za-z\-_]{35}'),
+        "headers":           {"User-Agent": "Mozilla/5.0 recon"},
+        "js_workers":        20,
+        "request_timeout":   10,
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# [NOVO] Padrões ricos de endpoint — paths, APIs, queries GET/POST
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _build_endpoint_patterns() -> list[tuple[str, re.Pattern, str]]:
-    """
-    Retorna lista de (label, regex, method_hint).
-    method_hint pode ser: GET, POST, PUT, DELETE, PATCH, ANY, UNKNOWN
-    """
-    return [
-        # /api/vN/...
-        ("api_versioned",
-         re.compile(r'["\`](/api/v\d+[a-zA-Z0-9/_\-]*(?:\?[^\s"\'`]*)?)["\`]'),
-         "ANY"),
-        # /graphql /gql
-        ("graphql",
-         re.compile(r'["\`]((?:/graphql|/gql)(?:\?[^\s"\'`]*)?)["\`\s/]', re.I),
-         "POST"),
-        # /vN/path (sem /api)
-        ("versioned_path",
-         re.compile(r'["\`](/v\d+/[a-zA-Z0-9/_\-]{4,}(?:\?[^\s"\'`]*)?)["\`]'),
-         "ANY"),
-        # URL absoluta de subdomínios internos
-        ("internal_subdomain",
-         re.compile(r'(https?://(?:internal|admin|dev|staging|api)\.[a-z0-9\-]+\.[a-z]+[^\s"\'`]*)'),
-         "ANY"),
-        # fetch / axios GET explícito
-        ("fetch_get",
-         re.compile(
-             r'(?:fetch|axios\.get|http\.get|request\.get|this\.\$http\.get)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]',
-             re.I,
-         ),
-         "GET"),
-        # fetch / axios POST explícito
-        ("fetch_post",
-         re.compile(
-             r'(?:fetch|axios\.post|http\.post|request\.post|this\.\$http\.post)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]',
-             re.I,
-         ),
-         "POST"),
-        # método: 'PUT' / 'DELETE' / 'PATCH' em fetch genérico
-        ("fetch_put",
-         re.compile(
-             r'(?:axios\.put|http\.put|request\.put)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]',
-             re.I,
-         ),
-         "PUT"),
-        ("fetch_delete",
-         re.compile(
-             r'(?:axios\.delete|http\.delete|request\.delete)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]',
-             re.I,
-         ),
-         "DELETE"),
-        ("fetch_patch",
-         re.compile(
-             r'(?:axios\.patch|http\.patch|request\.patch)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]',
-             re.I,
-         ),
-         "PATCH"),
-        # fetch genérico com method explícito no options object
-        ("fetch_generic_with_method",
-         re.compile(
-             r'fetch\s*\(\s*["\`]([^"\'`\s]{4,})["\`]\s*,\s*\{[^}]*method\s*:\s*["\'](\w+)["\']',
-             re.I,
-         ),
-         "DYNAMIC"),  # método capturado do grupo 2
-        # URLSearchParams / QueryString — GET com query
-        ("query_string_get",
-         re.compile(
-             r'(?:new\s+URLSearchParams|qs\.stringify|querystring\.stringify)\s*\([^)]*\)\s*[;\n].*?'
-             r'["\`](/[a-zA-Z0-9/_\-]{2,})["\`]',
-             re.I | re.DOTALL,
-         ),
-         "GET"),
-        # body JSON POST
-        ("json_body_post",
-         re.compile(
-             r'body\s*:\s*JSON\.stringify\s*\([^)]*\).*?'
-             r'["\`](/[a-zA-Z0-9/_\-]{2,})["\`]',
-             re.I | re.DOTALL,
-         ),
-         "POST"),
-        # FormData POST
-        ("formdata_post",
-         re.compile(
-             r'new\s+FormData\s*\([^)]*\).*?'
-             r'(?:fetch|axios\.post)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]',
-             re.I | re.DOTALL,
-         ),
-         "POST"),
-        # Rota de router (Vue/React/Express)
-        ("router_path",
-         re.compile(
-             r'(?:path|route|to)\s*:\s*["\`](/[a-zA-Z0-9/_\-:]{3,}(?:\?[^\s"\'`]*)?)["\`]',
-             re.I,
-         ),
-         "GET"),
-        # href / src com path
-        ("href_path",
-         re.compile(
-             r'(?:href|src|action)\s*[=:]\s*["\`](/[a-zA-Z0-9/_\-\.]{4,}(?:\?[^\s"\'`]*)?)["\`]',
-             re.I,
-         ),
-         "GET"),
-        # query param pattern em URLs absolutas: ?key=value&key2=value2
-        ("url_with_query",
-         re.compile(
-             r'["\`]((?:https?://[^\s"\'`]+)?/[a-zA-Z0-9/_\-]{2,}\?(?:[a-zA-Z0-9_\-]+=\w+&?)+)["\`]',
-             re.I,
-         ),
-         "GET"),
-        # WebSocket endpoints
-        ("websocket",
-         re.compile(
-             r'new\s+WebSocket\s*\(\s*["\`](wss?://[^\s"\'`]+)["\`]',
-             re.I,
-         ),
-         "WS"),
-    ]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Preflight check
+# Preflight check de ferramentas
 # ─────────────────────────────────────────────────────────────────────────────
 
 _TOOL_META: dict[str, dict] = {
@@ -563,15 +562,13 @@ _TOOL_META: dict[str, dict] = {
 _CRITICAL_TOOLS = {"httpx"}
 
 
+def tool_available(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
 def preflight_check(logger: logging.Logger, args: argparse.Namespace) -> bool:
     missing: list[tuple[str, str, str]] = []
     present: list[str]                  = []
-
-    # Verifica js_live_crawler.py separadamente
-    live_crawler_ok = Path("js_live_crawler.py").exists()
-    if not live_crawler_ok:
-        logger.warning("js_live_crawler.py não encontrado no diretório atual — etapa live JS será pulada.")
-
     for tool, meta in _TOOL_META.items():
         if tool_available(tool):
             present.append(tool)
@@ -580,22 +577,19 @@ def preflight_check(logger: logging.Logger, args: argparse.Namespace) -> bool:
 
     logger.info("─── Preflight check ─────────────────────────────────────────")
     logger.info("Ferramentas disponíveis (%d): %s", len(present), ", ".join(sorted(present)))
-    logger.info("js_live_crawler.py: %s", "OK" if live_crawler_ok else "AUSENTE")
-
     if missing:
         logger.warning("Ferramentas ausentes (%d):", len(missing))
         for tool, install_cmd, impact in sorted(missing):
             level = logging.ERROR if tool in _CRITICAL_TOOLS else logging.WARNING
-            logger.log(level, "  ✗ %-15s | impacto: %-45s | instalar: %s", tool, impact, install_cmd)
+            logger.log(level, "  ✗ %-15s | impacto: %-45s | instalar: %s",
+                       tool, impact, install_cmd)
 
     critical_missing = [t for t, _, _ in missing if t in _CRITICAL_TOOLS]
-    if "httpx" in critical_missing and args.no_httpx:
+    if "httpx" in critical_missing and getattr(args, "no_httpx", False):
         critical_missing.remove("httpx")
-
     if critical_missing:
         logger.error("Ferramentas críticas ausentes: %s — abortando.", ", ".join(critical_missing))
         return False
-
     logger.info("─────────────────────────────────────────────────────────────")
     return True
 
@@ -621,14 +615,13 @@ def append_line_to_file(path: Path, line: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Rate limiting adaptativo
+# Rate limiting adaptativo por hostname
 # ─────────────────────────────────────────────────────────────────────────────
 
 _host_semaphores: dict[str, threading.Semaphore] = {}
 _host_sem_lock   = threading.Lock()
 _MAX_PER_HOST    = 4
-
-_request_logger = logging.getLogger("recon.requests")
+_request_logger  = logging.getLogger("recon.requests")
 
 
 def _get_host_semaphore(url: str) -> threading.Semaphore:
@@ -663,7 +656,6 @@ def _make_retrying_get(cfg: dict):
             )
             if resp.status_code == 429:
                 retry_after = int(resp.headers.get("Retry-After", 10))
-                _request_logger.debug("[429] %s — aguardando %ds", url, retry_after)
                 time.sleep(min(retry_after, 60))
                 resp.raise_for_status()
             elif resp.status_code == 503:
@@ -680,9 +672,8 @@ def _make_retrying_get(cfg: dict):
 def run_cmd(cmd: list[str], logger: logging.Logger,
             stdin: str | None = None, timeout: int = 300) -> list[str]:
     try:
-        result = subprocess.run(
-            cmd, input=stdin, capture_output=True, text=True, timeout=timeout,
-        )
+        result = subprocess.run(cmd, input=stdin, capture_output=True,
+                                text=True, timeout=timeout)
         if result.stderr:
             logger.debug("[stderr] %s: %s", cmd[0], result.stderr.strip()[:300])
         return [l for l in result.stdout.splitlines() if l.strip()]
@@ -697,33 +688,24 @@ def run_cmd(cmd: list[str], logger: logging.Logger,
         return []
 
 
-def tool_available(name: str) -> bool:
-    return shutil.which(name) is not None
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Fontes passivas via API HTTP direta
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fetch_wayback_api(domain: str, logger: logging.Logger) -> set[str]:
     urls: set[str] = set()
-    params = {
-        "url": f"*.{domain}/*", "output": "text", "fl": "original",
-        "collapse": "urlkey", "limit": "100000", "filter": "statuscode:200",
-    }
     try:
         resp = requests.get(
             "https://web.archive.org/cdx/search/cdx",
-            params=params, timeout=900,
-            headers={"User-Agent": "Mozilla/5.0 recon"},
+            params={"url": f"*.{domain}/*", "output": "text", "fl": "original",
+                    "collapse": "urlkey", "limit": "100000", "filter": "statuscode:200"},
+            timeout=900, headers={"User-Agent": "Mozilla/5.0 recon"},
         )
         if resp.status_code == 200:
             for line in resp.text.splitlines():
                 line = line.strip()
                 if line and line.startswith("http"):
                     urls.add(line)
-    except requests.exceptions.Timeout:
-        logger.warning("[wayback-api] timeout na requisição.")
     except Exception as exc:
         logger.debug("[wayback-api] erro: %s", exc)
     return urls
@@ -742,7 +724,6 @@ def _fetch_commoncrawl_api(domain: str, logger: logging.Logger) -> set[str]:
     except Exception as exc:
         logger.debug("[commoncrawl-api] erro ao buscar índices: %s", exc)
         return urls
-
     for api_url in recent:
         try:
             resp = requests.get(
@@ -766,23 +747,21 @@ def _fetch_commoncrawl_api(domain: str, logger: logging.Logger) -> set[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def collect_urls(cfg: dict, logger: logging.Logger) -> int:
-    domain    = cfg["domain"]
+    domain   = cfg["domain"]
     all_urls: set[str] = set()
 
     if tool_available("gau"):
-        logger.info("[gau] coletando… (domínio: %s)", domain)
-        lines = run_cmd([
-            "gau", "--threads", "5", "--subs",
-            "--providers", "wayback,commoncrawl,otx,urlscan",
-            "--retries", "2", "--timeout", "90", domain,
-        ], logger, timeout=900)
+        logger.info("[gau] coletando…")
+        lines = run_cmd(["gau", "--threads", "5", "--subs",
+                         "--providers", "wayback,commoncrawl,otx,urlscan",
+                         "--retries", "2", "--timeout", "90", domain], logger, timeout=900)
         all_urls.update(lines)
         logger.info("[gau] %d URLs", len(lines))
     else:
         logger.warning("gau não encontrado — pulando.")
 
     if tool_available("waybackurls"):
-        logger.info("[waybackurls] coletando… (domínio: %s)", domain)
+        logger.info("[waybackurls] coletando…")
         lines = run_cmd(["waybackurls", domain], logger, timeout=900)
         all_urls.update(lines)
         logger.info("[waybackurls] %d URLs", len(lines))
@@ -790,14 +769,14 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
         logger.warning("waybackurls não encontrado — pulando.")
 
     logger.info("[wayback-api] consultando CDX API…")
-    wb = _fetch_wayback_api(domain, logger)
-    all_urls.update(wb)
-    logger.info("[wayback-api] %d URLs", len(wb))
+    wayback_urls = _fetch_wayback_api(domain, logger)
+    all_urls.update(wayback_urls)
+    logger.info("[wayback-api] %d URLs", len(wayback_urls))
 
     logger.info("[commoncrawl-api] consultando…")
-    cc = _fetch_commoncrawl_api(domain, logger)
-    all_urls.update(cc)
-    logger.info("[commoncrawl-api] %d URLs", len(cc))
+    cc_urls = _fetch_commoncrawl_api(domain, logger)
+    all_urls.update(cc_urls)
+    logger.info("[commoncrawl-api] %d URLs", len(cc_urls))
 
     if tool_available("katana"):
         logger.info("[katana] coletando…")
@@ -827,7 +806,8 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
         try:
             proc = subprocess.Popen(
                 ["gospider", "-s", f"https://{domain}",
-                 "-c", "10", "-d", "3", "--js", "--sitemap", "--robots",
+                 "-c", "10", "-d", "3",
+                 "--js", "--sitemap", "--robots",
                  "-a", "-w", "--subs", "-q",
                  "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -867,7 +847,7 @@ def collect_urls(cfg: dict, logger: logging.Logger) -> int:
                         proc = subprocess.Popen(
                             ["gospider", "-s", f"https://{sub}",
                              "-c", "5", "-d", "2", "--js", "-q",
-                             "--user-agent", "Mozilla/5.0"],
+                             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                         )
                         try:
@@ -978,7 +958,7 @@ def probe_xss(cfg: dict, logger: logging.Logger) -> int:
             ["dalfox", "file", str(xss_file),
              "--silence", "--output", str(out_file),
              "--worker", "10", "--timeout", "10",
-             "--header", "User-Agent: Mozilla/5.0"],
+             "--header", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         hits   = 0
@@ -987,8 +967,6 @@ def probe_xss(cfg: dict, logger: logging.Logger) -> int:
         try:
             for line in proc.stdout:
                 line = line.strip()
-                if not line:
-                    continue
                 if "[V]" in line:
                     hits += 1
                     logger.warning("[!!!] dalfox XSS confirmado: %s", line)
@@ -1018,7 +996,6 @@ def probe_ssrf_redirect(cfg: dict, logger: logging.Logger) -> int:
     if not tool_available("qsreplace"):
         logger.warning("qsreplace não encontrado — pulando probes SSRF/redirect.")
         return 0
-
     for kind, (gf_file, payload) in probes.items():
         if not gf_file.exists() or gf_file.stat().st_size == 0:
             continue
@@ -1033,7 +1010,6 @@ def probe_ssrf_redirect(cfg: dict, logger: logging.Logger) -> int:
         except Exception as exc:
             logger.error("qsreplace (%s): %s", kind, exc)
             continue
-
         hits = []
         for url in probe_urls[:200]:
             try:
@@ -1050,7 +1026,6 @@ def probe_ssrf_redirect(cfg: dict, logger: logging.Logger) -> int:
                     hits.append(url)
             except Exception:
                 pass
-
         if hits:
             write_if_not_empty(cfg["gf_dir"] / f"{kind}_hits.txt", hits, logger)
             logger.warning("[!!!] %s: %d hits", kind.upper(), len(hits))
@@ -1083,11 +1058,9 @@ def download_and_analyze_sensitive(cfg: dict, logger: logging.Logger) -> int:
     urls = [u.strip() for u in cfg["sensitive_urls_file"].read_text(encoding="utf-8").splitlines() if u.strip()]
     if not urls:
         return 0
-
     get          = _make_retrying_get(cfg)
     findings     = 0
     report_lines: list[str] = []
-
     logger.info("Baixando %d arquivos sensíveis…", len(urls))
     for url in urls[:500]:
         try:
@@ -1111,7 +1084,6 @@ def download_and_analyze_sensitive(cfg: dict, logger: logging.Logger) -> int:
                 logger.warning("[!!!] Segredo em arquivo sensível → %s", url)
                 report_lines.append(f"URL: {url}\nACHADO: {hit}\n" + "-" * 60)
                 findings += 1
-
     if report_lines:
         write_if_not_empty(cfg["sensitive_report"], report_lines, logger)
     logger.info("Achados em arquivos sensíveis: %d", findings)
@@ -1119,7 +1091,7 @@ def download_and_analyze_sensitive(cfg: dict, logger: logging.Logger) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Etapa 5: Coleta de JS (passiva)
+# Etapa 5: Coleta de JS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def collect_js(cfg: dict, logger: logging.Logger) -> int:
@@ -1127,31 +1099,24 @@ def collect_js(cfg: dict, logger: logging.Logger) -> int:
     if not source.exists():
         logger.warning("Arquivo de URLs não encontrado — pulando coleta de JS.")
         return 0
-
     js_re = re.compile(
-        r'(?:\.js(?:\?[^\s]*)?$|/(?:static|assets|dist|build|chunks|bundles)/[^\s]*\.js)',
-        re.I,
+        r'(?:\.js(?:\?[^\s]*)?$|/(?:static|assets|dist|build|chunks|bundles)/[^\s]*\.js)', re.I,
     )
     js_urls: set[str] = set()
     for line in source.read_text(encoding="utf-8").splitlines():
         url = line.strip()
-        if not url:
-            continue
-        if _CDN_DOMAINS_RE.search(url):
-            continue
-        if url.endswith(".js.map"):
+        if not url or _CDN_DOMAINS_RE.search(url) or url.endswith(".js.map"):
             continue
         if js_re.search(url):
             js_urls.add(url)
-
     wrote = write_if_not_empty(cfg["js_file"], sorted(js_urls), logger)
-    logger.info("Arquivos JS únicos (passivo): %d%s", len(js_urls),
+    logger.info("Arquivos JS únicos: %d%s", len(js_urls),
                 f" → {cfg['js_file']}" if wrote else " (nenhum)")
     return len(js_urls)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Etapa 5b: Inline scripts em HTML
+# Análise de inline scripts em HTML
 # ─────────────────────────────────────────────────────────────────────────────
 
 _INLINE_SCRIPT_RE = re.compile(r'<script(?:\s[^>]*)?>(.+?)</script>', re.DOTALL | re.IGNORECASE)
@@ -1171,14 +1136,12 @@ def analyze_inline_scripts(cfg: dict, logger: logging.Logger,
     source = cfg.get("_active_urls_file", cfg["urls_file"])
     if not source.exists():
         return 0
-
     candidate_urls = [
         u.strip() for u in source.read_text(encoding="utf-8").splitlines()
         if u.strip() and not _STATIC_EXT_RE.search(u.strip())
     ]
     if not candidate_urls:
         return 0
-
     get_fn  = _make_retrying_get(cfg)
     total   = 0
     sampled = candidate_urls[:300]
@@ -1198,17 +1161,22 @@ def analyze_inline_scripts(cfg: dict, logger: logging.Logger,
         content = resp.text
         if len(content) > 5_000_000:
             return 0
-        scripts = [m.group(1) for m in _INLINE_SCRIPT_RE.finditer(content) if "src=" not in m.group(0)[:50]]
+        scripts = [
+            m.group(1) for m in _INLINE_SCRIPT_RE.finditer(content)
+            if "src=" not in m.group(0)[:50]
+        ]
         for i, script_content in enumerate(scripts):
             if len(script_content.strip()) < 20:
                 continue
             virtual_url = f"{url}::inline_script_{i}"
-            n = analyze_js_content(script_content, virtual_url, cfg, logger, google_keys_found, google_keys_lock)
+            n = analyze_js_content(script_content, virtual_url, cfg, logger,
+                                   google_keys_found, google_keys_lock)
             local += n
             for fm in _FRAMEWORK_DATA_RE.finditer(script_content):
                 try:
                     data_obj = json.loads(fm.group(1))
-                    n2 = analyze_js_content(json.dumps(data_obj), f"{url}::framework_data", cfg, logger, google_keys_found, google_keys_lock)
+                    n2 = analyze_js_content(json.dumps(data_obj), f"{url}::framework_data",
+                                            cfg, logger, google_keys_found, google_keys_lock)
                     local += n2
                 except Exception:
                     pass
@@ -1221,133 +1189,11 @@ def analyze_inline_scripts(cfg: dict, logger: logging.Logger,
                 total += fut.result()
             except Exception as exc:
                 logger.debug("[inline-scripts] erro: %s", exc)
-
-    logger.info("[inline-scripts] segredos: %d", total)
+    if total:
+        logger.warning("[!!!] Segredos em inline scripts: %d", total)
+    else:
+        logger.info("[inline-scripts] nenhum segredo encontrado.")
     return total
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# [NOVO] Etapa 5c: js_live_crawler — coleta JS ao vivo via browser real
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_live_crawler(
-    cfg: dict,
-    logger: logging.Logger,
-    args: argparse.Namespace,
-    alive_subdomains: list[str],
-) -> set[str]:
-    """
-    Chama js_live_crawler.py para o domínio principal e todos os subdomínios
-    vivos, coleta os .js retornados, deduplica globalmente e salva.
-
-    Retorna: set de URLs de JS novas (não vistas nas etapas passivas).
-    """
-    live_crawler = Path("js_live_crawler.py")
-    if not live_crawler.exists():
-        logger.warning("[live-crawler] js_live_crawler.py não encontrado — etapa pulada.")
-        return set()
-
-    domain = cfg["domain"]
-    timeout = getattr(args, "live_timeout", 30)
-    wait    = getattr(args, "live_wait",    2)
-
-    # Monta lista de alvos: domínio principal + subdomínios vivos
-    targets: list[str] = [f"https://{domain}"]
-    for sub in alive_subdomains:
-        if not sub.startswith("http"):
-            sub = f"https://{sub}"
-        targets.append(sub)
-
-    logger.info("[live-crawler] iniciando coleta ao vivo em %d alvo(s)…", len(targets))
-
-    # Arquivo temporário de domínios para o -f
-    domains_file = cfg["base_dir"] / "_live_crawler_targets.txt"
-    domains_file.write_text("\n".join(targets) + "\n", encoding="utf-8")
-
-    # Arquivo de saída JSON do live crawler
-    live_json = cfg["live_js_report"]
-
-    cmd = [
-        sys.executable, str(live_crawler),
-        "-f", str(domains_file),
-        "-t", str(timeout),
-        "-w", str(wait),
-        "-o", str(live_json),
-    ]
-
-    logger.info("[live-crawler] executando: %s", " ".join(cmd))
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True, text=True,
-            timeout=max(300, len(targets) * (timeout + wait + 10)),
-        )
-        if result.returncode != 0:
-            logger.warning("[live-crawler] saiu com código %d", result.returncode)
-            if result.stderr:
-                logger.debug("[live-crawler] stderr: %s", result.stderr[:500])
-    except subprocess.TimeoutExpired:
-        logger.warning("[live-crawler] timeout global — resultados parciais podem ter sido salvos.")
-    except Exception as exc:
-        logger.error("[live-crawler] erro ao executar: %s", exc)
-        return set()
-
-    # Lê o JSON gerado e extrai URLs de JS
-    if not live_json.exists():
-        logger.warning("[live-crawler] nenhum arquivo de resultado gerado.")
-        return set()
-
-    live_js_urls: set[str] = set()
-    try:
-        raw = json.loads(live_json.read_text(encoding="utf-8"))
-        # O live_crawler acumula em lista; cada item é um crawl
-        if isinstance(raw, list):
-            crawls = raw
-        else:
-            crawls = [raw]
-
-        for crawl in crawls:
-            for section in ("own_domain", "third_party"):
-                for entry in crawl.get(section, []):
-                    url = entry.get("url", "").strip()
-                    if url and not _CDN_DOMAINS_RE.search(url):
-                        live_js_urls.add(url)
-    except Exception as exc:
-        logger.error("[live-crawler] erro ao ler resultado JSON: %s", exc)
-        return set()
-
-    logger.info("[live-crawler] %d JS coletados ao vivo (bruto)", len(live_js_urls))
-
-    # ── Deduplicação global contra JS já conhecidos ──────────────────────────
-    known_js: set[str] = set()
-    if cfg["js_file"].exists():
-        for line in cfg["js_file"].read_text(encoding="utf-8").splitlines():
-            known_js.add(line.strip().split("?")[0])
-
-    new_js = {
-        url for url in live_js_urls
-        if url.split("?")[0] not in known_js
-    }
-    duplicate_count = len(live_js_urls) - len(new_js)
-
-    logger.info("[live-crawler] JS novos (não vistos passivamente): %d  |  duplicados removidos: %d",
-                len(new_js), duplicate_count)
-
-    # Salva lista de JS novos para análise
-    if new_js:
-        write_if_not_empty(cfg["live_js_file"], sorted(new_js), logger)
-
-    # Atualiza js_file unificado: passivos + live
-    all_js = known_js | {url.split("?")[0] for url in live_js_urls}
-    write_if_not_empty(cfg["js_file"], sorted(all_js), logger)
-
-    # Limpa arquivo temporário de targets
-    try:
-        domains_file.unlink()
-    except Exception:
-        pass
-
-    return new_js
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1399,7 +1245,6 @@ def validate_google_key(key: str, cfg: dict, logger: logging.Logger) -> dict:
         for fut in as_completed({ex.submit(_check, n, t): n for n, t in GOOGLE_ENDPOINTS}):
             n, s = fut.result()
             results[n] = s
-
     vuln = [n for n, s in results.items() if s == "VULNERAVEL"]
     if vuln:
         logger.warning("[GOOGLE KEY] %s → vulnerável: %s", key, ", ".join(vuln))
@@ -1426,38 +1271,21 @@ def validate_all_google_keys(google_keys: set, cfg: dict, logger: logging.Logger
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Etapa 6: Análise de JS (segredos + endpoints ricos)
+# Estado global thread-safe
 # ─────────────────────────────────────────────────────────────────────────────
 
-def is_valid_js(resp: requests.Response, content: str) -> bool:
-    ct = resp.headers.get("Content-Type", "")
-    if "javascript" in ct or "ecmascript" in ct:
-        return True
-    stripped = content.strip()
-    if stripped.startswith(("<html", "<HTML", "<!DOCTYPE", "<!doctype", "<?xml")):
-        return False
-    if re.match(r'^\s*[{\[]', stripped) and not re.search(
-            r'(?:var |let |const |function|=>|\bif\b|\bfor\b)', stripped[:500]):
-        return False
-    return True
+_analyzed_js_urls: set[str]         = set()
+_analyzed_js_lock: threading.Lock   = threading.Lock()
+_seen_secrets: set[tuple[str, str]] = set()
+_seen_secrets_lock: threading.Lock  = threading.Lock()
+_secret_write_lock                  = threading.Lock()
+_seen_endpoints: set[tuple]         = set()
+_endpoint_write_lock                = threading.Lock()
 
 
-def _secret_context(content: str, start: int, end: int, radius: int = 90) -> str:
-    left  = max(0, start - radius)
-    right = min(len(content), end + radius)
-    return content[left:right].replace("\r", " ").replace("\n", " ").strip()
-
-
-_analyzed_js_urls: set[str]          = set()
-_analyzed_js_lock: threading.Lock    = threading.Lock()
-_seen_secrets: set[tuple[str, str]]  = set()
-_seen_secrets_lock: threading.Lock   = threading.Lock()
-_secret_write_lock                   = threading.Lock()
-
-# [NOVO] Dedup global de endpoints
-_seen_endpoints: set[tuple[str, str]]  = set()   # (method, path_normalized)
-_endpoint_write_lock                   = threading.Lock()
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Persistência de segredos
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _append_secret(finding: dict, cfg: dict) -> bool:
     finding = {**finding, "severity": get_severity(finding["type"])}
@@ -1466,15 +1294,12 @@ def _append_secret(finding: dict, cfg: dict) -> bool:
         if norm_key in _seen_secrets:
             return False
         _seen_secrets.add(norm_key)
-
     with _secret_write_lock:
-        sev_tag = f"[{finding['severity']}]"
         append_line_to_file(
             cfg["secrets_txt"],
-            f"{sev_tag} [{finding['type']}] {finding['url']}\n"
+            f"[{finding['severity']}] [{finding['type']}] {finding['url']}\n"
             f"VALUE  : {finding['value']}\n"
-            f"CONTEXT: {finding['context'][:300]}\n"
-            + "-" * 60,
+            f"CONTEXT: {finding['context'][:300]}\n" + "-" * 60,
         )
         csv_new = not cfg["secrets_csv"].exists()
         cfg["secrets_csv"].parent.mkdir(parents=True, exist_ok=True)
@@ -1502,160 +1327,55 @@ def _append_secret(finding: dict, cfg: dict) -> bool:
     return True
 
 
-def _build_absolute_url(endpoint: str, js_url: str, domain: str) -> str:
-    """Transforma path relativo em URL absoluta usando o domínio do alvo."""
-    if endpoint.startswith(("http://", "https://", "ws://", "wss://")):
-        return endpoint
+# ─────────────────────────────────────────────────────────────────────────────
+# Persistência de endpoints (NOVO - jsrecon)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _abs_url(path: str, js_url: str, domain: str) -> str:
+    if path.startswith(("http://", "https://", "ws://", "wss://")):
+        return path
     base = f"https://{domain}"
-    if endpoint.startswith("/"):
-        return base + endpoint
-    return base + "/" + endpoint
+    return base + (path if path.startswith("/") else "/" + path)
 
 
-def _append_endpoint(ep: dict, cfg: dict, domain: str) -> bool:
-    """
-    Registra um endpoint deduplicado.
-    ep: {method, path, js_url, query_params, absolute_url}
-    """
-    method = ep.get("method", "UNKNOWN").upper()
-    path   = ep.get("path", "").strip()
-
-    # Normaliza para dedup: remove query string do path base
-    path_base = path.split("?")[0].rstrip("/") or "/"
-    dedup_key = (method if method != "ANY" else "_", path_base)
-
-    with _endpoint_write_lock:
-        if dedup_key in _seen_endpoints:
-            return False
-        _seen_endpoints.add(dedup_key)
-
-        abs_url = ep.get("absolute_url") or _build_absolute_url(path, ep.get("js_url", ""), domain)
-
-        # ── TXT legível ──────────────────────────────────────────────────────
-        line_txt = (
-            f"[{method}] {path}\n"
-            f"  → Absoluta : {abs_url}\n"
-            f"  → Fonte JS : {ep.get('js_url', '?')}\n"
-        )
-        if ep.get("query_params"):
-            line_txt += f"  → Query    : {ep['query_params']}\n"
-        line_txt += "-" * 60
-
-        append_line_to_file(cfg["api_endpoints_file"], line_txt)
-
-        # ── JSONL enriquecido ────────────────────────────────────────────────
-        append_line_to_file(
-            cfg["api_endpoints_jsonl"],
-            json.dumps({
-                "method":       method,
-                "path":         path,
-                "absolute_url": abs_url,
-                "query_params": ep.get("query_params", ""),
-                "js_source":    ep.get("js_url", ""),
-            }, ensure_ascii=False),
-        )
-    return True
-
-
-def _extract_query_params(url_or_path: str) -> str:
-    """Extrai e formata query string de uma URL."""
+def _query_params(url_or_path: str) -> str:
     if "?" not in url_or_path:
         return ""
     qs = url_or_path.split("?", 1)[1].split("#")[0]
     try:
         parsed = urllib.parse.parse_qs(qs, keep_blank_values=True)
-        parts  = []
-        for k, vs in parsed.items():
-            for v in vs:
-                parts.append(f"{k}={v}")
-        return "&".join(parts)
+        return "&".join(f"{k}={v}" for k, vs in parsed.items() for v in vs)
     except Exception:
         return qs
 
 
-def analyze_js_content(
-    content: str,
-    url: str,
-    cfg: dict,
-    logger: logging.Logger,
-    google_keys_found: set,
-    google_keys_lock: threading.Lock,
-) -> int:
-    found       = 0
-    lines       = content.splitlines()
-    generic_set = cfg["_generic_patterns"]
-    domain      = cfg["domain"]
+def _save_endpoint(ep: dict, cfg: dict) -> bool:
+    method    = ep.get("method", "UNKNOWN").upper()
+    path      = ep.get("path", "").strip()
+    path_base = path.split("?")[0].rstrip("/") or "/"
+    key       = (method if method != "ANY" else "_", path_base)
 
-    def _line_at(pos: int) -> str:
-        char_count = 0
-        for line in lines:
-            char_count += len(line) + 1
-            if char_count >= pos:
-                return line
-        return ""
+    with _endpoint_write_lock:
+        if key in _seen_endpoints:
+            return False
+        _seen_endpoints.add(key)
 
-    # ── Segredos ─────────────────────────────────────────────────────────────
-    for name, pattern in cfg["secret_patterns"].items():
-        for match in pattern.finditer(content):
-            raw_value = match.group(0)
-            value     = match.group(1) if match.lastindex and match.lastindex >= 1 else raw_value
-
-            if name in generic_set:
-                context_line = _line_at(match.start())
-                if not is_likely_real_credential(value, context_line):
-                    logger.debug("[SKIP FP] %s → %s", name, value[:60])
-                    continue
-
-            if name == "jwt" and not _is_real_jwt(value):
-                logger.debug("[SKIP FP] jwt inválido estruturalmente → %s", value[:60])
-                continue
-
-            context = _secret_context(content, match.start(), match.end())
-            finding = {"type": name, "value": value, "url": url, "context": context}
-
-            if _append_secret(finding, cfg):
-                logger.warning("[!!!] %s → %s | %s", name, value[:80], url)
-                found += 1
-                if name == "google_api_key":
-                    with google_keys_lock:
-                        google_keys_found.add(value)
-
-    for obf in scan_charcode_obfuscation(content, url, logger):
-        _append_secret(obf, cfg)
-        found += 1
-
-    # ── [NOVO] Endpoints ricos ───────────────────────────────────────────────
-    for label, pattern, method_hint in cfg["endpoint_patterns"]:
-        for m in pattern.finditer(content):
-            # Grupo 1 = path/url, grupo 2 = method dinâmico (se existir)
-            path = (m.group(1) or "").strip().strip("\"'`")
-            if not path or len(path) < 2:
-                continue
-
-            # Filtra paths que claramente não são rotas (assets estáticos, etc.)
-            if re.search(r'\.(png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|css)$', path, re.I):
-                continue
-
-            # Método dinâmico capturado do JS
-            if method_hint == "DYNAMIC" and m.lastindex and m.lastindex >= 2:
-                method = (m.group(2) or "UNKNOWN").upper()
-            else:
-                method = method_hint
-
-            query_params = _extract_query_params(path)
-            abs_url      = _build_absolute_url(path, url, domain)
-
-            ep = {
-                "method":       method,
-                "path":         path,
-                "absolute_url": abs_url,
-                "query_params": query_params,
-                "js_url":       url,
-            }
-            if _append_endpoint(ep, cfg, domain):
-                logger.debug("[ENDPOINT][%s] %s → %s", method, path, url)
-
-    return found
+        abs_u = ep.get("absolute_url") or _abs_url(path, ep.get("js_url", ""), cfg["domain"])
+        line  = (f"[{method}] {path}\n"
+                 f"  → Absoluta : {abs_u}\n"
+                 f"  → Fonte JS : {ep.get('js_url','?')}\n")
+        if ep.get("query_params"):
+            line += f"  → Query    : {ep['query_params']}\n"
+        line += "-" * 60
+        append_line_to_file(cfg["endpoints_txt"], line)
+        append_line_to_file(cfg["endpoints_jsonl"], json.dumps({
+            "method":       method,
+            "path":         path,
+            "absolute_url": abs_u,
+            "query_params": ep.get("query_params", ""),
+            "js_source":    ep.get("js_url", ""),
+        }, ensure_ascii=False))
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1695,12 +1415,131 @@ def _save_cached_js(cfg: dict, url: str, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         path.write_text(
-            json.dumps({"version": _JS_CACHE_VERSION, "ts": time.time(), "content": content}, ensure_ascii=False),
+            json.dumps({"version": _JS_CACHE_VERSION, "ts": time.time(), "content": content},
+                       ensure_ascii=False),
             encoding="utf-8",
         )
     except Exception:
         pass
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Análise de conteúdo JS — núcleo expandido
+# ─────────────────────────────────────────────────────────────────────────────
+
+def is_valid_js(resp: requests.Response, content: str) -> bool:
+    ct = resp.headers.get("Content-Type", "")
+    if "javascript" in ct or "ecmascript" in ct:
+        return True
+    stripped = content.strip()
+    if stripped.startswith(("<html", "<HTML", "<!DOCTYPE", "<!doctype", "<?xml")):
+        return False
+    if re.match(r'^\s*[{\[]', stripped) and not re.search(
+            r'(?:var |let |const |function|=>|\bif\b|\bfor\b)', stripped[:500]):
+        return False
+    return True
+
+
+def _secret_context(content: str, start: int, end: int, radius: int = 90) -> str:
+    left  = max(0, start - radius)
+    right = min(len(content), end + radius)
+    return content[left:right].replace("\r", " ").replace("\n", " ").strip()
+
+
+def analyze_js_content(
+    content: str,
+    url: str,
+    cfg: dict,
+    logger: logging.Logger,
+    google_keys_found: set,
+    google_keys_lock: threading.Lock,
+) -> int:
+    found       = 0
+    lines       = content.splitlines()
+    generic_set = cfg["_generic_patterns"]
+    domain      = cfg["domain"]
+
+    def _line_at(pos: int) -> str:
+        char_count = 0
+        for line in lines:
+            char_count += len(line) + 1
+            if char_count >= pos:
+                return line
+        return ""
+
+    # ── Segredos ──────────────────────────────────────────────────────────────
+    for name, pattern in cfg["secret_patterns"].items():
+        for match in pattern.finditer(content):
+            raw_value = match.group(0)
+            value     = match.group(1) if match.lastindex and match.lastindex >= 1 else raw_value
+
+            if name in generic_set:
+                if not is_likely_real_credential(value, _line_at(match.start())):
+                    continue
+
+            if name == "jwt" and not _is_real_jwt(value):
+                continue
+
+            context = _secret_context(content, match.start(), match.end())
+            finding = {"type": name, "value": value, "url": url, "context": context}
+
+            if _append_secret(finding, cfg):
+                logger.warning("[!!!] %s → %s | %s", name, value[:80], url)
+                found += 1
+                if name == "google_api_key":
+                    with google_keys_lock:
+                        google_keys_found.add(value)
+
+    # ── Ofuscação por char-code arrays ────────────────────────────────────────
+    for obf in scan_charcode_obfuscation(content, url, logger):
+        if _append_secret(obf, cfg):
+            found += 1
+
+    # ── Análise dedicada de btoa() [NOVO - jsrecon] ───────────────────────────
+    _btoa_re = re.compile(r'\bbtoa\s*\(\s*["\'](.*?)["\'\']\s*\)', re.I)
+    for bm in _btoa_re.finditer(content):
+        raw_val = bm.group(1)
+        ctx     = content[max(0, bm.start()-80):min(len(content), bm.end()+80)].replace("\n", " ")
+        finding = {"type": "btoa_decoded", "value": raw_val, "url": url, "context": ctx}
+        if _append_secret(finding, cfg):
+            decoded = ""
+            try:
+                decoded = _b64.b64decode(raw_val + "==").decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            if decoded and decoded != raw_val:
+                logger.warning("[!!!] btoa decoded → '%s' (claro: '%s') | %s", raw_val, decoded, url)
+            else:
+                logger.warning("[!!!] btoa hardcoded → '%s' | %s", raw_val, url)
+            found += 1
+
+    # ── Endpoints — 17 padrões com método HTTP [NOVO - jsrecon] ──────────────
+    for label, pattern, method_hint in cfg["endpoint_patterns"]:
+        for m in pattern.finditer(content):
+            path = (m.group(1) or "").strip().strip("\"'`")
+            if not path or len(path) < 2:
+                continue
+            if re.search(r'\.(png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|css)$', path, re.I):
+                continue
+            method = (m.group(2).upper()
+                      if method_hint == "DYNAMIC" and m.lastindex and m.lastindex >= 2
+                      else method_hint)
+            ep = {
+                "method":       method,
+                "path":         path,
+                "absolute_url": _abs_url(path, url, domain),
+                "query_params": _query_params(path),
+                "js_url":       url,
+            }
+            if _save_endpoint(ep, cfg):
+                logger.debug("[EP][%s] %s ← %s", method, path, url)
+
+    return found
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Análise de JS (workers)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def process_js(
     url: str,
@@ -1713,7 +1552,6 @@ def process_js(
     url_key = url.split("?")[0]
     with _analyzed_js_lock:
         if url_key in _analyzed_js_urls:
-            logger.debug("[CACHE] JS já analisado — pulando: %s", url)
             return 0
         _analyzed_js_urls.add(url_key)
 
@@ -1736,12 +1574,9 @@ def process_js(
 
     if resp.status_code != 200:
         return 0
-
     content = resp.text
     if not is_valid_js(resp, content):
-        logger.debug("Não é JS: %s", url)
         return 0
-
     _save_cached_js(cfg, url_key, content)
     return analyze_js_content(content, url, cfg, logger, google_keys_found, google_keys_lock)
 
@@ -1750,7 +1585,6 @@ def analyze_all_js(cfg: dict, logger: logging.Logger) -> tuple[int, set]:
     if not cfg["js_file"].exists():
         logger.warning("Nenhum arquivo JS para analisar.")
         return 0, set()
-
     urls = [u.strip() for u in cfg["js_file"].read_text(encoding="utf-8").splitlines() if u.strip()]
     if not urls:
         return 0, set()
@@ -1761,10 +1595,10 @@ def analyze_all_js(cfg: dict, logger: logging.Logger) -> tuple[int, set]:
     get_fn                            = _make_retrying_get(cfg)
 
     logger.info("Analisando %d arquivos JS com %d workers…", len(urls), cfg["js_workers"])
-
     with ThreadPoolExecutor(max_workers=cfg["js_workers"]) as executor:
         futures = {
-            executor.submit(process_js, url, cfg, logger, google_keys_found, google_keys_lock, get_fn): url
+            executor.submit(process_js, url, cfg, logger,
+                            google_keys_found, google_keys_lock, get_fn): url
             for url in urls
         }
         for future in as_completed(futures):
@@ -1777,12 +1611,11 @@ def analyze_all_js(cfg: dict, logger: logging.Logger) -> tuple[int, set]:
         logger.info("Segredos encontrados em JS: %d → %s", total_found, cfg["secrets_txt"])
     else:
         logger.info("Nenhum segredo encontrado em JS.")
-
     return total_found, google_keys_found
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Source maps
+# Coleta e análise de source maps (.js.map)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def collect_and_analyze_sourcemaps(cfg: dict, logger: logging.Logger,
@@ -1791,17 +1624,18 @@ def collect_and_analyze_sourcemaps(cfg: dict, logger: logging.Logger,
     source = cfg.get("_active_urls_file", cfg["urls_file"])
     if not source.exists():
         return 0
-
     all_urls = [l.strip() for l in source.read_text(encoding="utf-8").splitlines() if l.strip()]
     get_fn   = _make_retrying_get(cfg)
-
     map_urls: set[str] = set()
+
     for url in all_urls:
         if url.endswith(".js.map"):
             map_urls.add(url)
-    for url in all_urls[:300]:
+
+    for url in all_urls:
         if re.search(r'\.js(\?|$)', url):
-            map_urls.add(re.sub(r'\.js(\?.*)?$', '.js.map', url))
+            candidate = re.sub(r'\.js(\?.*)?$', '.js.map', url)
+            map_urls.add(candidate)
 
     if not map_urls:
         logger.info("[sourcemaps] nenhuma URL candidata encontrada.")
@@ -1819,9 +1653,7 @@ def collect_and_analyze_sourcemaps(cfg: dict, logger: logging.Logger,
             resp = get_fn(map_url)
         except Exception:
             return 0
-        if resp.status_code != 200:
-            return 0
-        if "<html" in resp.text[:100].lower():
+        if resp.status_code != 200 or "<html" in resp.text[:100].lower():
             return 0
         try:
             data = resp.json()
@@ -1831,21 +1663,26 @@ def collect_and_analyze_sourcemaps(cfg: dict, logger: logging.Logger,
         sources_names   = data.get("sources", [])
         if not sources_content:
             return 0
+
         with confirmed_lock:
             confirmed.append(map_url)
         sourcemap_dir.mkdir(parents=True, exist_ok=True)
         safe = re.sub(r'[^\w\-.]', '_', map_url)[:100]
         logger.warning("[!!!] Source map confirmado: %s (%d fontes)", map_url, len(sources_content))
+
         for i, src_content in enumerate(sources_content):
             if not src_content or not isinstance(src_content, str):
                 continue
             src_name    = sources_names[i] if i < len(sources_names) else f"source_{i}"
             virtual_url = f"{map_url}::{src_name}"
             try:
-                (sourcemap_dir / (safe + f"_src{i}.js")).write_text(src_content, encoding="utf-8", errors="replace")
+                (sourcemap_dir / (safe + f"_src{i}.js")).write_text(
+                    src_content, encoding="utf-8", errors="replace"
+                )
             except Exception:
                 pass
-            n = analyze_js_content(src_content, virtual_url, cfg, logger, google_keys_found, google_keys_lock)
+            n = analyze_js_content(src_content, virtual_url, cfg, logger,
+                                   google_keys_found, google_keys_lock)
             local_findings += n
         return local_findings
 
@@ -1862,19 +1699,17 @@ def collect_and_analyze_sourcemaps(cfg: dict, logger: logging.Logger,
         logger.warning("[!!!] Source maps confirmados: %d — segredos: %d", len(confirmed), findings)
     else:
         logger.info("[sourcemaps] nenhum source map público confirmado.")
-
     return findings
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Análise de subdomínios (com integração live crawler)
+# Análise por subdomínio
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _probe_alive_urls(urls: list[str], timeout: int, logger: logging.Logger) -> list[str]:
     if not urls:
         return []
     if not tool_available("httpx"):
-        logger.warning("httpx não encontrado — usando todos os subdomínios sem validação.")
         return urls
     try:
         result = subprocess.run(
@@ -1892,8 +1727,7 @@ def _probe_alive_urls(urls: list[str], timeout: int, logger: logging.Logger) -> 
 def _collect_js_from_sub(sub_url: str, cfg: dict, logger: logging.Logger) -> set[str]:
     all_urls: set[str] = set()
     js_re = re.compile(
-        r'(?:\.js(?:\?[^\s]*)?$|/(?:static|assets|dist|build|chunks|bundles)/[^\s]*\.js)',
-        re.I,
+        r'(?:\.js(?:\?[^\s]*)?$|/(?:static|assets|dist|build|chunks|bundles)/[^\s]*\.js)', re.I,
     )
     if tool_available("hakrawler"):
         lines = run_cmd(
@@ -1902,20 +1736,16 @@ def _collect_js_from_sub(sub_url: str, cfg: dict, logger: logging.Logger) -> set
         )
         all_urls.update(lines)
     if tool_available("gospider"):
-        raw = run_cmd(["gospider", "-s", sub_url, "-c", "5", "-d", "2", "--js", "-q"], logger, timeout=60)
+        raw = run_cmd(
+            ["gospider", "-s", sub_url, "-c", "5", "-d", "2", "--js", "-q"],
+            logger, timeout=60,
+        )
         for line in raw:
             m = re.search(r'https?://[^\s"\'<>\]]+', line)
             if m:
                 all_urls.add(m.group(0).rstrip('.,;)"\'>]'))
-    js_urls: set[str] = set()
-    for url in all_urls:
-        if _CDN_DOMAINS_RE.search(url):
-            continue
-        if url.endswith(".js.map"):
-            continue
-        if js_re.search(url):
-            js_urls.add(url)
-    return js_urls
+    return {u for u in all_urls
+            if not _CDN_DOMAINS_RE.search(u) and not u.endswith(".js.map") and js_re.search(u)}
 
 
 def analyze_subdomains(
@@ -1926,90 +1756,58 @@ def analyze_subdomains(
     all_google_keys: set,
     google_keys_lock: threading.Lock,
 ) -> dict:
-    banner_sub = "=" * 60
-    logger.info(banner_sub)
+    logger.info("=" * 60)
     logger.info("ANÁLISE DE SUBDOMÍNIOS — %s", root_domain)
-    logger.info(banner_sub)
+    logger.info("=" * 60)
+
+    if not tool_available("subfinder"):
+        logger.warning("subfinder não encontrado — pulando análise de subdomínios.")
+        return {}
 
     subs: set[str] = set()
-    if tool_available("subfinder"):
-        logger.info("[subfinder] enumerando subdomínios de %s…", root_domain)
-        lines = run_cmd(["subfinder", "-d", root_domain, "-silent"], logger, timeout=300)
-        subs.update(lines)
-        logger.info("[subfinder] %d subdomínios", len(lines))
-    else:
-        logger.warning("subfinder não encontrado — pulando enumeração de subdomínios.")
-        return {}
+    lines = run_cmd(["subfinder", "-d", root_domain, "-silent"], logger, timeout=300)
+    subs.update(lines)
+    logger.info("[subfinder] %d subdomínios", len(lines))
 
     subs_clean = sorted({
         s.strip().lower() for s in subs
         if s.strip() and "*" not in s
-        and s.strip().lower() != root_domain
-        and root_domain in s
+        and s.strip().lower() != root_domain and root_domain in s
     })
-
     if not subs_clean:
         logger.info("Nenhum subdomínio encontrado para %s.", root_domain)
         return {}
-
     logger.info("Subdomínios únicos: %d", len(subs_clean))
-    sub_urls   = [f"https://{s}" for s in subs_clean]
-    alive_urls = _probe_alive_urls(sub_urls, cfg["request_timeout"], logger)
 
-    https_alive     = set(alive_urls)
-    http_candidates = [f"http://{s}" for s in subs_clean if f"https://{s}" not in https_alive]
-    if http_candidates:
-        http_alive = _probe_alive_urls(http_candidates, cfg["request_timeout"], logger)
-        alive_urls.extend(http_alive)
-
-    alive_urls = sorted(set(alive_urls))
+    alive_urls = _probe_alive_urls([f"https://{s}" for s in subs_clean], cfg["request_timeout"], logger)
+    http_extra = _probe_alive_urls(
+        [f"http://{s}" for s in subs_clean if f"https://{s}" not in set(alive_urls)],
+        cfg["request_timeout"], logger,
+    )
+    alive_urls = sorted(set(alive_urls) | set(http_extra))
     logger.info("Subdomínios vivos: %d / %d", len(alive_urls), len(subs_clean))
-
     if not alive_urls:
-        logger.info("Nenhum subdomínio vivo encontrado.")
         return {}
 
     write_if_not_empty(cfg["base_dir"] / "subdomains_alive.txt", alive_urls, logger)
 
-    # ── [NOVO] Chama js_live_crawler para domínio + subdomínios vivos ────────
-    if not getattr(args, "no_live_crawler", False):
-        live_new_js = run_live_crawler(cfg, logger, args, alive_urls)
-        logger.info("[live-crawler] %d JS novos adicionados ao pool de análise", len(live_new_js))
-    else:
-        logger.info("--no-live-crawler: etapa live JS pulada.")
-
-    # ── Análise passiva por subdomínio ────────────────────────────────────────
     sub_stats: dict[str, dict] = {}
     get_fn = _make_retrying_get(cfg)
 
     for sub_url in alive_urls:
         sub_host = re.sub(r'^https?://', '', sub_url).rstrip('/')
-        logger.info("─── Analisando subdomínio: %s", sub_host)
+        logger.info("─── Analisando: %s", sub_host)
         safe_sub = re.sub(r'[^\w\-.]', '_', sub_host)
         sub_dir  = cfg["base_dir"] / "subdomains" / safe_sub
         sub_dir.mkdir(parents=True, exist_ok=True)
 
         js_urls = _collect_js_from_sub(sub_url, cfg, logger)
-
-        # [NOVO] Deduplicação: remove JS já analisados globalmente
-        js_urls_new = set()
-        for js_url in js_urls:
-            url_key = js_url.split("?")[0]
-            with _analyzed_js_lock:
-                if url_key not in _analyzed_js_urls:
-                    js_urls_new.add(js_url)
-        dedup_removed = len(js_urls) - len(js_urls_new)
-        if dedup_removed:
-            logger.debug("  [dedup] %d JS já analisados removidos de %s", dedup_removed, sub_host)
-        js_urls = js_urls_new
-
-        logger.info("  JS novos a analisar: %d", len(js_urls))
+        logger.info("  JS encontrado: %d arquivos", len(js_urls))
         if not js_urls:
             sub_stats[sub_host] = {"js": 0, "secrets": 0}
             continue
 
         write_if_not_empty(sub_dir / "js_urls.txt", sorted(js_urls), logger)
-
         sub_findings = 0
         for js_url in js_urls:
             url_key = js_url.split("?")[0]
@@ -2017,11 +1815,10 @@ def analyze_subdomains(
                 if url_key in _analyzed_js_urls:
                     continue
                 _analyzed_js_urls.add(url_key)
-
             cached = _load_cached_js(cfg, url_key)
             if cached is not None:
-                n = analyze_js_content(cached, js_url, cfg, logger, all_google_keys, google_keys_lock)
-                sub_findings += n
+                sub_findings += analyze_js_content(cached, js_url, cfg, logger,
+                                                   all_google_keys, google_keys_lock)
                 continue
             try:
                 resp = get_fn(js_url)
@@ -2033,9 +1830,8 @@ def analyze_subdomains(
             if not is_valid_js(resp, content):
                 continue
             _save_cached_js(cfg, url_key, content)
-            n = analyze_js_content(content, js_url, cfg, logger, all_google_keys, google_keys_lock)
-            sub_findings += n
-
+            sub_findings += analyze_js_content(content, js_url, cfg, logger,
+                                               all_google_keys, google_keys_lock)
         sub_stats[sub_host] = {"js": len(js_urls), "secrets": sub_findings}
         if sub_findings:
             logger.warning("  [!!!] %d segredo(s) em %s", sub_findings, sub_host)
@@ -2044,18 +1840,11 @@ def analyze_subdomains(
 
     total_subs_secrets = sum(v["secrets"] for v in sub_stats.values())
     total_subs_js      = sum(v["js"]      for v in sub_stats.values())
-
-    logger.info(banner_sub)
-    logger.info("SUBDOMÍNIOS — RESUMO")
-    logger.info("  Total analisados : %d", len(sub_stats))
-    logger.info("  JS coletados     : %d", total_subs_js)
-    logger.info("  Segredos totais  : %d", total_subs_secrets)
-    logger.info(banner_sub)
+    logger.info("SUBDOMÍNIOS — %d analisados | %d JS | %d segredos",
+                len(sub_stats), total_subs_js, total_subs_secrets)
 
     report_lines = [
-        "ANÁLISE POR SUBDOMÍNIO",
-        f"Domínio raiz: {root_domain}",
-        "=" * 60, "",
+        "ANÁLISE POR SUBDOMÍNIO", f"Domínio raiz: {root_domain}", "=" * 60, "",
     ]
     for sub, data in sorted(sub_stats.items(), key=lambda x: -x[1]["secrets"]):
         status = "[!!!]" if data["secrets"] > 0 else "[ ok]"
@@ -2073,7 +1862,7 @@ def analyze_subdomains(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Resumo por severidade
+# Agrupamento por severidade para o SUMMARY
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _summary_by_severity(secrets_jsonl: Path) -> list[str]:
@@ -2089,12 +1878,11 @@ def _summary_by_severity(secrets_jsonl: Path) -> list[str]:
             sevs[t] = obj.get("severity", "UNKNOWN")
         except json.JSONDecodeError:
             pass
-    lines = []
-    for t, n in sorted(counts.items(),
-                        key=lambda x: (_SEVERITY_ORDER.get(sevs.get(x[0], "UNKNOWN"), 4), -x[1])):
-        sev = sevs.get(t, "UNKNOWN")
-        lines.append(f"    [{sev}] {t}: {n}")
-    return lines
+    return [
+        f"    [{sevs.get(t,'?')}] {t}: {n}"
+        for t, n in sorted(counts.items(),
+                           key=lambda x: (_SEVERITY_ORDER.get(sevs.get(x[0], "UNKNOWN"), 4), -x[1]))
+    ]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2103,12 +1891,6 @@ def _summary_by_severity(secrets_jsonl: Path) -> list[str]:
 
 def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
     def _count(path: Path) -> int:
-        if not path.exists():
-            return 0
-        # Para JSONL conta linhas; para TXT conta separadores
-        return sum(1 for l in path.read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip())
-
-    def _count_jsonl(path: Path) -> int:
         if not path.exists():
             return 0
         return sum(1 for l in path.read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip())
@@ -2123,20 +1905,15 @@ def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
     def _f(key: str) -> str:
         return str(stats.get(key, 0)).rjust(6)
 
-    ep_count  = _count_jsonl(cfg["api_endpoints_jsonl"])
-    live_count = _count(cfg["live_js_file"]) if cfg["live_js_file"].exists() else 0
-
     lines = [
         "=" * 64,
         "  SUMÁRIO DE RECONHECIMENTO",
         f"  Alvo  : {cfg['domain']}",
         f"  Saída : {cfg['base_dir']}",
-        "=" * 64,
-        "",
+        "=" * 64, "",
         f"  URLs coletadas           : {_f('urls_total')}",
         f"  URLs ativas (httpx)      : {_f('urls_alive')}",
-        f"  Arquivos JS (passivo)    : {_f('js_total')}",
-        f"  Arquivos JS (live)       : {str(live_count).rjust(6)}",
+        f"  Arquivos JS              : {_f('js_total')}",
         f"  URLs sensíveis           : {_f('sensitive_total')}",
         "",
         f"  Segredos encontrados     : {_f('js_findings')}",
@@ -2152,13 +1929,13 @@ def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
 
     lines += [
         "",
+        f"  Endpoints extraídos      : {str(_count(cfg['endpoints_jsonl'])).rjust(6)}",
         f"  Google Keys encontradas  : {_f('google_keys')}",
         f"  Google Keys vulneráveis  : {str(vuln_google).rjust(6)}",
         "",
         f"  Segredos em .env/.conf   : {_f('sensitive_findings')}",
         f"  XSS confirmados (dalfox) : {_f('xss_hits')}",
         f"  SSRF/Redirect hits       : {_f('ssrf_redirect_hits')}",
-        f"  Endpoints extraídos      : {str(ep_count).rjust(6)}",
     ]
 
     if stats.get("subs_found", 0) > 0:
@@ -2170,22 +1947,17 @@ def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
             f"  JS em subdomínios        : {_f('subs_js')}",
             f"  Segredos em subdomínios  : {_f('subs_secrets')}",
         ]
-        sub_report = cfg["base_dir"] / "subdomains_report.txt"
-        if sub_report.exists():
-            lines.append(f"  Relatório subs           : {sub_report}")
 
     output_files = [
-        ("Segredos TXT",      cfg["secrets_txt"]),
-        ("Segredos CSV",      cfg["secrets_csv"]),
-        ("Segredos JSONL",    cfg["secrets_jsonl"]),
-        ("Google Keys",       cfg["google_report_file"]),
-        ("Endpoints TXT",     cfg["api_endpoints_file"]),
-        ("Endpoints JSONL",   cfg["api_endpoints_jsonl"]),
-        ("JS Live",           cfg["live_js_file"]),
-        ("Relatório Live JS", cfg["live_js_report"]),
-        ("Sensíveis",         cfg["sensitive_report"]),
-        ("SUMMARY HTML",      cfg["summary_html"]),
-        ("Log completo",      cfg["log_file"]),
+        ("Segredos TXT",    cfg["secrets_txt"]),
+        ("Segredos CSV",    cfg["secrets_csv"]),
+        ("Segredos JSONL",  cfg["secrets_jsonl"]),
+        ("Endpoints TXT",   cfg["endpoints_txt"]),
+        ("Endpoints JSONL", cfg["endpoints_jsonl"]),
+        ("Google Keys",     cfg["google_report_file"]),
+        ("Sensíveis",       cfg["sensitive_report"]),
+        ("SUMMARY HTML",    cfg["summary_html"]),
+        ("Log completo",    cfg["log_file"]),
     ]
     existing = [(label, path) for label, path in output_files if path.exists()]
     if existing:
@@ -2194,7 +1966,6 @@ def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
             lines.append(f"    {label}: {path}")
 
     lines += ["", "=" * 64]
-
     write_if_not_empty(cfg["summary_file"], lines, logger)
     for line in lines:
         logger.info(line)
@@ -2206,6 +1977,8 @@ def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
 
 def write_summary_html(cfg: dict, logger: logging.Logger, stats: dict) -> None:
     findings: list[dict] = []
+    endpoints: list[dict] = []
+
     if cfg["secrets_jsonl"].exists():
         for line in cfg["secrets_jsonl"].read_text(encoding="utf-8", errors="ignore").splitlines():
             try:
@@ -2215,76 +1988,66 @@ def write_summary_html(cfg: dict, logger: logging.Logger, stats: dict) -> None:
             except json.JSONDecodeError:
                 pass
 
-    findings.sort(key=lambda x: (_SEVERITY_ORDER.get(x.get("severity", "UNKNOWN"), 4), x.get("type", "")))
-
-    # Endpoints enriquecidos
-    endpoints: list[dict] = []
-    if cfg["api_endpoints_jsonl"].exists():
-        for line in cfg["api_endpoints_jsonl"].read_text(encoding="utf-8", errors="ignore").splitlines():
+    if cfg["endpoints_jsonl"].exists():
+        for line in cfg["endpoints_jsonl"].read_text(encoding="utf-8", errors="ignore").splitlines():
             try:
                 endpoints.append(json.loads(line))
             except json.JSONDecodeError:
                 pass
 
+    findings.sort(key=lambda x: (_SEVERITY_ORDER.get(x.get("severity", "UNKNOWN"), 4), x.get("type", "")))
+
     sev_colors = {
         "CRITICAL": "#c0392b", "HIGH": "#e67e22",
-        "MEDIUM": "#2980b9", "LOW": "#27ae60", "UNKNOWN": "#7f8c8d",
+        "MEDIUM":   "#2980b9", "LOW":  "#27ae60", "UNKNOWN": "#7f8c8d",
     }
-    method_colors = {
+    meth_colors = {
         "GET": "#27ae60", "POST": "#e67e22", "PUT": "#2980b9",
         "DELETE": "#c0392b", "PATCH": "#8e44ad", "WS": "#16a085",
-        "ANY": "#7f8c8d", "UNKNOWN": "#7f8c8d",
+        "ANY": "#7f8c8d", "UNKNOWN": "#7f8c8d", "DYNAMIC": "#7f8c8d",
     }
+    sev_counts = {s: sum(1 for f in findings if f.get("severity") == s)
+                  for s in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]}
 
-    # ── Tabela de segredos ────────────────────────────────────────────────────
-    rows_html = ""
+    def _esc(s: str) -> str:
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    secret_rows = ""
     for f in findings:
         sev   = f.get("severity", "UNKNOWN")
         color = sev_colors.get(sev, "#7f8c8d")
         url   = f.get("url", "")
-        val   = f.get("value", "")[:120]
-        ctx   = f.get("context", "")[:200].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        rows_html += (
+        val   = _esc(f.get("value", "")[:120])
+        ctx   = _esc(f.get("context", "")[:200])
+        secret_rows += (
             f'<tr data-sev="{sev}" data-type="{f.get("type","")}">'
             f'<td><span class="badge" style="background:{color}">{sev}</span></td>'
             f'<td><code>{f.get("type","")}</code></td>'
             f'<td class="url-cell"><a href="{url}" target="_blank" rel="noopener">{url[:100]}</a></td>'
             f'<td class="mono">{val}</td>'
-            f'<td class="ctx">{ctx}</td>'
-            f'</tr>\n'
+            f'<td class="ctx">{ctx}</td></tr>\n'
         )
 
-    # ── Tabela de endpoints ───────────────────────────────────────────────────
-    ep_rows_html = ""
+    ep_rows = ""
     for ep in endpoints:
-        method   = ep.get("method", "UNKNOWN")
-        mc       = method_colors.get(method, "#7f8c8d")
-        path     = ep.get("path", "")
-        abs_url  = ep.get("absolute_url", "")
-        js_src   = ep.get("js_source", "")
-        qp       = ep.get("query_params", "")
-        ep_rows_html += (
-            f'<tr>'
-            f'<td><span class="badge" style="background:{mc}">{method}</span></td>'
-            f'<td class="mono">{path[:120]}</td>'
-            f'<td class="url-cell"><a href="{abs_url}" target="_blank" rel="noopener">{abs_url[:80]}</a></td>'
-            f'<td class="ctx">{qp[:80]}</td>'
-            f'<td class="url-cell" style="font-size:10px">{js_src[:80]}</td>'
-            f'</tr>\n'
+        m    = ep.get("method", "?")
+        mc   = meth_colors.get(m, "#7f8c8d")
+        path = _esc(ep.get("path", "")[:120])
+        abs_ = ep.get("absolute_url", "")
+        qp   = _esc(ep.get("query_params", "")[:80])
+        src  = _esc(ep.get("js_source", "")[:80])
+        ep_rows += (
+            f'<tr><td><span class="badge" style="background:{mc}">{m}</span></td>'
+            f'<td class="mono">{path}</td>'
+            f'<td class="url-cell"><a href="{abs_}" target="_blank">{abs_[:80]}</a></td>'
+            f'<td class="ctx">{qp}</td>'
+            f'<td class="ctx">{src}</td></tr>\n'
         )
 
-    sev_counts = {s: sum(1 for f in findings if f.get("severity") == s)
-                  for s in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]}
-    types_opts = "".join(
-        f'<option value="{t}">{t}</option>'
-        for t in sorted(set(f.get("type", "") for f in findings))
-    )
-    method_opts = "".join(
-        f'<option value="{m}">{m}</option>'
-        for m in sorted(set(ep.get("method", "") for ep in endpoints))
-    )
-    live_count = sum(1 for _ in (cfg["live_js_file"].read_text(encoding="utf-8").splitlines()
-                                  if cfg["live_js_file"].exists() else []) if _.strip())
+    types_opts  = "".join(f'<option value="{t}">{t}</option>'
+                           for t in sorted(set(f.get("type","") for f in findings)))
+    method_opts = "".join(f'<option value="{m}">{m}</option>'
+                           for m in sorted(set(ep.get("method","") for ep in endpoints)))
     ts = time.strftime("%Y-%m-%d %H:%M")
 
     html = f"""<!DOCTYPE html>
@@ -2298,28 +2061,27 @@ def write_summary_html(cfg: dict, logger: logging.Logger, stats: dict) -> None:
 body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f1117;color:#e2e8f0;font-size:14px}}
 a{{color:#60a5fa;text-decoration:none}}a:hover{{text-decoration:underline}}
 code{{font-family:'SFMono-Regular',Consolas,monospace;font-size:12px;background:#1e2130;padding:1px 5px;border-radius:3px}}
-header{{background:#1a1d2e;border-bottom:1px solid #2d3148;padding:1rem 1.5rem;display:flex;align-items:center;gap:1rem;flex-wrap:wrap}}
+header{{background:#1a1d2e;border-bottom:1px solid #2d3148;padding:1rem 1.5rem}}
 header h1{{font-size:16px;font-weight:600;color:#f1f5f9}}
-header p{{font-size:12px;color:#64748b}}
+header p{{font-size:12px;color:#64748b;margin-top:4px}}
 .banner{{display:flex;gap:.75rem;padding:.75rem 1.5rem;background:#141620;border-bottom:1px solid #2d3148;flex-wrap:wrap}}
-.stat-card{{background:#1a1d2e;border:1px solid #2d3148;border-radius:6px;padding:.5rem .9rem;min-width:90px;text-align:center}}
-.stat-card .n{{font-size:22px;font-weight:700;line-height:1.1}}
-.stat-card .l{{font-size:11px;color:#64748b;margin-top:2px}}
-.tabs{{display:flex;gap:0;padding:0 1.5rem;background:#141620;border-bottom:1px solid #2d3148}}
+.card{{background:#1a1d2e;border:1px solid #2d3148;border-radius:6px;padding:.5rem .9rem;min-width:90px;text-align:center}}
+.card .n{{font-size:22px;font-weight:700;line-height:1.1}}
+.card .l{{font-size:11px;color:#64748b;margin-top:2px}}
+.tabs{{display:flex;padding:0 1.5rem;background:#141620;border-bottom:1px solid #2d3148}}
 .tab{{padding:.6rem 1.2rem;cursor:pointer;font-size:13px;color:#64748b;border-bottom:2px solid transparent}}
 .tab.active{{color:#f1f5f9;border-bottom-color:#60a5fa}}
 .tab-content{{display:none}}.tab-content.active{{display:block}}
-.controls{{display:flex;gap:.75rem;padding:.65rem 1.5rem;background:#141620;border-bottom:1px solid #2d3148;flex-wrap:wrap;align-items:center}}
-.controls select,.controls input{{background:#1a1d2e;border:1px solid #2d3148;border-radius:5px;color:#e2e8f0;padding:5px 8px;font-size:13px}}
-.controls input[type=search]{{width:220px}}
-#count,#ep-count{{font-size:12px;color:#64748b;margin-left:auto}}
+.ctrl{{display:flex;gap:.75rem;padding:.65rem 1.5rem;background:#141620;border-bottom:1px solid #2d3148;flex-wrap:wrap;align-items:center}}
+.ctrl select,.ctrl input{{background:#1a1d2e;border:1px solid #2d3148;border-radius:5px;color:#e2e8f0;padding:5px 8px;font-size:13px}}
+.ctrl input[type=search]{{width:220px}}
+.cnt{{font-size:12px;color:#64748b;margin-left:auto}}
 .badge{{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;color:#fff;white-space:nowrap}}
 table{{width:100%;border-collapse:collapse}}
 thead th{{background:#1a1d2e;color:#94a3b8;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;padding:8px 10px;text-align:left;cursor:pointer;border-bottom:1px solid #2d3148;white-space:nowrap;user-select:none}}
 thead th:hover{{color:#f1f5f9}}
 td{{padding:7px 10px;border-bottom:1px solid #1e2130;vertical-align:top}}
-tr:hover td{{background:#1a1d2e}}
-tr.hidden{{display:none}}
+tr:hover td{{background:#1a1d2e}}tr.hidden{{display:none}}
 .url-cell{{max-width:260px;word-break:break-all;font-size:12px}}
 .mono{{font-family:'SFMono-Regular',Consolas,monospace;font-size:11px;word-break:break-all;max-width:200px;color:#a3e635}}
 .ctx{{font-size:11px;color:#64748b;max-width:260px;word-break:break-all}}
@@ -2328,107 +2090,80 @@ footer{{padding:.75rem 1.5rem;font-size:11px;color:#334155;border-top:1px solid 
 </head>
 <body>
 <header>
-  <div>
-    <h1>Reconhecimento — {cfg['domain']}</h1>
-    <p>recon.py · {ts} · {len(findings)} segredos · {len(endpoints)} endpoints · {stats.get('urls_total',0)} URLs · {stats.get('js_total',0)} JS passivo · {live_count} JS live</p>
-  </div>
+  <h1>recon — {cfg['domain']}</h1>
+  <p>{ts} · {stats.get('urls_total',0)} URLs · {stats.get('js_total',0)} JS · {len(findings)} segredos · {len(endpoints)} endpoints</p>
 </header>
 <div class="banner">
-  {"".join(f'<div class="stat-card"><div class="n" style="color:{sev_colors[s]}">{sev_counts[s]}</div><div class="l">{s}</div></div>' for s in ["CRITICAL","HIGH","MEDIUM","LOW"])}
-  <div class="stat-card"><div class="n" style="color:#a78bfa">{stats.get("sourcemap_findings",0)}</div><div class="l">Source maps</div></div>
-  <div class="stat-card"><div class="n" style="color:#34d399">{stats.get("inline_findings",0)}</div><div class="l">Inline scripts</div></div>
-  <div class="stat-card"><div class="n" style="color:#60a5fa">{len(endpoints)}</div><div class="l">Endpoints</div></div>
-  <div class="stat-card"><div class="n" style="color:#fb923c">{live_count}</div><div class="l">JS live</div></div>
-  <div class="stat-card"><div class="n" style="color:#f472b6">{stats.get("xss_hits",0)}</div><div class="l">XSS</div></div>
+  {"".join(f'<div class="card"><div class="n" style="color:{sev_colors[s]}">{sev_counts[s]}</div><div class="l">{s}</div></div>' for s in ["CRITICAL","HIGH","MEDIUM","LOW"])}
+  <div class="card"><div class="n" style="color:#60a5fa">{len(endpoints)}</div><div class="l">Endpoints</div></div>
+  <div class="card"><div class="n" style="color:#a78bfa">{stats.get('js_total',0)}</div><div class="l">JS</div></div>
+  <div class="card"><div class="n" style="color:#34d399">{stats.get('inline_findings',0)}</div><div class="l">Inline scripts</div></div>
+  <div class="card"><div class="n" style="color:#f472b6">{stats.get('xss_hits',0)}</div><div class="l">XSS</div></div>
+  <div class="card"><div class="n" style="color:#fb923c">{stats.get('ssrf_redirect_hits',0)}</div><div class="l">SSRF/Redir</div></div>
 </div>
 <div class="tabs">
-  <div class="tab active" onclick="switchTab('secrets',this)">🔑 Segredos ({len(findings)})</div>
-  <div class="tab" onclick="switchTab('endpoints',this)">🔗 Endpoints ({len(endpoints)})</div>
+  <div class="tab active" onclick="switchTab('s',this)">🔑 Segredos ({len(findings)})</div>
+  <div class="tab" onclick="switchTab('e',this)">🔗 Endpoints ({len(endpoints)})</div>
 </div>
 
-<!-- TAB: Segredos -->
-<div id="tab-secrets" class="tab-content active">
-<div class="controls">
-  <label>Severidade<select id="sev-filter" onchange="applyFilters()"><option value="">Todas</option>
+<div id="tab-s" class="tab-content active">
+<div class="ctrl">
+  <label>Severidade <select id="sf" onchange="fs()"><option value="">Todas</option>
     <option>CRITICAL</option><option>HIGH</option><option>MEDIUM</option><option>LOW</option>
   </select></label>
-  <label>Tipo<select id="type-filter" onchange="applyFilters()"><option value="">Todos</option>{types_opts}</select></label>
-  <input id="search" type="search" placeholder="Buscar URL, valor ou contexto…" oninput="applyFilters()">
-  <span id="count">{len(findings)} de {len(findings)} achados</span>
+  <label>Tipo <select id="tf" onchange="fs()"><option value="">Todos</option>{types_opts}</select></label>
+  <input id="ss" type="search" placeholder="Buscar…" oninput="fs()">
+  <span id="sc" class="cnt">{len(findings)} de {len(findings)}</span>
 </div>
-<table id="tbl">
-<thead><tr>
-  <th onclick="sortTable('tbl',0)">Sev ↕</th><th onclick="sortTable('tbl',1)">Tipo ↕</th>
-  <th onclick="sortTable('tbl',2)">URL ↕</th><th>Valor</th><th>Contexto</th>
-</tr></thead>
-<tbody>{rows_html}</tbody>
-</table>
+<table id="st"><thead><tr>
+  <th onclick="sort('st',0)">Sev ↕</th><th onclick="sort('st',1)">Tipo ↕</th>
+  <th onclick="sort('st',2)">URL ↕</th><th>Valor</th><th>Contexto</th>
+</tr></thead><tbody>{secret_rows}</tbody></table>
 </div>
 
-<!-- TAB: Endpoints -->
-<div id="tab-endpoints" class="tab-content">
-<div class="controls">
-  <label>Método<select id="method-filter" onchange="applyEpFilters()"><option value="">Todos</option>{method_opts}</select></label>
-  <input id="ep-search" type="search" placeholder="Buscar path, URL ou JS fonte…" oninput="applyEpFilters()">
-  <span id="ep-count">{len(endpoints)} de {len(endpoints)} endpoints</span>
+<div id="tab-e" class="tab-content">
+<div class="ctrl">
+  <label>Método <select id="mf" onchange="fe()"><option value="">Todos</option>{method_opts}</select></label>
+  <input id="es" type="search" placeholder="Buscar…" oninput="fe()">
+  <span id="ec" class="cnt">{len(endpoints)} de {len(endpoints)}</span>
 </div>
-<table id="ep-tbl">
-<thead><tr>
-  <th onclick="sortTable('ep-tbl',0)">Método ↕</th>
-  <th onclick="sortTable('ep-tbl',1)">Path ↕</th>
-  <th onclick="sortTable('ep-tbl',2)">URL Absoluta ↕</th>
-  <th>Query Params</th>
-  <th>JS Fonte</th>
-</tr></thead>
-<tbody>{ep_rows_html}</tbody>
-</table>
+<table id="et"><thead><tr>
+  <th onclick="sort('et',0)">Método ↕</th><th onclick="sort('et',1)">Path ↕</th>
+  <th onclick="sort('et',2)">URL Absoluta ↕</th><th>Query Params</th><th>JS Fonte</th>
+</tr></thead><tbody>{ep_rows}</tbody></table>
 </div>
 
 <footer>recon.py · {cfg['domain']} · {len(findings)} segredos · {len(endpoints)} endpoints · {ts}</footer>
 <script>
-function switchTab(name,el){{
+function switchTab(n,el){{
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
   document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));
-  el.classList.add('active');
-  document.getElementById('tab-'+name).classList.add('active');
+  el.classList.add('active');document.getElementById('tab-'+n).classList.add('active');
 }}
-const rows=Array.from(document.querySelectorAll('#tbl tbody tr'));
-function applyFilters(){{
-  const sev=document.getElementById('sev-filter').value;
-  const typ=document.getElementById('type-filter').value;
-  const srch=document.getElementById('search').value.toLowerCase();
-  let vis=0;
-  rows.forEach(r=>{{
-    const ok=(!sev||r.dataset.sev===sev)&&(!typ||r.dataset.type===typ)&&(!srch||r.textContent.toLowerCase().includes(srch));
-    r.classList.toggle('hidden',!ok);if(ok)vis++;
-  }});
-  document.getElementById('count').textContent=vis+' de {len(findings)} achados';
+const sr=Array.from(document.querySelectorAll('#st tbody tr'));
+function fs(){{
+  const sv=document.getElementById('sf').value,tv=document.getElementById('tf').value,
+        q=document.getElementById('ss').value.toLowerCase();
+  let v=0;
+  sr.forEach(r=>{{const ok=(!sv||r.dataset.sev===sv)&&(!tv||r.dataset.type===tv)&&(!q||r.textContent.toLowerCase().includes(q));r.classList.toggle('hidden',!ok);if(ok)v++;}});
+  document.getElementById('sc').textContent=v+' de {len(findings)}';
 }}
-const epRows=Array.from(document.querySelectorAll('#ep-tbl tbody tr'));
-function applyEpFilters(){{
-  const meth=document.getElementById('method-filter').value;
-  const srch=document.getElementById('ep-search').value.toLowerCase();
-  let vis=0;
-  epRows.forEach(r=>{{
-    const badge=r.cells[0]?.querySelector('.badge')?.textContent||'';
-    const ok=(!meth||badge===meth)&&(!srch||r.textContent.toLowerCase().includes(srch));
-    r.classList.toggle('hidden',!ok);if(ok)vis++;
-  }});
-  document.getElementById('ep-count').textContent=vis+' de {len(endpoints)} endpoints';
+const er=Array.from(document.querySelectorAll('#et tbody tr'));
+function fe(){{
+  const mv=document.getElementById('mf').value,q=document.getElementById('es').value.toLowerCase();
+  let v=0;
+  er.forEach(r=>{{const b=r.cells[0]?.querySelector('.badge')?.textContent||'';
+    const ok=(!mv||b===mv)&&(!q||r.textContent.toLowerCase().includes(q));r.classList.toggle('hidden',!ok);if(ok)v++;}});
+  document.getElementById('ec').textContent=v+' de {len(endpoints)}';
 }}
-let sortDirs={{}};
-function sortTable(tid,col){{
+let sd={{}};
+function sort(tid,col){{
   const tbody=document.querySelector('#'+tid+' tbody');
   const rs=Array.from(tbody.querySelectorAll('tr'));
-  const key=tid+col;
-  sortDirs[key]=(sortDirs[key]||1)*-1;
-  rs.sort((a,b)=>{{
-    const ta=a.cells[col]?.textContent.trim()||'';
-    const tb=b.cells[col]?.textContent.trim()||'';
-    return sortDirs[key]*ta.localeCompare(tb);
-  }});
+  const k=tid+col;sd[k]=(sd[k]||1)*-1;
+  rs.sort((a,b)=>sd[k]*(a.cells[col]?.textContent.trim()||'').localeCompare(b.cells[col]?.textContent.trim()||''));
   rs.forEach(r=>tbody.appendChild(r));
-  tid==='tbl'?applyFilters():applyEpFilters();
+  tid==='st'?fs():fe();
 }}
 </script>
 </body>
@@ -2444,23 +2179,28 @@ function sortTable(tid,col){{
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Reconhecimento web focado em JS: coleta URLs, extrai segredos, endpoints e valida chaves."
+        description="Reconhecimento web focado em JS: coleta URLs, extrai segredos e endpoints.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Exemplos:
+  python3 recon.py exemplo.com.br
+  python3 recon.py exemplo.com.br --no-subs --workers 30
+  python3 recon.py exemplo.com.br --no-dalfox --no-ssrf-probe
+  python3 recon.py exemplo.com.br --no-cache
+        """,
     )
-    parser.add_argument("domain",               nargs="?",            help="Domínio alvo. Ex: exemplo.com.br")
-    parser.add_argument("--no-dalfox",          action="store_true",  help="Pula probe XSS com dalfox")
-    parser.add_argument("--no-ssrf-probe",      action="store_true",  help="Pula probe SSRF/redirect")
-    parser.add_argument("--no-sensitive-dl",    action="store_true",  help="Pula download de arquivos sensíveis")
-    parser.add_argument("--no-httpx",           action="store_true",  help="Usa todas as URLs sem validar com httpx")
-    parser.add_argument("--no-google-val",      action="store_true",  help="Pula validação de endpoints Google")
-    parser.add_argument("--no-subs",            action="store_true",  help="Pula análise de subdomínios")
-    parser.add_argument("--no-sourcemaps",      action="store_true",  help="Pula coleta e análise de source maps")
-    parser.add_argument("--no-inline-scripts",  action="store_true",  help="Pula análise de inline scripts em HTML")
-    parser.add_argument("--no-cache",           action="store_true",  help="Ignora cache de JS em disco")
-    parser.add_argument("--no-live-crawler",    action="store_true",  help="Pula coleta ao vivo via js_live_crawler.py")
-    parser.add_argument("--workers",            type=int, default=20, help="Workers JS (padrão: 20)")
-    parser.add_argument("--timeout",            type=int, default=10, help="Timeout de requisições em segundos (padrão: 10)")
-    parser.add_argument("--live-timeout",       type=int, default=30, help="Timeout de navegação do live crawler em segundos (padrão: 30)")
-    parser.add_argument("--live-wait",          type=int, default=2,  help="Segundos extras após networkidle no live crawler (padrão: 2)")
+    parser.add_argument("domain",              nargs="?",            help="Domínio alvo. Ex: exemplo.com.br")
+    parser.add_argument("--no-dalfox",         action="store_true",  help="Pula probe XSS com dalfox")
+    parser.add_argument("--no-ssrf-probe",     action="store_true",  help="Pula probe SSRF/redirect")
+    parser.add_argument("--no-sensitive-dl",   action="store_true",  help="Pula download de arquivos sensíveis")
+    parser.add_argument("--no-httpx",          action="store_true",  help="Usa todas as URLs sem validar com httpx")
+    parser.add_argument("--no-google-val",     action="store_true",  help="Pula validação de endpoints Google")
+    parser.add_argument("--no-subs",           action="store_true",  help="Pula análise de subdomínios")
+    parser.add_argument("--no-sourcemaps",     action="store_true",  help="Pula coleta e análise de source maps")
+    parser.add_argument("--no-inline-scripts", action="store_true",  help="Pula análise de inline scripts em HTML")
+    parser.add_argument("--no-cache",          action="store_true",  help="Ignora cache de JS em disco")
+    parser.add_argument("--workers",           type=int, default=20, help="Workers JS (padrão: 20)")
+    parser.add_argument("--timeout",           type=int, default=10, help="Timeout de requisições em segundos (padrão: 10)")
     return parser.parse_args()
 
 
@@ -2475,10 +2215,16 @@ def main() -> None:
         print("Domínio inválido.")
         sys.exit(1)
 
+    for _pfx in ("https://", "http://"):
+        if domain.startswith(_pfx):
+            domain = domain[len(_pfx):]
+            break
+    domain = domain.rstrip("/")
+
     cfg                    = get_config(domain)
     cfg["js_workers"]      = max(1, args.workers)
     cfg["request_timeout"] = max(1, args.timeout)
-    cfg["_no_cache"]       = getattr(args, "no_cache", False)
+    cfg["_no_cache"]       = args.no_cache
     logger                 = setup_logging(cfg["log_file"])
     stats: dict[str, int]  = {}
 
@@ -2490,9 +2236,10 @@ def main() -> None:
     if not preflight_check(logger, args):
         sys.exit(1)
 
-    # ── Etapas principais ────────────────────────────────────────────────────
+    # ── 1. Coleta de URLs ─────────────────────────────────────────────────────
     stats["urls_total"] = collect_urls(cfg, logger)
 
+    # ── 2. Validação com httpx ────────────────────────────────────────────────
     if args.no_httpx:
         cfg["_active_urls_file"] = cfg["urls_file"]
         stats["urls_alive"]      = stats["urls_total"]
@@ -2500,72 +2247,58 @@ def main() -> None:
     else:
         stats["urls_alive"] = validate_alive_urls(cfg, logger)
 
+    # ── 3. GF + probes ────────────────────────────────────────────────────────
     run_gf(cfg, logger)
     stats["xss_hits"]           = 0 if args.no_dalfox     else probe_xss(cfg, logger)
     stats["ssrf_redirect_hits"] = 0 if args.no_ssrf_probe else probe_ssrf_redirect(cfg, logger)
 
+    # ── 4. Arquivos sensíveis ─────────────────────────────────────────────────
     stats["sensitive_total"]    = extract_sensitive_urls(cfg, logger)
-    stats["sensitive_findings"] = 0 if args.no_sensitive_dl \
-                                    else download_and_analyze_sensitive(cfg, logger)
+    stats["sensitive_findings"] = (0 if args.no_sensitive_dl
+                                   else download_and_analyze_sensitive(cfg, logger))
 
+    # ── 5. Coleta de JS ───────────────────────────────────────────────────────
     stats["js_total"] = collect_js(cfg, logger)
 
     google_keys_found: set            = set()
     google_keys_lock:  threading.Lock = threading.Lock()
 
+    # ── 5b. Inline scripts ────────────────────────────────────────────────────
     if args.no_inline_scripts:
-        logger.info("--no-inline-scripts: pulando análise de inline scripts.")
+        logger.info("--no-inline-scripts: pulando.")
         stats["inline_findings"] = 0
     else:
         stats["inline_findings"] = analyze_inline_scripts(
             cfg, logger, google_keys_found, google_keys_lock
         )
 
-    # ── JS externo (passivo) ─────────────────────────────────────────────────
+    # ── 6. Análise de JS externos ─────────────────────────────────────────────
     js_findings, gkeys = analyze_all_js(cfg, logger)
     stats["js_findings"] = js_findings
     with google_keys_lock:
         google_keys_found.update(gkeys)
 
-    # ── Source maps ──────────────────────────────────────────────────────────
+    # ── 6b. Source maps ───────────────────────────────────────────────────────
     if args.no_sourcemaps:
-        logger.info("--no-sourcemaps: pulando análise de source maps.")
+        logger.info("--no-sourcemaps: pulando.")
         stats["sourcemap_findings"] = 0
     else:
-        sm_findings = collect_and_analyze_sourcemaps(
-            cfg, logger, google_keys_found, google_keys_lock
-        )
-        stats["sourcemap_findings"]  = sm_findings
-        stats["js_findings"]        += sm_findings
+        sm = collect_and_analyze_sourcemaps(cfg, logger, google_keys_found, google_keys_lock)
+        stats["sourcemap_findings"]  = sm
+        stats["js_findings"]        += sm
 
-    # ── Subdomínios + live crawler ───────────────────────────────────────────
+    # ── 7. Subdomínios ────────────────────────────────────────────────────────
     if args.no_subs:
-        logger.info("--no-subs: análise de subdomínios pulada.")
-        # Ainda roda live crawler no domínio principal se habilitado
-        if not getattr(args, "no_live_crawler", False):
-            live_new = run_live_crawler(cfg, logger, args, [])
-            logger.info("[live-crawler] %d JS novos do domínio principal", len(live_new))
-            if live_new:
-                lf, lg = analyze_all_js(cfg, logger)
-                stats["js_findings"] += lf
-                with google_keys_lock:
-                    google_keys_found.update(lg)
+        logger.info("--no-subs: pulando.")
         stats.update({"subs_found": 0, "subs_alive": 0, "subs_js": 0, "subs_secrets": 0})
     else:
         sub_stats = analyze_subdomains(
-            domain, args, cfg, logger,
-            google_keys_found, google_keys_lock,
+            domain, args, cfg, logger, google_keys_found, google_keys_lock,
         )
         stats.update(sub_stats)
 
-        # Analisa JS novos trazidos pelo live crawler (adicionados ao js_file)
-        lf, lg = analyze_all_js(cfg, logger)
-        stats["js_findings"] += lf
-        with google_keys_lock:
-            google_keys_found.update(lg)
-
+    # ── 8. Google Keys ────────────────────────────────────────────────────────
     stats["google_keys"] = len(google_keys_found)
-
     if args.no_google_val:
         if google_keys_found:
             write_if_not_empty(cfg["google_keys_file"], sorted(google_keys_found), logger)
@@ -2573,6 +2306,7 @@ def main() -> None:
     else:
         validate_all_google_keys(google_keys_found, cfg, logger)
 
+    # ── 9. Relatórios ─────────────────────────────────────────────────────────
     write_summary(cfg, logger, stats)
     write_summary_html(cfg, logger, stats)
 
