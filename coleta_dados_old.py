@@ -7,27 +7,19 @@ Fluxo:
   2. Validação de URLs ativas com httpx
   3. Filtragem com GF  (xss, sqli, ssrf, redirect, ssti)
   4. Download e análise de arquivos sensíveis por extensão
-  5. Coleta de URLs de JS  (filtro inteligente, sem CDNs)
+  5. Coleta de URLs de JS  (filtro inteligente, sem CDNs, SOMENTE domínio/subdomínios do alvo)
   5b. Análise de inline scripts em HTML
   6. Análise de segredos em JS  (padrões de alta precisão + detecção de ofuscação)
-  6b. Extração e análise de source maps (.js.map)
+  6b. Extração e análise de source maps (.js.map) — inclui paths de fontes e sourcesContent
   7. Validação de Google API Keys
   8. Extração de endpoints de API expostos em JS
   9. Probe de XSS (dalfox) e SSRF/redirect (qsreplace)
  10. Relatório consolidado (TXT + HTML interativo)
 
 Melhorias integradas (herdadas do jsrecon.py):
-  A. Padrões de segredos expandidos:
-       • js_secret_key, firebase_app_id, firebase_sender_id,
-         firebase_measurement_id, firebase_config_block, env_config_key
-       • basic_auth_btoa, btoa_creds, basic_auth_b64_raw,
-         hardcoded_credentials, auth_header_hardcoded
+  A. Padrões de segredos expandidos
   B. Análise dedicada de chamadas btoa() com decodificação do valor em claro
-  C. Extração de endpoints muito mais abrangente (17 padrões com método HTTP):
-       fetch_get/post/put/delete/patch, fetch_dynamic, query_string_get,
-       json_body_post, formdata_post, router_path, href_path,
-       url_with_query, websocket, api_versioned, graphql, versioned_path,
-       internal_subdomain
+  C. Extração de endpoints muito mais abrangente (17 padrões com método HTTP)
   D. Persistência de endpoints estruturada (JSONL + TXT com método, URL
      absoluta, query params e fonte JS)
   E. Severidade por tipo de segredo (CRITICAL/HIGH/MEDIUM/LOW)
@@ -38,7 +30,12 @@ Melhorias integradas (herdadas do jsrecon.py):
   J. Cache de JS em disco por hash de URL
   K. Preflight check de ferramentas
   L. SUMMARY.html interativo e filtrável
-  M. Coleta e análise de source maps (.js.map)
+  M. Coleta e análise de source maps (.js.map) com inspeção de paths e sourcesContent
+
+Filtro de domínio (v2):
+  - JS e MAP só são coletados/analisados se o hostname pertence ao domínio-alvo
+    ou a um subdomínio direto dele (*.target.com.br).
+  - CDNs de terceiros e domínios externos são ignorados automaticamente.
 """
 
 from __future__ import annotations
@@ -168,6 +165,10 @@ SECRET_SEVERITY: dict[str, str] = {
     "bearer_token":             "LOW",
     "password_field":           "LOW",
     "bcrypt_hash":              "LOW",
+    # SOURCE MAP específicos
+    "sourcemap_internal_path":  "LOW",
+    "sourcemap_env_path":       "MEDIUM",
+    "sourcemap_secret_in_src":  "HIGH",
 }
 
 _SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
@@ -229,6 +230,28 @@ def is_likely_real_credential(raw_match: str, context_line: str = "") -> bool:
     if _shannon_entropy(value) < _MIN_ENTROPY:
         return False
     return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Filtro de domínio — NOVO
+# Retorna True se a URL pertence ao domínio-alvo ou a um subdomínio direto.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _belongs_to_target(url: str, root_domain: str) -> bool:
+    """
+    Aceita apenas URLs cujo hostname é exatamente root_domain
+    ou termina com .root_domain  (qualquer nível de subdomínio).
+    URLs sem scheme (caminhos relativos) são sempre aceitas — o contexto
+    de onde vieram já garante o domínio correto.
+    """
+    if not url.startswith(("http://", "https://")):
+        return True  # caminho relativo; aceitar
+    try:
+        host = urlparse(url).netloc.lower().split(":")[0]
+    except Exception:
+        return False
+    rd = root_domain.lower()
+    return host == rd or host.endswith("." + rd)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -305,7 +328,7 @@ def scan_charcode_obfuscation(content: str, url: str, logger: logging.Logger) ->
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Padrões de segredos — expandidos com tudo do jsrecon.py
+# Padrões de segredos
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_secret_patterns() -> dict[str, re.Pattern]:
@@ -315,17 +338,11 @@ def _build_secret_patterns() -> dict[str, re.Pattern]:
         "google_oauth_client":      _regex(r'[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com'),
         "firebase_url":             _regex(r'https?://[a-z0-9\-]+\.firebaseio\.com', re.I),
         "gcp_service_account":      _regex(r'"type"\s*:\s*"service_account"'),
-        # secretKey / secreteKey hardcoded em objeto de config JS [NOVO - jsrecon]
         "js_secret_key":            _regex(r'secrete?[Kk]ey\s*[:=]\s*["\']([^"\']{6,})["\']', re.I),
-        # Firebase appId no formato "1:NNNN:web:HEX" [NOVO - jsrecon]
         "firebase_app_id":          _regex(r'appId\s*[:=]\s*["\'](\d+:\d+:\w+:[a-f0-9]{16,})["\']', re.I),
-        # Firebase messagingSenderId [NOVO - jsrecon]
         "firebase_sender_id":       _regex(r'messagingSenderId\s*[:=]\s*["\'](\d{8,})["\']', re.I),
-        # Firebase measurementId / Google Analytics [NOVO - jsrecon]
         "firebase_measurement_id":  _regex(r'measurementId\s*[:=]\s*["\']([A-Z0-9\-]{8,})["\']', re.I),
-        # Bloco completo de config Firebase (apiKey + authDomain juntos) [NOVO - jsrecon]
         "firebase_config_block":    _regex(r'apiKey\s*:\s*["\']([^"\']{20,})["\'][^}]{0,200}authDomain\s*:\s*["\']([^"\']+)["\']', re.I | re.DOTALL),
-        # environment.ts / config.js: URLs de ambiente genéricas [NOVO - jsrecon]
         "env_config_key":           _regex(r'(?:apiUrl|baseUrl|endpointUrl|serviceUrl|backendUrl)\s*[:=]\s*["\']([^"\']{8,})["\']', re.I),
 
         # ── AWS / Cloud ───────────────────────────────────────────────────────
@@ -391,16 +408,11 @@ def _build_secret_patterns() -> dict[str, re.Pattern]:
         "jwt":                      _regex(r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}'),
         "bcrypt_hash":              _regex(r'\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}'),
 
-        # ── Basic Auth / credenciais hardcoded [NOVO - jsrecon] ──────────────
-        # Authorization:"Basic "+btoa("admin:123456") — Angular/React/Vue
+        # ── Basic Auth / credenciais hardcoded ────────────────────────────────
         "basic_auth_btoa":          _regex(r'Basic\s*["\']?\s*\+\s*btoa\s*\(\s*["\']([^"\']{3,100})["\']\s*\)', re.I),
-        # btoa("user:pass") standalone — decodificável via base64
         "btoa_creds":               _regex(r'\bbtoa\s*\(\s*["\']([^"\']{2,100})["\']\s*\)', re.I),
-        # Authorization: "Basic dXNlcjpwYXNz" — base64 literal embutido
         "basic_auth_b64_raw":       _regex(r'(?:Authorization|authorization)\s*[:\s=]+["\']?\s*Basic\s+([A-Za-z0-9+/]{8,}={0,2})', re.I),
-        # username + password juntos na mesma região do código
         "hardcoded_credentials":    _regex(r'(?:username|user|login|usr)\s*[:=]\s*["\']([^"\']{2,50})["\']\s{0,5}.{0,80}(?:password|passwd|pass|pwd|senha)\s*[:=]\s*["\']([^"\']{2,})["\']', re.I),
-        # Authorization como chave de objeto JS com valor Basic
         "auth_header_hardcoded":    _regex(r'["\']Authorization["\']\s*:\s*["\']Basic\s+([A-Za-z0-9+/]{8,}={0,2})["\']', re.I),
 
         # ── Padrões genéricos — validação extra de entropia obrigatória ───────
@@ -418,11 +430,10 @@ _GENERIC_PATTERNS = frozenset({
 })
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Padrões de endpoints — expandidos com os 17 padrões do jsrecon.py
+# Padrões de endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_endpoint_patterns() -> list[tuple[str, re.Pattern, str]]:
-    """(label, regex, method_hint). DYNAMIC = método capturado do grupo 2."""
     return [
         ("api_versioned",
          _regex(r'["\`](/api/v\d+[a-zA-Z0-9/_\-]*(?:\?[^\s"\'`]*)?)["\`]'), "ANY"),
@@ -499,8 +510,8 @@ def get_config(domain: str) -> dict:
         "secrets_txt":          base / "secrets.txt",
         "secrets_csv":          base / "secrets.csv",
         "secrets_jsonl":        base / "secrets.jsonl",
-        "endpoints_txt":        base / "endpoints.txt",       # NOVO
-        "endpoints_jsonl":      base / "endpoints.jsonl",     # NOVO
+        "endpoints_txt":        base / "endpoints.txt",
+        "endpoints_jsonl":      base / "endpoints.jsonl",
         "google_keys_file":     base / "google_keys.txt",
         "google_report_file":   base / "google_keys_report.txt",
         "log_file":             base / "recon.log",
@@ -520,7 +531,7 @@ def get_config(domain: str) -> dict:
 
         "secret_patterns":   _build_secret_patterns(),
         "_generic_patterns": _GENERIC_PATTERNS,
-        "endpoint_patterns": _build_endpoint_patterns(),    # NOVO
+        "endpoint_patterns": _build_endpoint_patterns(),
 
         "sensitive_content_patterns": [
             re.compile(r'(?:DB_PASS(?:WORD)?|DATABASE_PASSWORD|MYSQL_ROOT_PASSWORD)\s*=\s*\S+', re.I),
@@ -1091,27 +1102,55 @@ def download_and_analyze_sensitive(cfg: dict, logger: logging.Logger) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Etapa 5: Coleta de JS
+# Etapa 5: Coleta de JS — FILTRADO POR DOMÍNIO DO ALVO
 # ─────────────────────────────────────────────────────────────────────────────
 
 def collect_js(cfg: dict, logger: logging.Logger) -> int:
+    """
+    Coleta URLs de JS que:
+      1. Pertencem ao domínio-alvo ou a um subdomínio direto (*.target.com.br)
+      2. Não são CDN de terceiros
+      3. Não são source maps (.js.map)
+    URLs de terceiros são contadas e logadas para transparência, mas descartadas.
+    """
     source = cfg.get("_active_urls_file", cfg["urls_file"])
     if not source.exists():
         logger.warning("Arquivo de URLs não encontrado — pulando coleta de JS.")
         return 0
-    js_re = re.compile(
+
+    domain = cfg["domain"]
+    js_re  = re.compile(
         r'(?:\.js(?:\?[^\s]*)?$|/(?:static|assets|dist|build|chunks|bundles)/[^\s]*\.js)', re.I,
     )
-    js_urls: set[str] = set()
+
+    js_urls: set[str]      = set()
+    skipped_cdn:    int    = 0
+    skipped_domain: int    = 0
+
     for line in source.read_text(encoding="utf-8").splitlines():
         url = line.strip()
-        if not url or _CDN_DOMAINS_RE.search(url) or url.endswith(".js.map"):
+        if not url:
             continue
-        if js_re.search(url):
-            js_urls.add(url)
+        if url.endswith(".js.map"):
+            continue  # source maps tratados separadamente
+        if not js_re.search(url):
+            continue
+        if _CDN_DOMAINS_RE.search(url):
+            skipped_cdn += 1
+            continue
+        if not _belongs_to_target(url, domain):
+            skipped_domain += 1
+            continue
+        js_urls.add(url)
+
     wrote = write_if_not_empty(cfg["js_file"], sorted(js_urls), logger)
-    logger.info("Arquivos JS únicos: %d%s", len(js_urls),
-                f" → {cfg['js_file']}" if wrote else " (nenhum)")
+    logger.info(
+        "Arquivos JS únicos (alvo): %d%s  |  descartados: %d CDN, %d domínios externos",
+        len(js_urls),
+        f" → {cfg['js_file']}" if wrote else " (nenhum)",
+        skipped_cdn,
+        skipped_domain,
+    )
     return len(js_urls)
 
 
@@ -1136,9 +1175,12 @@ def analyze_inline_scripts(cfg: dict, logger: logging.Logger,
     source = cfg.get("_active_urls_file", cfg["urls_file"])
     if not source.exists():
         return 0
+    domain = cfg["domain"]
     candidate_urls = [
         u.strip() for u in source.read_text(encoding="utf-8").splitlines()
-        if u.strip() and not _STATIC_EXT_RE.search(u.strip())
+        if u.strip()
+        and not _STATIC_EXT_RE.search(u.strip())
+        and _belongs_to_target(u.strip(), domain)
     ]
     if not candidate_urls:
         return 0
@@ -1328,7 +1370,7 @@ def _append_secret(finding: dict, cfg: dict) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Persistência de endpoints (NOVO - jsrecon)
+# Persistência de endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _abs_url(path: str, js_url: str, domain: str) -> str:
@@ -1424,7 +1466,7 @@ def _save_cached_js(cfg: dict, url: str, content: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Análise de conteúdo JS — núcleo expandido
+# Análise de conteúdo JS — núcleo
 # ─────────────────────────────────────────────────────────────────────────────
 
 def is_valid_js(resp: requests.Response, content: str) -> bool:
@@ -1495,7 +1537,7 @@ def analyze_js_content(
         if _append_secret(obf, cfg):
             found += 1
 
-    # ── Análise dedicada de btoa() [NOVO - jsrecon] ───────────────────────────
+    # ── Análise dedicada de btoa() ────────────────────────────────────────────
     _btoa_re = re.compile(r'\bbtoa\s*\(\s*["\'](.*?)["\'\']\s*\)', re.I)
     for bm in _btoa_re.finditer(content):
         raw_val = bm.group(1)
@@ -1513,7 +1555,7 @@ def analyze_js_content(
                 logger.warning("[!!!] btoa hardcoded → '%s' | %s", raw_val, url)
             found += 1
 
-    # ── Endpoints — 17 padrões com método HTTP [NOVO - jsrecon] ──────────────
+    # ── Endpoints ─────────────────────────────────────────────────────────────
     for label, pattern, method_hint in cfg["endpoint_patterns"]:
         for m in pattern.finditer(content):
             path = (m.group(1) or "").strip().strip("\"'`")
@@ -1615,33 +1657,168 @@ def analyze_all_js(cfg: dict, logger: logging.Logger) -> tuple[int, set]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Coleta e análise de source maps (.js.map)
+# Padrões específicos de source maps para alertas estruturais
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Paths que indicam exposição de código-fonte interno
+_MAP_SENSITIVE_PATH_RE = re.compile(
+    r'(?:'
+    r'\.env|/env\b|'
+    r'config(?:uration)?[/.]|'
+    r'secret[s]?[/.]|'
+    r'credential[s]?[/.]|'
+    r'private[/.]|'
+    r'internal[/.]|'
+    r'\.git/|'
+    r'node_modules/(?!@types)|'  # node_modules mas não @types (definitivo)
+    r'src/(?:services?|api|auth|store|redux|vuex|context)|'
+    r'\.(pem|key|crt|pfx)$'
+    r')',
+    re.I,
+)
+
+# Paths que valem LOW — apenas para informação
+_MAP_INTERNAL_PATH_RE = re.compile(
+    r'(?:webpack://|webpack-internal://|/src/|/app/|/pages/|/components/)',
+    re.I,
+)
+
+
+def _analyze_sourcemap_structure(
+    map_url: str,
+    data: dict,
+    cfg: dict,
+    logger: logging.Logger,
+) -> int:
+    """
+    Analisa a estrutura do JSON do source map em busca de:
+      - Paths de fontes sensíveis (campo 'sources')
+      - Paths absolutos vazando estrutura do servidor
+      - Metadata como 'file' e 'sourceRoot' revelando informações internas
+    Registra achados no mesmo pipeline de segredos, com tipos dedicados.
+    Retorna o número de achados estruturais novos.
+    """
+    found = 0
+
+    # ── Campo 'file': path do JS compilado ────────────────────────────────────
+    file_field = data.get("file", "")
+    if file_field and re.search(r'(?:/home/|/var/|/opt/|/srv/|/root/|[A-Z]:\\)', file_field):
+        ctx = f"source map 'file' field: {file_field}"
+        finding = {
+            "type":    "sourcemap_internal_path",
+            "value":   file_field,
+            "url":     map_url,
+            "context": ctx,
+        }
+        if _append_secret(finding, cfg):
+            logger.warning("[!!!] [sourcemap] path absoluto interno no campo 'file': %s | %s",
+                           file_field, map_url)
+            found += 1
+
+    # ── Campo 'sourceRoot': raiz do projeto no servidor ───────────────────────
+    source_root = data.get("sourceRoot", "")
+    if source_root and len(source_root) > 1 and source_root not in ("webpack://", "/"):
+        ctx = f"source map 'sourceRoot': {source_root}"
+        finding = {
+            "type":    "sourcemap_internal_path",
+            "value":   source_root,
+            "url":     map_url,
+            "context": ctx,
+        }
+        if _append_secret(finding, cfg):
+            logger.warning("[!!!] [sourcemap] sourceRoot exposto: %s | %s", source_root, map_url)
+            found += 1
+
+    # ── Campo 'sources': lista de paths de código-fonte ──────────────────────
+    sources = data.get("sources", [])
+    sensitive_paths:  list[str] = []
+    interesting_paths: list[str] = []
+
+    for src_path in sources:
+        if not src_path or not isinstance(src_path, str):
+            continue
+        if _MAP_SENSITIVE_PATH_RE.search(src_path):
+            sensitive_paths.append(src_path)
+        elif _MAP_INTERNAL_PATH_RE.search(src_path):
+            interesting_paths.append(src_path)
+
+    if sensitive_paths:
+        value = "\n".join(sensitive_paths[:20])
+        ctx   = f"Paths sensíveis em sources[] do source map ({len(sensitive_paths)} total)"
+        finding = {
+            "type":    "sourcemap_env_path",
+            "value":   value,
+            "url":     map_url,
+            "context": ctx,
+        }
+        if _append_secret(finding, cfg):
+            logger.warning(
+                "[!!!] [sourcemap] %d paths sensíveis em sources[]: %s | %s",
+                len(sensitive_paths), sensitive_paths[:3], map_url,
+            )
+            found += 1
+
+    if interesting_paths and not sensitive_paths:
+        # Apenas loga como informação, não registra como segredo
+        logger.info(
+            "[sourcemap] %d paths internos expostos (webpack/src) em %s",
+            len(interesting_paths), map_url,
+        )
+
+    return found
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Coleta e análise de source maps (.js.map) — FILTRADO POR DOMÍNIO + análise completa
 # ─────────────────────────────────────────────────────────────────────────────
 
 def collect_and_analyze_sourcemaps(cfg: dict, logger: logging.Logger,
                                    google_keys_found: set,
                                    google_keys_lock: threading.Lock) -> int:
+    """
+    1. Coleta URLs .js.map do arquivo de URLs ativas, FILTRANDO pelo domínio do alvo.
+    2. Para cada arquivo JS do alvo, tenta também inferir o .map correspondente.
+    3. Para cada map válido:
+       a. Analisa a ESTRUTURA do JSON (sources[], sourceRoot, file) — achados estruturais.
+       b. Analisa cada entrada de sourcesContent[] com os mesmos padrões de segredos do JS.
+       c. Registra tudo no pipeline unificado de segredos.
+    """
     source = cfg.get("_active_urls_file", cfg["urls_file"])
+    domain = cfg["domain"]
+
     if not source.exists():
         return 0
+
     all_urls = [l.strip() for l in source.read_text(encoding="utf-8").splitlines() if l.strip()]
     get_fn   = _make_retrying_get(cfg)
     map_urls: set[str] = set()
 
+    # URLs já identificadas como .js.map — filtrar por domínio
     for url in all_urls:
-        if url.endswith(".js.map"):
+        if url.endswith(".js.map") and _belongs_to_target(url, domain):
             map_urls.add(url)
 
+    # Para cada JS do alvo, inferir o map candidato
     for url in all_urls:
+        if not _belongs_to_target(url, domain):
+            continue
         if re.search(r'\.js(\?|$)', url):
             candidate = re.sub(r'\.js(\?.*)?$', '.js.map', url)
             map_urls.add(candidate)
+
+    # Também tentar a partir dos JS já filtrados
+    if cfg["js_file"].exists():
+        for url in cfg["js_file"].read_text(encoding="utf-8").splitlines():
+            url = url.strip()
+            if url and _belongs_to_target(url, domain):
+                candidate = re.sub(r'\.js(\?.*)?$', '.js.map', url)
+                map_urls.add(candidate)
 
     if not map_urls:
         logger.info("[sourcemaps] nenhuma URL candidata encontrada.")
         return 0
 
-    logger.info("[sourcemaps] tentando %d URLs de source map…", len(map_urls))
+    logger.info("[sourcemaps] tentando %d URLs de source map (alvo: %s)…", len(map_urls), domain)
     sourcemap_dir  = cfg["base_dir"] / "sourcemaps"
     findings       = 0
     confirmed: list[str] = []
@@ -1649,41 +1826,85 @@ def collect_and_analyze_sourcemaps(cfg: dict, logger: logging.Logger,
 
     def _process_map(map_url: str) -> int:
         local_findings = 0
+
+        # Verificar novamente o domínio (pode ter vindo de inferência)
+        if not _belongs_to_target(map_url, domain):
+            return 0
+
         try:
             resp = get_fn(map_url)
         except Exception:
             return 0
-        if resp.status_code != 200 or "<html" in resp.text[:100].lower():
+
+        if resp.status_code != 200:
             return 0
+
+        # Detectar HTML falso (CDN/WAF retornando página de erro)
+        raw = resp.text
+        if "<html" in raw[:200].lower():
+            return 0
+
         try:
             data = resp.json()
         except Exception:
             return 0
+
+        # Verificar se é de fato um source map (campo obrigatório: version ou sources)
+        if not isinstance(data, dict):
+            return 0
+        if "sources" not in data and "mappings" not in data:
+            return 0
+
         sources_content = data.get("sourcesContent", [])
         sources_names   = data.get("sources", [])
-        if not sources_content:
-            return 0
 
         with confirmed_lock:
             confirmed.append(map_url)
+
         sourcemap_dir.mkdir(parents=True, exist_ok=True)
         safe = re.sub(r'[^\w\-.]', '_', map_url)[:100]
-        logger.warning("[!!!] Source map confirmado: %s (%d fontes)", map_url, len(sources_content))
 
+        n_srcs    = len([s for s in sources_content if s])
+        n_sources = len(sources_names)
+        logger.warning(
+            "[!!!] Source map confirmado: %s  |  %d paths em sources[]  |  %d com código-fonte",
+            map_url, n_sources, n_srcs,
+        )
+
+        # ── a) Análise estrutural do JSON (paths, sourceRoot, file) ───────────
+        struct_findings = _analyze_sourcemap_structure(map_url, data, cfg, logger)
+        local_findings += struct_findings
+
+        # ── b) Análise de cada sourcesContent[] como JS real ─────────────────
         for i, src_content in enumerate(sources_content):
             if not src_content or not isinstance(src_content, str):
                 continue
             src_name    = sources_names[i] if i < len(sources_names) else f"source_{i}"
             virtual_url = f"{map_url}::{src_name}"
+
+            # Salvar o arquivo de fonte em disco para auditoria posterior
             try:
-                (sourcemap_dir / (safe + f"_src{i}.js")).write_text(
+                safe_src = re.sub(r'[^\w\-.]', '_', src_name)[:60]
+                (sourcemap_dir / f"{safe}_{i:04d}_{safe_src}").write_text(
                     src_content, encoding="utf-8", errors="replace"
                 )
             except Exception:
                 pass
-            n = analyze_js_content(src_content, virtual_url, cfg, logger,
-                                   google_keys_found, google_keys_lock)
+
+            # Rodar análise completa de segredos no conteúdo da fonte
+            n = analyze_js_content(
+                src_content, virtual_url, cfg, logger,
+                google_keys_found, google_keys_lock,
+            )
             local_findings += n
+
+        # ── c) Também analisar o JSON inteiro (pode ter segredos fora do sourcesContent) ──
+        n_raw = analyze_js_content(
+            raw, f"{map_url}::raw_json", cfg, logger,
+            google_keys_found, google_keys_lock,
+        )
+        local_findings += n_raw
+
         return local_findings
 
     with ThreadPoolExecutor(max_workers=cfg["js_workers"]) as executor:
@@ -1696,9 +1917,13 @@ def collect_and_analyze_sourcemaps(cfg: dict, logger: logging.Logger,
 
     if confirmed:
         write_if_not_empty(cfg["base_dir"] / "sourcemaps_found.txt", confirmed, logger)
-        logger.warning("[!!!] Source maps confirmados: %d — segredos: %d", len(confirmed), findings)
+        logger.warning(
+            "[!!!] Source maps confirmados: %d  |  segredos/alertas: %d",
+            len(confirmed), findings,
+        )
     else:
         logger.info("[sourcemaps] nenhum source map público confirmado.")
+
     return findings
 
 
@@ -1725,7 +1950,9 @@ def _probe_alive_urls(urls: list[str], timeout: int, logger: logging.Logger) -> 
 
 
 def _collect_js_from_sub(sub_url: str, cfg: dict, logger: logging.Logger) -> set[str]:
+    """Coleta JS de um subdomínio, garantindo que o resultado pertence ao alvo."""
     all_urls: set[str] = set()
+    domain = cfg["domain"]
     js_re = re.compile(
         r'(?:\.js(?:\?[^\s]*)?$|/(?:static|assets|dist|build|chunks|bundles)/[^\s]*\.js)', re.I,
     )
@@ -1744,8 +1971,13 @@ def _collect_js_from_sub(sub_url: str, cfg: dict, logger: logging.Logger) -> set
             m = re.search(r'https?://[^\s"\'<>\]]+', line)
             if m:
                 all_urls.add(m.group(0).rstrip('.,;)"\'>]'))
-    return {u for u in all_urls
-            if not _CDN_DOMAINS_RE.search(u) and not u.endswith(".js.map") and js_re.search(u)}
+    return {
+        u for u in all_urls
+        if not _CDN_DOMAINS_RE.search(u)
+        and not u.endswith(".js.map")
+        and js_re.search(u)
+        and _belongs_to_target(u, domain)
+    }
 
 
 def analyze_subdomains(
@@ -1913,7 +2145,7 @@ def write_summary(cfg: dict, logger: logging.Logger, stats: dict) -> None:
         "=" * 64, "",
         f"  URLs coletadas           : {_f('urls_total')}",
         f"  URLs ativas (httpx)      : {_f('urls_alive')}",
-        f"  Arquivos JS              : {_f('js_total')}",
+        f"  Arquivos JS (alvo)       : {_f('js_total')}",
         f"  URLs sensíveis           : {_f('sensitive_total')}",
         "",
         f"  Segredos encontrados     : {_f('js_findings')}",
@@ -2257,7 +2489,7 @@ def main() -> None:
     stats["sensitive_findings"] = (0 if args.no_sensitive_dl
                                    else download_and_analyze_sensitive(cfg, logger))
 
-    # ── 5. Coleta de JS ───────────────────────────────────────────────────────
+    # ── 5. Coleta de JS (filtrada por domínio) ────────────────────────────────
     stats["js_total"] = collect_js(cfg, logger)
 
     google_keys_found: set            = set()
@@ -2278,7 +2510,7 @@ def main() -> None:
     with google_keys_lock:
         google_keys_found.update(gkeys)
 
-    # ── 6b. Source maps ───────────────────────────────────────────────────────
+    # ── 6b. Source maps (filtrados por domínio + análise completa) ────────────
     if args.no_sourcemaps:
         logger.info("--no-sourcemaps: pulando.")
         stats["sourcemap_findings"] = 0
