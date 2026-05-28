@@ -84,6 +84,53 @@ _CDN_DOMAINS_RE = re.compile(
     re.I,
 )
 
+# ── Filtros de qualidade de endpoints (adicionados pelo patch) ─────────────────
+_TRAILING_JUNK = re.compile(r'[\\)\\]]+$')
+_BUILD_PATH    = re.compile(r'/(?:node_modules|builds/|src/locales|src/pages|\.cache)', re.I)
+_STATUS_CODE   = re.compile(r'^/\d{3}$')
+_TOO_SHORT     = re.compile(r'^/[a-zA-Z0-9_]{1,3}$')
+
+# ── Novos providers de secrets (adicionados pelo patch) ───────────────────────
+_EXTRA_SECRET_PATTERNS: dict[str, re.Pattern] = {
+    "anthropic_key":       re.compile(r'sk-ant-(?:api03-)?[A-Za-z0-9\-_]{95,}'),
+    "vercel_token":        re.compile(r'vercel_[A-Za-z0-9]{24}'),
+    "doppler_token":       re.compile(r'dp\.st\.[a-z0-9]+\.[a-zA-Z0-9]{43}'),
+    "huggingface_token":   re.compile(r'hf_[A-Za-z0-9]{37}'),
+    "resend_key":          re.compile(r're_[a-zA-Z0-9]{24}'),
+    "expo_token":          re.compile(r'expo_[A-Za-z0-9]{40}'),
+    "planetscale_token":   re.compile(r'pscale_tkn_[A-Za-z0-9]{32}'),
+    "neon_postgres":       re.compile(r'postgresql://[^@\s]+@[^.]+\.neon\.tech[^\s"''"`]*', re.I),
+    "upstash_token":       re.compile(r'AX[A-Za-z0-9]{50,}'),
+    "upstash_url":         re.compile(r'https://[a-z]+-[0-9]+-[0-9]+\.upstash\.io', re.I),
+    "turso_url":           re.compile(r'libsql://[a-z0-9\-]+\.turso\.io', re.I),
+    "render_api_key":      re.compile(r'rnd_[A-Za-z0-9]{32}'),
+    "aws_arn":             re.compile(r'arn:aws:[a-z0-9]+:[a-z0-9\-]*:[0-9]{12}:[^\s"''"`]{3,}'),
+    "aws_account_id":      re.compile(r'(?:accountId|AccountId)\s*[=:]\s*["\'\']?([0-9]{12})', re.I),
+    "aws_s3_bucket":       re.compile(r'(?:Bucket|s3_bucket)\s*[=:]\s*["\'\']([a-z0-9][a-z0-9\-\.]{2,62})["\'\']', re.I),
+    "gcp_project_id":      re.compile(r'(?:projectId|project_id)\s*[=:]\s*["\'\']([a-z][a-z0-9\-]{4,28}[a-z0-9])["\'\']', re.I),
+    "fcm_server_key":      re.compile(r'AAAA[A-Za-z0-9_\-]{7}:[A-Za-z0-9_\-]{140}'),
+    "vapid_public_key":    re.compile(r'(?:vapidPublicKey|applicationServerKey)\s*[=:]\s*["\'\']([A-Za-z0-9\-_=]{80,})["\'\']', re.I),
+    "oauth_client_secret": re.compile(r'(?:clientSecret|client_secret)\s*[=:]\s*["\'\']([A-Za-z0-9_\-\.]{16,})["\'\']', re.I),
+    "atob_hardcoded":      re.compile(r'\batob\s*\(\s*["\'\']([A-Za-z0-9+/]{8,}={0,2})["\'\']', re.I),
+    "process_env_secret":  re.compile(r'process\.env\.([A-Z][A-Z0-9_]{3,}(?:SECRET|KEY|TOKEN|PASS)[A-Z0-9_]*)', re.I),
+    "vite_env_secret":     re.compile(r'import\.meta\.env\.([A-Z][A-Z0-9_]{3,}(?:SECRET|KEY|TOKEN|PASS)[A-Z0-9_]*)', re.I),
+}
+
+_EXTRA_SEVERITY: dict[str, str] = {
+    "anthropic_key": "CRITICAL", "doppler_token": "CRITICAL",
+    "atob_hardcoded": "HIGH", "vercel_token": "HIGH",
+    "planetscale_token": "HIGH", "neon_postgres": "HIGH",
+    "upstash_token": "HIGH", "resend_key": "HIGH",
+    "fcm_server_key": "HIGH", "oauth_client_secret": "HIGH",
+    "huggingface_token": "HIGH",
+    "aws_arn": "MEDIUM", "vapid_public_key": "MEDIUM",
+    "upstash_url": "MEDIUM", "expo_token": "MEDIUM",
+    "render_api_key": "MEDIUM", "turso_url": "MEDIUM",
+    "aws_account_id": "LOW", "aws_s3_bucket": "LOW",
+    "gcp_project_id": "LOW", "process_env_secret": "LOW", "vite_env_secret": "LOW",
+}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Constantes de qualidade / anti-falso-positivo
 # ─────────────────────────────────────────────────────────────────────────────
@@ -172,6 +219,7 @@ SECRET_SEVERITY: dict[str, str] = {
 }
 
 _SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
+SECRET_SEVERITY.update(_EXTRA_SEVERITY)  # merge após SECRET_SEVERITY
 
 
 def get_severity(secret_type: str) -> str:
@@ -1488,6 +1536,161 @@ def _secret_context(content: str, start: int, end: int, radius: int = 90) -> str
     return content[left:right].replace("\r", " ").replace("\n", " ").strip()
 
 
+
+# ── Funções adicionadas pelo patch ────────────────────────────────────────────
+
+def _scan_obfuscation_ext(content: str, url: str) -> list[dict]:
+    """Ofuscação extendida: fromCharCode, hex, unicode, XOR, reverse, atob."""
+    import base64, math, collections
+    results = []
+    seen = set()
+
+    def _ent(s):
+        if not s: return 0.0
+        freq = collections.Counter(s)
+        t = len(s)
+        return -sum((c/t)*math.log2(c/t) for c in freq.values())
+
+    for m in re.finditer(r'String\.fromCharCode\s*\(([0-9,\s]{10,})\)', content, re.I):
+        try:
+            codes = [int(x.strip()) for x in m.group(1).split(',') if x.strip()]
+            if any(c<32 or c>126 for c in codes) or len(codes)<4: continue
+            decoded = ''.join(chr(c) for c in codes)
+            if (decoded,'fcc') not in seen and (_ent(decoded)>=3.0 or len(decoded)>=10):
+                seen.add((decoded,'fcc'))
+                ctx = content[max(0,m.start()-60):m.end()+60].replace('\n',' ')
+                results.append({"type":"fromcharcode_decoded","value":decoded,"context":ctx,"url":url})
+        except Exception: pass
+
+    for m in re.finditer(r'["\'\']((?:\\\\x[0-9a-fA-F]{2}){4,})["\'\']', content):
+        try:
+            decoded = bytes.fromhex(m.group(1).replace('\\\\x','')).decode('utf-8',errors='replace')
+            if len(decoded)>=6 and _ent(decoded)>=2.5 and (decoded,'hex') not in seen:
+                seen.add((decoded,'hex'))
+                ctx = content[max(0,m.start()-60):m.end()+60].replace('\n',' ')
+                results.append({"type":"hex_string_decoded","value":decoded[:200],"context":ctx,"url":url})
+        except Exception: pass
+
+    for m in re.finditer(r'\batob\s*\(\s*["\'\']([A-Za-z0-9+/]{8,}={0,2})["\'\']', content, re.I):
+        b64 = m.group(1)
+        try:
+            decoded = base64.b64decode(b64+'==').decode('utf-8',errors='replace')
+            if len(decoded)>=4 and decoded!=b64 and (decoded,'atob') not in seen:
+                seen.add((decoded,'atob'))
+                ctx = content[max(0,m.start()-80):m.end()+80].replace('\n',' ')
+                results.append({"type":"atob_decoded","value":f"{b64} → {decoded}","context":ctx,"url":url})
+        except Exception: pass
+
+    for m in re.finditer(r'["\'\']([A-Za-z0-9+/=_\-]{8,})["\'\']\.split\s*\(\s*["\'\']["\'\']?\s*\)\.reverse\s*\(\s*\)\.join', content, re.I):
+        decoded = m.group(1)[::-1]
+        if len(decoded)>=8 and _ent(decoded)>=2.8 and (decoded,'rev') not in seen:
+            seen.add((decoded,'rev'))
+            ctx = content[max(0,m.start()-60):m.end()+60].replace('\n',' ')
+            results.append({"type":"reversed_string_decoded","value":decoded,"context":ctx,"url":url})
+
+    return results
+
+_INFRA_PATS = [
+    ("internal_host",   re.compile(r'https?://(?:internal|private|corp|intra)[a-zA-Z0-9.\-_]*(?::\d+)?', re.I)),
+    ("k8s_service",     re.compile(r'[a-z0-9\-]+\.svc\.cluster\.local(?::\d+)?', re.I)),
+    ("private_ip_host", re.compile(r'https?://(?:10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+)(?::\d+)?')),
+    ("ecr_registry",    re.compile(r'[0-9]{12}\.dkr\.ecr\.[a-z0-9\-]+\.amazonaws\.com')),
+    ("env_var_ref",     re.compile(r'process\.env\.([A-Z_]{4,})(?!\s*[=!])', re.I)),
+]
+
+def _scan_infra(content: str, url: str) -> list[dict]:
+    results, seen = [], set()
+    for itype, pat in _INFRA_PATS:
+        for m in pat.finditer(content):
+            val = m.group(0) if not m.lastindex else m.group(1)
+            if (itype, val) in seen: continue
+            seen.add((itype, val))
+            ctx = content[max(0,m.start()-60):m.end()+60].replace('\n',' ')
+            results.append({"type":itype,"value":val,"context":ctx,"url":url})
+    return results
+
+_EP_RISK = [
+    ("CRITICAL","admin_panel",     re.compile(r'/admin(?:/|$)', re.I)),
+    ("CRITICAL","spring_actuator", re.compile(r'/actuator(?:/|$)', re.I)),
+    ("CRITICAL","graphql",         re.compile(r'/graphql(?:\?|$)', re.I)),
+    ("CRITICAL","debug_endpoint",  re.compile(r'/debug(?:/|$)', re.I)),
+    ("HIGH","api_docs",            re.compile(r'/(?:swagger|api-docs|openapi|redoc)(?:/|\?|$)', re.I)),
+    ("HIGH","internal_api",        re.compile(r'/internal(?:/|$)', re.I)),
+    ("HIGH","export_data",         re.compile(r'/(?:export|download)(?:/|$)', re.I)),
+    ("HIGH","webhook",             re.compile(r'/webhooks?(?:/|$)', re.I)),
+    ("HIGH","auth_token",          re.compile(r'/(?:auth|oauth|token|refresh)(?:/|$)', re.I)),
+    ("MEDIUM","metrics",           re.compile(r'/metrics(?:/|$)', re.I)),
+    ("MEDIUM","health_check",      re.compile(r'/(?:health|healthz|readyz)(?:/|$)', re.I)),
+    ("MEDIUM","upload",            re.compile(r'/uploads?(?:/|$)', re.I)),
+]
+
+def _classify_risk(path: str) -> tuple[str, str]:
+    clean = path.split('?')[0]
+    for sev, cat, pat in _EP_RISK:
+        if pat.search(clean): return sev, cat
+    return "INFO", "generic"
+
+_ENV_PROBE = [
+    '/.env','/.env.local','/.env.production','/.env.staging',
+    '/.env.example','/.env.bak','/config.js','/config.json',
+    '/next.config.js','/nuxt.config.js','/vite.config.js',
+    '/.npmrc','/.yarnrc.yml','/package.json',
+    '/.git/config','/.git/HEAD',
+    '/secrets.json','/credentials.json',
+    '/application.yml','/application.properties',
+]
+_ENV_SIGS = [
+    re.compile(r'(?:DB_PASS|DATABASE_PASSWORD)\s*=', re.I),
+    re.compile(r'(?:SECRET_KEY|APP_KEY)\s*=', re.I),
+    re.compile(r'AWS_SECRET_ACCESS_KEY\s*=', re.I),
+    re.compile(r'AIza[0-9A-Za-z\-_]{35}'),
+    re.compile(r'-----BEGIN.*PRIVATE KEY-----'),
+    re.compile(r'sk-ant-'),
+    re.compile(r'AKIA[0-9A-Z]{16}'),
+]
+
+def probe_env_recon(base_url: str, get_fn, logger) -> list[dict]:
+    base = base_url.rstrip('/')
+    findings = []
+    for path in _ENV_PROBE:
+        url = base + path
+        try:
+            resp = get_fn(url)
+        except Exception: continue
+        if resp.status_code != 200: continue
+        content = resp.text
+        if '<html' in content[:200].lower(): continue
+        if len(content) > 500_000: continue
+        hits = [sig.pattern for sig in _ENV_SIGS if sig.search(content)]
+        if hits or path in ('/.git/config','/.git/HEAD','/package.json'):
+            logger.warning("[!!!] Arquivo exposto: %s | %s", url, hits[:3])
+            findings.append({"url":url,"path":path,"size":len(content),"signatures_matched":hits,"preview":content[:300]})
+    return findings
+
+def save_risky_recon(cfg: dict, logger) -> int:
+    import json
+    ep_file = cfg.get("endpoints_jsonl", cfg["base_dir"] / "endpoints.jsonl")
+    if not ep_file.exists(): return 0
+    risky = []
+    for line in ep_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+        try:
+            ep = json.loads(line)
+            path = ep.get("path","")
+            sev, cat = _classify_risk(path)
+            if sev in ("CRITICAL","HIGH","MEDIUM"):
+                risky.append({**ep,"risk":sev,"category":cat})
+        except Exception: pass
+    risky.sort(key=lambda x: {"CRITICAL":0,"HIGH":1,"MEDIUM":2}.get(x["risk"],3))
+    if risky:
+        out = cfg["base_dir"] / "endpoints_risky.txt"
+        out.write_text('\n'.join(
+            f"[{ep['risk']}][{ep['category']}] [{ep.get('method','?')}] {ep.get('absolute_url',ep.get('path','?'))}"
+            for ep in risky
+        ), encoding="utf-8")
+        logger.warning("[!!!] Endpoints de risco: %d → %s", len(risky), out)
+    return sum(1 for e in risky if e["risk"] in ("CRITICAL","HIGH"))
+
+
 def analyze_js_content(
     content: str,
     url: str,
@@ -1563,6 +1766,15 @@ def analyze_js_content(
                 continue
             if re.search(r'\.(png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|css)$', path, re.I):
                 continue
+            # ── Filtros de qualidade (adicionados pelo patch) ──────────────────
+            path = _TRAILING_JUNK.sub("", path).rstrip("/") or path
+            if _BUILD_PATH.search(path) or _STATUS_CODE.match(path) or _TOO_SHORT.match(path):
+                continue
+            if label in ("fetch_baseurl","fetch_baseurl_m"):
+                _tmpl = re.compile(r'\$\{[^}]*\}')
+                if _tmpl.search(path):
+                    path = _tmpl.split(path)[0].rstrip("/") or path
+                    if not path or len(path) < 3: continue
             method = (m.group(2).upper()
                       if method_hint == "DYNAMIC" and m.lastindex and m.lastindex >= 2
                       else method_hint)
@@ -2539,6 +2751,36 @@ def main() -> None:
         validate_all_google_keys(google_keys_found, cfg, logger)
 
     # ── 9. Relatórios ─────────────────────────────────────────────────────────
+    # ── Probe de .env e configs expostos (adicionado pelo patch) ──────────
+    get_fn_env = _make_retrying_get(cfg)
+    env_findings = []
+    source_urls_file = cfg.get("_active_urls_file", cfg["urls_file"])
+    if source_urls_file.exists():
+        seen_bases = set()
+        for url_line in source_urls_file.read_text(encoding="utf-8").splitlines()[:300]:
+            url_line = url_line.strip()
+            if not url_line: continue
+            try:
+                from urllib.parse import urlparse as _up2
+                p = _up2(url_line)
+                base = f"{p.scheme}://{p.netloc}"
+                if base not in seen_bases:
+                    seen_bases.add(base)
+                    env_findings.extend(probe_env_recon(base, get_fn_env, logger))
+            except Exception: pass
+    if env_findings:
+        import json as _json2
+        env_out = cfg["base_dir"] / "env_files_exposed.jsonl"
+        with open(env_out, "w", encoding="utf-8") as _ef:
+            for ef in env_findings:
+                _ef.write(_json2.dumps(ef, ensure_ascii=False) + "\n")
+        logger.warning("[!!!] Arquivos .env/config expostos: %d → %s", len(env_findings), env_out)
+    stats["env_exposed"] = len(env_findings)
+
+    # ── Classificação de endpoints por risco (adicionado pelo patch) ─────────
+    risky = save_risky_recon(cfg, logger)
+    stats["risky_endpoints"] = risky
+
     write_summary(cfg, logger, stats)
     write_summary_html(cfg, logger, stats)
 
