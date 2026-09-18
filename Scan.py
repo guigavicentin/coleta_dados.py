@@ -158,6 +158,17 @@ TAKEOVER_FINGERPRINTS: list[dict] = [
      "cname": r"\.kajabi\.com", "severity": "medium"},
     {"service": "Wishpond",     "fingerprint": "https://www.wishpond.com/404",
      "cname": r"\.wishpond\.com", "severity": "low"},
+    # Plataformas modernas — adicionadas
+    {"service": "Netlify",      "fingerprint": "Not Found - Request ID:",
+     "cname": r"\.netlify\.app|\.netlify\.com", "severity": "high"},
+    {"service": "Vercel",       "fingerprint": "The deployment could not be found",
+     "cname": r"\.vercel\.app",  "severity": "high"},
+    {"service": "Render",       "fingerprint": "Service Not Found",
+     "cname": r"\.onrender\.com","severity": "high"},
+    {"service": "Railway",      "fingerprint": "Application not found",
+     "cname": r"\.railway\.app", "severity": "high"},
+    {"service": "Fly.io",       "fingerprint": "404: Application Not Found",
+     "cname": r"\.fly\.dev",     "severity": "high"},
 ]
 
 # CNAMEs de serviços externos que indicam risco potencial (mesmo sem fingerprint confirmado)
@@ -171,6 +182,7 @@ SUSPICIOUS_CNAME_PATTERNS: list[tuple[str, str]] = [
     (r"\.fastly\.net",          "Fastly CDN"),
     (r"\.ghost\.io",            "Ghost"),
     (r"\.netlify\.app",         "Netlify"),
+    (r"\.netlify\.com",         "Netlify"),
     (r"\.vercel\.app",          "Vercel"),
     (r"\.surge\.sh",            "Surge.sh"),
     (r"\.readme\.io",           "Readme.io"),
@@ -178,6 +190,9 @@ SUSPICIOUS_CNAME_PATTERNS: list[tuple[str, str]] = [
     (r"\.myshopify\.com",       "Shopify"),
     (r"\.statuspage\.io",       "Statuspage"),
     (r"\.zendesk\.com",         "Zendesk"),
+    (r"\.onrender\.com",        "Render"),
+    (r"\.railway\.app",         "Railway"),
+    (r"\.fly\.dev",             "Fly.io"),
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -304,7 +319,7 @@ def http_get_with_retry(
         base_headers.update(headers)
     for attempt in range(max_retries):
         try:
-            resp = requests.get(url, timeout=timeout, headers=base_headers)
+            resp = requests.get(url, timeout=timeout, verify=False, headers=base_headers)
             if resp.status_code == 429:
                 wait = 2 ** attempt
                 logger.debug("[retry] Rate limit em %s — aguardando %ds", url, wait)
@@ -392,8 +407,11 @@ def enumerate_subdomains(
     elif not github_token:
         logger.info("[github-subdomains] GITHUB_TOKEN não definida — pulando.")
 
-    # Filtra apenas subdomínios do domínio alvo
-    clean = [s for s in all_subs if domain in s and "*" not in s]
+    # Filtra apenas subdomínios do domínio alvo (evita match por substring)
+    clean = [
+        s for s in all_subs
+        if (s == domain or s.endswith("." + domain)) and "*" not in s
+    ]
     logger.info("Total de subdomínios únicos: %d", len(clean))
     write_lines(base / "subdomains_raw.txt", clean, logger)
     return clean
@@ -566,13 +584,14 @@ def probe_alive(
 
     httpx_timeout  = getattr(args, "httpx_timeout", 10)
     httpx_rate     = getattr(args, "httpx_rate", 150)
+    httpx_ports    = getattr(args, "ports", HTTPX_PORTS)
 
     result = subprocess.run(
         [
             "httpx",
             "-l", str(input_file),
             "-silent",
-            "-ports", HTTPX_PORTS,
+            "-ports", httpx_ports,
             "-mc", "200,201,204,301,302,307,308,403",
             "-threads", "50",
             "-timeout", str(httpx_timeout),
@@ -625,11 +644,21 @@ def probe_alive(
 
 def _waf_worker(url: str, timeout: int = 20) -> tuple[str, str]:
     """Worker para wafw00f em thread — [PER-2]"""
+    if not shutil.which("wafw00f"):
+        return url, ""
     try:
         result = subprocess.run(
             ["wafw00f", url, "-a", "-f", "json"],
             capture_output=True, text=True, timeout=timeout,
         )
+        # Tenta parsear como JSON completo primeiro, depois linha a linha
+        try:
+            obj = json.loads(result.stdout)
+            waf = obj.get("detected", [])
+            if waf:
+                return url, waf[0].get("firewall", "Unknown")
+        except json.JSONDecodeError:
+            pass
         for line in result.stdout.splitlines():
             try:
                 obj = json.loads(line)
@@ -643,7 +672,12 @@ def _waf_worker(url: str, timeout: int = 20) -> tuple[str, str]:
     return url, ""
 
 
-def detect_waf(alive_urls: list[str], base: Path, logger: logging.Logger) -> dict[str, str]:
+def detect_waf(
+    alive_urls: list[str],
+    base: Path,
+    logger: logging.Logger,
+    waf_limit: int = 100,
+) -> dict[str, str]:
     """
     MELHORIA [PER-2] — wafw00f paralelizado com ThreadPoolExecutor
     """
@@ -654,7 +688,12 @@ def detect_waf(alive_urls: list[str], base: Path, logger: logging.Logger) -> dic
         logger.info("wafw00f não encontrado — pulando WAF detection.")
         return waf_map
 
-    targets = alive_urls[:100]
+    targets = alive_urls[:waf_limit]
+    if len(alive_urls) > waf_limit:
+        logger.warning(
+            "[WAF] Limitado a %d/%d hosts — use --waf-limit para aumentar.",
+            waf_limit, len(alive_urls),
+        )
     logger.info("Detectando WAF em %d hosts em paralelo…", len(targets))
 
     with ThreadPoolExecutor(max_workers=20) as executor:
@@ -1384,12 +1423,19 @@ function filterTable(input, tableId) {{
 
 def process_domain(domain: str, args: argparse.Namespace, logger: logging.Logger) -> None:
     args.domain = domain
-    base = Path(domain)
-    base.mkdir(exist_ok=True)
+    output_root = Path(args.output) if getattr(args, "output", None) else Path(".")
+    base = output_root / domain
+    base.mkdir(parents=True, exist_ok=True)
+    force = getattr(args, "force", False)
     stats: dict[str, int] = {}
 
-    # 1. Enumeração
-    subs = enumerate_subdomains(domain, base, args, logger)
+    # 1. Enumeração (resume: reutiliza subdomains_raw.txt se existir e --force não foi passado)
+    raw_cache = base / "subdomains_raw.txt"
+    if raw_cache.exists() and not force:
+        logger.info("[resume] Usando subdomains_raw.txt existente — use --force para re-enumerar.")
+        subs = read_lines(raw_cache)
+    else:
+        subs = enumerate_subdomains(domain, base, args, logger)
     stats["subdomains"] = len(subs)
 
     # 2. Bruteforce (opcional)
@@ -1402,13 +1448,34 @@ def process_domain(domain: str, args: argparse.Namespace, logger: logging.Logger
         )
         subs = sorted(set(subs + bf_subs))
 
-    # 3. Resolução DNS + CNAMEs
-    resolved, cname_map = resolve_dns(subs, base, args.resolvers or DEFAULT_RESOLVERS_FILE, logger)
+    # 3. Resolução DNS + CNAMEs (resume)
+    resolved_cache = base / "subdomains_resolved.txt"
+    if resolved_cache.exists() and not force:
+        logger.info("[resume] Usando subdomains_resolved.txt existente.")
+        resolved  = read_lines(resolved_cache)
+        cname_map = {}
+        cname_file = base / "cnames.txt"
+        if cname_file.exists():
+            for line in read_lines(cname_file):
+                parts = line.split("\t→\t", 1)
+                if len(parts) == 2:
+                    cname_map[parts[0].strip()] = parts[1].strip()
+    else:
+        resolved, cname_map = resolve_dns(subs, base, args.resolvers or DEFAULT_RESOLVERS_FILE, logger)
     stats["resolved"] = len(resolved)
     stats["cnames"]   = len(cname_map)
 
-    # 4. Hosts vivos
-    alive_urls, alive_domains = probe_alive(resolved, base, logger, args)
+    # 4. Hosts vivos (resume)
+    alive_cache = base / "alive.txt"
+    if alive_cache.exists() and not force:
+        logger.info("[resume] Usando alive.txt existente.")
+        alive_urls    = read_lines(alive_cache)
+        alive_domains = list({
+            re.sub(r'^https?://', '', u).split('/')[0].split(':')[0]
+            for u in alive_urls
+        })
+    else:
+        alive_urls, alive_domains = probe_alive(resolved, base, logger, args)
     stats["alive"] = len(alive_urls)
 
     if not alive_urls:
@@ -1418,7 +1485,7 @@ def process_domain(domain: str, args: argparse.Namespace, logger: logging.Logger
     # 5. WAF
     waf_map: dict[str, str] = {}
     if not args.no_waf:
-        waf_map = detect_waf(alive_urls, base, logger)
+        waf_map = detect_waf(alive_urls, base, logger, waf_limit=getattr(args, "waf_limit", 100))
         stats["wafs"] = len(waf_map)
     else:
         stats["wafs"] = 0
@@ -1486,10 +1553,32 @@ Nuclei:
     # [RES-3] Timeouts granulares por ferramenta
     p.add_argument("--httpx-timeout",     type=int, default=10,  help="Timeout por request httpx (s)")
     p.add_argument("--httpx-rate",        type=int, default=150, help="Rate limit httpx (req/s)")
-    p.add_argument("--no-nmap",           action="store_true",   help="Pula nmap")
-    p.add_argument("--no-waf",            action="store_true",   help="Pula WAF detection")
-    p.add_argument("--no-bruteforce",     action="store_true",   help="Pula puredns bruteforce")
+    p.add_argument("--ports",             default=HTTPX_PORTS,
+                   help=f"Portas para httpx (padrão: {HTTPX_PORTS})")
+    p.add_argument("--output",      "-o", default=None,
+                   help="Diretório raiz de saída (padrão: diretório atual)")
+    p.add_argument("--waf-limit",         type=int, default=100,
+                   help="Máximo de hosts para WAF detection (padrão: 100)")
+    p.add_argument("--domain-threads",   type=int, default=1,
+                   help="Domínios processados em paralelo — modo --list (padrão: 1)")
+    p.add_argument("--force",            action="store_true",
+                   help="Re-executa todas as etapas mesmo que arquivos de cache existam")
+    p.add_argument("--no-nmap",          action="store_true",   help="Pula nmap")
+    p.add_argument("--no-waf",           action="store_true",   help="Pula WAF detection")
+    p.add_argument("--no-bruteforce",    action="store_true",   help="Pula puredns bruteforce")
     return p.parse_args()
+
+
+def _process_one(domain: str, args: argparse.Namespace) -> None:
+    """Processa um domínio com logger isolado (safe para threads)."""
+    output_root = Path(args.output) if getattr(args, "output", None) else Path(".")
+    log_dir     = output_root / domain
+    log_dir.mkdir(parents=True, exist_ok=True)
+    # Logger com nome único por domínio — evita acúmulo de handlers em multi-domain
+    logger = setup_logging(log_dir / "takeover.log")
+    logger.name = f"takeover.{domain}"
+    logger.info("######## PROCESSANDO %s ########", domain)
+    process_domain(domain, args, logger)
 
 
 def main() -> None:
@@ -1499,18 +1588,25 @@ def main() -> None:
     if args.domain:
         domains.append(args.domain)
     if args.list:
-        with open(args.list) as f:
+        with open(args.list, encoding="utf-8") as f:
             domains.extend(d.strip() for d in f if d.strip())
 
     if not domains:
         parse_args().print_help()
         sys.exit(1)
 
-    for domain in domains:
-        log_file = Path(domain) / "takeover.log"
-        logger   = setup_logging(log_file)
-        logger.info("######## PROCESSANDO %s ########", domain)
-        process_domain(domain, args, logger)
+    domain_threads = getattr(args, "domain_threads", 1)
+    if domain_threads > 1 and len(domains) > 1:
+        with ThreadPoolExecutor(max_workers=domain_threads) as ex:
+            futures = {ex.submit(_process_one, d, args): d for d in domains}
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as exc:
+                    print(f"[ERRO] {futures[future]}: {exc}")
+    else:
+        for domain in domains:
+            _process_one(domain, args)
 
 
 if __name__ == "__main__":
